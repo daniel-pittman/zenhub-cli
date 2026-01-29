@@ -1,0 +1,1996 @@
+#!/bin/bash
+#
+# zh - ZenHub CLI Tool
+#
+# A command-line interface for ZenHub API operations.
+# Wraps the ZenHub GraphQL API to manage issues, pipelines, and workspaces.
+#
+# Repository: https://github.com/daniel-pittman/zenhub-cli
+# License: MIT
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+CONFIG_DIR="${HOME}/.config/zh"
+CONFIG_FILE="${CONFIG_DIR}/config"
+ZENHUB_API="https://api.zenhub.com/public/graphql"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+error() {
+    echo -e "${RED}Error:${NC} $1" >&2
+    exit 1
+}
+
+warn() {
+    echo -e "${YELLOW}Warning:${NC} $1" >&2
+}
+
+info() {
+    echo -e "${BLUE}Info:${NC} $1"
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+# Load configuration
+load_config() {
+    # Check for config file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    # Check for local .env file
+    if [[ -f ".env" ]]; then
+        # shellcheck source=/dev/null
+        source ".env"
+    fi
+
+    # Validate required config
+    if [[ -z "${ZH_TOKEN:-}" ]]; then
+        error "ZH_TOKEN not set. Create ${CONFIG_FILE} with:
+  ZH_TOKEN=your_zenhub_api_token
+
+Get your token at: https://app.zenhub.com/settings/tokens"
+    fi
+}
+
+# Make a GraphQL request to ZenHub API
+zh_graphql() {
+    local query="$1"
+    local variables="${2:-{\}}"
+
+    # Build request body using jq to ensure proper JSON formatting
+    local body
+    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
+
+    local response
+    response=$(curl -s -X POST "$ZENHUB_API" \
+        -H "Authorization: Bearer ${ZH_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    # Check for errors
+    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+        local error_msg
+        error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"')
+        error "ZenHub API error: $error_msg"
+    fi
+
+    echo "$response"
+}
+
+# Get GitHub repo info from current directory
+get_repo_info() {
+    local remote_url
+    remote_url=$(git remote get-url origin 2>/dev/null || echo "")
+
+    if [[ -z "$remote_url" ]]; then
+        error "Not in a git repository or no origin remote found"
+    fi
+
+    # Parse owner/repo from various URL formats
+    local repo_path
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    else
+        error "Could not parse GitHub repository from remote URL: $remote_url"
+    fi
+}
+
+# Get ZenHub repository ID from owner/repo (uses gh CLI to get GitHub ID first)
+get_repo_id() {
+    local owner_repo="$1"
+
+    # First get the GitHub repo ID using gh CLI
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+    if [[ -z "$gh_id" ]]; then
+        error "Could not get GitHub repo ID for: $owner_repo (is gh CLI authenticated?)"
+    fi
+
+    # Now query ZenHub with the GitHub ID
+    local query='
+    query($ghIds: [Int!]!) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            id
+            ghId
+            name
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local repo_id
+    repo_id=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].id // empty')
+
+    if [[ -z "$repo_id" ]]; then
+        error "Repository not found in ZenHub: $owner_repo (GitHub ID: $gh_id)"
+    fi
+
+    echo "$repo_id"
+}
+
+# Get workspace ID for a repository (using GitHub ID)
+get_workspace_id() {
+    local owner_repo="$1"
+
+    # Get GitHub repo ID
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+    if [[ -z "$gh_id" ]]; then
+        error "Could not get GitHub repo ID for: $owner_repo"
+    fi
+
+    local query='
+    query($ghIds: [Int!]!) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            id
+            name
+            workspacesConnection {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    # Get first workspace
+    local workspace_id
+    workspace_id=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[0].id // empty')
+
+    if [[ -z "$workspace_id" ]]; then
+        error "No workspace found for this repository"
+    fi
+
+    echo "$workspace_id"
+}
+
+# =============================================================================
+# Commands
+# =============================================================================
+
+cmd_help() {
+    cat << 'EOF'
+zh - ZenHub CLI Tool
+
+USAGE:
+    zh <command> [options]
+
+COMMANDS:
+    issue <number>          View issue details
+                           Example: zh issue 679
+
+    mine                    List issues assigned to you
+
+    board [--all]           Show board overview (issue count per pipeline)
+                           Excludes closed issues by default
+
+    pipeline <name> [--all] List issues in a specific pipeline
+                           Excludes closed issues by default
+                           Example: zh pipeline "In Progress"
+                           Example: zh pipeline todo --all
+
+    pipelines [repo]        List pipeline names for a workspace
+                           Example: zh pipelines
+
+    move <issue> <pipeline> Move an issue to a pipeline
+                           Example: zh move 679 "In Progress"
+                           Example: zh move #679 done
+
+    reorder <issue> <pos>   Reorder an issue within its pipeline
+                           Example: zh reorder 679 top
+                           Example: zh reorder 679 bottom
+
+    estimate <issue> <pts>  Set story point estimate
+                           Example: zh estimate 679 3
+                           Example: zh estimate 679 clear
+
+    assign <issue> <user>   Assign a user to an issue
+                           Example: zh assign 679 daniel-pittman
+
+    create <title> [opts]   Create a new issue
+                           -t, --type <type>     Issue type
+                           -l, --labels <labels> Comma-separated labels
+                           -a, --assignee <user> Assign to user
+                           -p, --pipeline <name> Place in pipeline
+                           -e, --estimate <pts>  Story points
+                           -b, --body <text>     Short description
+                           -f, --file <path>     Read description from file
+                           --stdin               Read description from stdin
+
+    block <issue> <blocker> Set issue as blocked by another
+                           Example: zh block 123 456
+                           (123 is blocked by 456)
+
+    unblock <issue> <blocker> Remove a blocking dependency
+                           Example: zh unblock 123 456
+                           (123 is no longer blocked by 456)
+
+    priority <issue> [lvl]  Set or view issue priority
+                           Example: zh priority 679 high
+                           Example: zh priority 679 clear
+                           Example: zh priority 679  (view only)
+
+    types                   List available issue types
+
+    labels                  List available labels
+
+    workspaces              List available workspaces for current repo
+
+    help                    Show this help message
+
+CONFIGURATION:
+    Create ~/.config/zh/config with:
+        ZH_TOKEN=your_graphql_token
+        ZH_REST_TOKEN=your_rest_token
+
+    Generate tokens at:
+        GraphQL: https://app.zenhub.com/settings/tokens
+        REST:    https://app.zenhub.com/dashboard/tokens
+
+ALIASES:
+    issue: i, show
+    mine: my
+    board: b, overview
+    pipeline: pipe, col
+    pipelines: pipes, p
+    move: mv, m
+    reorder: order, pos
+    estimate: est, points
+    create: new
+    workspaces: ws
+
+EXAMPLES:
+    zh issue 679                    # View issue details
+    zh mine                         # See your assigned issues
+    zh board                        # Overview of all pipelines
+    zh pipeline "TO DO"             # List issues in TO DO
+    zh move 679 "In Review"         # Move issue to pipeline
+    zh reorder 679 top              # Prioritize to top
+    zh estimate 679 5               # Set to 5 points
+    zh assign 679 daniel-pittman    # Assign to user
+    zh create "Fix bug" -t Bug -e 2 # Create new bug with estimate
+    zh types                        # List issue types
+    zh labels                       # List available labels
+    zh block 123 456                # 123 blocked by 456
+    zh priority 679 high            # Set high priority
+    cat desc.md | zh create "Title" --stdin  # Body from stdin
+EOF
+}
+
+cmd_workspaces() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+    info "Getting workspaces for ${owner_repo}..."
+
+    # Get GitHub repo ID
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+    if [[ -z "$gh_id" ]]; then
+        error "Could not get GitHub repo ID for: $owner_repo"
+    fi
+
+    local query='
+    query($ghIds: [Int!]!) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            id
+            name
+            workspacesConnection {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    echo ""
+    echo -e "${BOLD}Workspaces:${NC}"
+    echo ""
+
+    echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[] |
+        "  \(.name)\n    ID: \(.id)\n"'
+}
+
+cmd_pipelines() {
+    load_config
+
+    local owner_repo
+    if [[ -n "${1:-}" ]]; then
+        owner_repo="$1"
+    else
+        owner_repo=$(get_repo_info)
+    fi
+
+    info "Getting pipelines for ${owner_repo}..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            id
+            name
+            pipelinesConnection {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local workspace_name
+    workspace_name=$(echo "$response" | jq -r '.data.workspace.name')
+
+    echo ""
+    echo -e "${BOLD}Workspace:${NC} $workspace_name"
+    echo -e "${BOLD}Pipelines:${NC}"
+    echo ""
+
+    echo "$response" | jq -r '.data.workspace.pipelinesConnection.nodes[] | "  \(.name)"'
+
+    echo ""
+    echo -e "${CYAN}Tip:${NC} Use 'zh move <issue#> \"<pipeline name>\"' to move an issue"
+}
+
+cmd_move() {
+    load_config
+
+    local issue_num="${1:-}"
+    local pipeline_name="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$pipeline_name" ]]; then
+        error "Usage: zh move <issue_number> <pipeline_name>
+Example: zh move 679 \"In Review\""
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Moving issue #${issue_num} to '${pipeline_name}'..."
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Get pipeline ID by name
+    local pipelines_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            pipelinesConnection {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local pipelines_vars
+    pipelines_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local pipelines_response
+    pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars")
+
+    # Find pipeline by name (case-insensitive, trim whitespace)
+    local pipeline_id
+    pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline_name" \
+        '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .id')
+
+    if [[ -z "$pipeline_id" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline '${pipeline_name}' not found." >&2
+        echo ""
+        echo "Available pipelines:"
+        echo "$pipelines_response" | jq -r '.data.workspace.pipelinesConnection.nodes[] | "  - \(.name)"'
+        exit 1
+    fi
+
+    # Get the issue ID from ZenHub
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            number
+            title
+            pipelineIssues {
+                nodes {
+                    pipeline {
+                        name
+                    }
+                }
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found in ZenHub"
+    fi
+
+    local issue_title
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+
+    local current_pipeline
+    current_pipeline=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.name // "Unknown"')
+
+    # Move the issue
+    local move_mutation='
+    mutation($input: MoveIssueInput!) {
+        moveIssue(input: $input) {
+            issue {
+                id
+                pipelineIssues {
+                    nodes {
+                        pipeline {
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local move_vars
+    move_vars=$(jq -n \
+        --arg issue_id "$issue_id" \
+        --arg pipeline_id "$pipeline_id" \
+        '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: 0}}')
+
+    local move_response
+    move_response=$(zh_graphql "$move_mutation" "$move_vars")
+
+    local new_pipeline
+    new_pipeline=$(echo "$move_response" | jq -r '.data.moveIssue.issue.pipelineIssues.nodes[0].pipeline.name // empty')
+
+    if [[ -n "$new_pipeline" ]]; then
+        echo ""
+        success "Moved issue #${issue_num}: ${issue_title}"
+        echo -e "  ${CYAN}${current_pipeline}${NC} → ${GREEN}${new_pipeline}${NC}"
+    else
+        error "Failed to move issue"
+    fi
+}
+
+cmd_issue() {
+    load_config
+
+    local issue_num="${1:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh issue <issue_number>
+Example: zh issue 679"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            number
+            title
+            body
+            state
+            htmlUrl
+            estimate {
+                value
+            }
+            assignees {
+                nodes {
+                    login
+                    name
+                }
+            }
+            labels {
+                nodes {
+                    name
+                    color
+                }
+            }
+            pipelineIssues {
+                nodes {
+                    pipeline {
+                        name
+                    }
+                }
+            }
+            blockingIssues {
+                nodes {
+                    number
+                    title
+                }
+            }
+            blockedIssues {
+                nodes {
+                    number
+                    title
+                }
+            }
+            createdAt
+            updatedAt
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local issue
+    issue=$(echo "$response" | jq '.data.issueByInfo')
+
+    if [[ "$issue" == "null" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    local title state pipeline estimate assignees labels url blocking_issues blocked_issues
+    title=$(echo "$issue" | jq -r '.title')
+    state=$(echo "$issue" | jq -r '.state')
+    pipeline=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
+    estimate=$(echo "$issue" | jq -r '.estimate.value // "—"')
+    assignees=$(echo "$issue" | jq -r '[.assignees.nodes[].login] | join(", ") | if . == "" then "Unassigned" else . end')
+    labels=$(echo "$issue" | jq -r '[.labels.nodes[].name] | join(", ") | if . == "" then "None" else . end')
+    url=$(echo "$issue" | jq -r '.htmlUrl')
+    blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
+    blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
+
+    echo ""
+    echo -e "${BOLD}#${issue_num}${NC} ${title}"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}     ${state}"
+    echo -e "  ${CYAN}Pipeline:${NC}  ${pipeline}"
+    echo -e "  ${CYAN}Estimate:${NC}  ${estimate}"
+    echo -e "  ${CYAN}Assignees:${NC} ${assignees}"
+    echo -e "  ${CYAN}Labels:${NC}    ${labels}"
+    if [[ -n "$blocking_issues" ]]; then
+        echo -e "  ${YELLOW}Blocked by:${NC} ${blocking_issues}"
+    fi
+    if [[ -n "$blocked_issues" ]]; then
+        echo -e "  ${YELLOW}Blocking:${NC}  ${blocked_issues}"
+    fi
+    echo -e "  ${CYAN}URL:${NC}       ${url}"
+    echo ""
+}
+
+cmd_mine() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    # Get current GitHub username
+    local gh_user
+    gh_user=$(gh api user --jq '.login' 2>/dev/null)
+
+    if [[ -z "$gh_user" ]]; then
+        error "Could not get GitHub username (is gh CLI authenticated?)"
+    fi
+
+    info "Finding issues assigned to ${gh_user}..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Get pipeline IDs first
+    local pipelines_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            pipelinesConnection {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local pipelines_vars
+    pipelines_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local pipelines_response
+    pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars")
+
+    local pipelines
+    pipelines=$(echo "$pipelines_response" | jq -c '.data.workspace.pipelinesConnection.nodes[]')
+
+    # Collect all issues assigned to user across pipelines
+    local all_issues="[]"
+
+    while IFS= read -r pipeline; do
+        local pipeline_id pipeline_name
+        pipeline_id=$(echo "$pipeline" | jq -r '.id')
+        pipeline_name=$(echo "$pipeline" | jq -r '.name')
+
+        # Search issues in this pipeline filtered by assignee
+        local query='
+        query($pipelineId: ID!, $filters: IssueSearchFiltersInput!) {
+            searchIssuesByPipeline(
+                pipelineId: $pipelineId
+                filters: $filters
+                first: 50
+            ) {
+                nodes {
+                    number
+                    title
+                    estimate {
+                        value
+                    }
+                    assignees {
+                        nodes {
+                            login
+                        }
+                    }
+                }
+            }
+        }'
+
+        local variables
+        variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg user "$gh_user" \
+            '{pipelineId: $pipeline_id, filters: {assignees: {logins: [$user]}}}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables" 2>/dev/null) || continue
+
+        # Add pipeline name to each issue and merge
+        local issues_with_pipeline
+        issues_with_pipeline=$(echo "$response" | jq --arg pname "$pipeline_name" \
+            '[.data.searchIssuesByPipeline.nodes[] | . + {pipeline: $pname}]')
+
+        all_issues=$(echo "$all_issues" "$issues_with_pipeline" | jq -s 'add')
+    done <<< "$pipelines"
+
+    local count
+    count=$(echo "$all_issues" | jq 'length')
+
+    echo ""
+    echo -e "${BOLD}Your Issues (${count}):${NC}"
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  No issues assigned to you"
+    else
+        echo "$all_issues" | jq -r '.[] |
+            "  #\(.number | tostring | (" " * (5 - length)) + .) │ \(.pipeline | if length > 18 then .[:15] + "..." else . + (" " * (18 - length)) end) │ \(.title | if length > 45 then .[:42] + "..." else . end)"'
+    fi
+    echo ""
+}
+
+cmd_board() {
+    load_config
+
+    local include_closed=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a)
+                include_closed=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting board overview for ${owner_repo}..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local query
+    if [[ "$include_closed" == "true" ]]; then
+        query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                name
+                pipelinesConnection {
+                    nodes {
+                        id
+                        name
+                        issues {
+                            totalCount
+                        }
+                    }
+                }
+            }
+        }'
+    else
+        query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                name
+                pipelinesConnection {
+                    nodes {
+                        id
+                        name
+                        issues(state: OPEN) {
+                            totalCount
+                        }
+                    }
+                }
+            }
+        }'
+    fi
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local workspace_name
+    workspace_name=$(echo "$response" | jq -r '.data.workspace.name')
+
+    local total
+    total=$(echo "$response" | jq '[.data.workspace.pipelinesConnection.nodes[].issues.totalCount] | add')
+
+    echo ""
+    if [[ "$include_closed" == "true" ]]; then
+        echo -e "${BOLD}Board: ${workspace_name}${NC} (${total} total issues)"
+    else
+        echo -e "${BOLD}Board: ${workspace_name}${NC} (${total} open issues)"
+    fi
+    echo ""
+
+    # Print pipelines with counts as a simple bar chart
+    echo "$response" | jq -r '.data.workspace.pipelinesConnection.nodes[] |
+        "\(.name)\t\(.issues.totalCount)"' | while IFS=$'\t' read -r name count; do
+        # Pad the name
+        printf "  %-25s %3d " "$name" "$count"
+        # Draw a simple bar
+        local bar=""
+        for ((i=0; i<count && i<30; i++)); do
+            bar+="█"
+        done
+        if [[ $count -gt 30 ]]; then
+            bar+="…"
+        fi
+        echo -e "${GREEN}${bar}${NC}"
+    done
+
+    echo ""
+}
+
+cmd_pipeline() {
+    load_config
+
+    local pipeline_name=""
+    local include_closed=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a)
+                include_closed=true
+                shift
+                ;;
+            *)
+                if [[ -z "$pipeline_name" ]]; then
+                    pipeline_name="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$pipeline_name" ]]; then
+        error "Usage: zh pipeline <pipeline_name> [--all]
+Example: zh pipeline \"In Progress\"
+         zh pipeline todo --all    # Include closed issues"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting issues in '${pipeline_name}'..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # First get the pipeline ID
+    local pipelines_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            pipelinesConnection {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local pipelines_vars
+    pipelines_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local pipelines_response
+    pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars")
+
+    # Find pipeline by name (case-insensitive, trim whitespace)
+    local pipeline_id pipeline_actual_name
+    pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline_name" \
+        '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .id')
+    pipeline_actual_name=$(echo "$pipelines_response" | jq -r --arg name "$pipeline_name" \
+        '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .name')
+
+    if [[ -z "$pipeline_id" ]]; then
+        echo -e "${RED}Error:${NC} Pipeline '${pipeline_name}' not found." >&2
+        echo ""
+        echo "Available pipelines:"
+        echo "$pipelines_response" | jq -r '.data.workspace.pipelinesConnection.nodes[] | "  - \(.name)"'
+        exit 1
+    fi
+
+    # Get issues in this pipeline
+    local query='
+    query($pipelineId: ID!, $filters: IssueSearchFiltersInput!) {
+        searchIssuesByPipeline(
+            pipelineId: $pipelineId
+            filters: $filters
+            first: 50
+        ) {
+            nodes {
+                number
+                title
+                state
+                estimate {
+                    value
+                }
+                assignees {
+                    nodes {
+                        login
+                    }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg pipeline_id "$pipeline_id" \
+        '{pipelineId: $pipeline_id, filters: {}}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local issues
+    if [[ "$include_closed" == "true" ]]; then
+        issues=$(echo "$response" | jq '.data.searchIssuesByPipeline.nodes')
+    else
+        issues=$(echo "$response" | jq '[.data.searchIssuesByPipeline.nodes[] | select(.state != "CLOSED")]')
+    fi
+
+    local count
+    count=$(echo "$issues" | jq 'length')
+
+    local total_count
+    total_count=$(echo "$response" | jq '.data.searchIssuesByPipeline.nodes | length')
+
+    local closed_count=$((total_count - count))
+
+    echo ""
+    if [[ "$include_closed" == "true" ]]; then
+        echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues)"
+    else
+        if [[ $closed_count -gt 0 ]]; then
+            echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} open, ${closed_count} closed hidden)"
+        else
+            echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues)"
+        fi
+    fi
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  No issues in this pipeline"
+    else
+        echo "$issues" | jq -r '.[] |
+            "\(.state)" as $state |
+            "  #\(.number | tostring | (" " * (5 - length)) + .) │ \((.estimate.value // "—") | tostring | (" " * (3 - length)) + .) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end | if length > 12 then .[:9] + "..." else . end | . + (" " * (12 - length))) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title | if length > 43 then .[:40] + "..." else . end)"'
+    fi
+    echo ""
+}
+
+cmd_reorder() {
+    load_config
+
+    local issue_num="${1:-}"
+    local position="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$position" ]]; then
+        error "Usage: zh reorder <issue_number> <position>
+       zh reorder <issue_number> top
+       zh reorder <issue_number> bottom
+
+Examples:
+  zh reorder 679 0      # Move to top of pipeline
+  zh reorder 679 top    # Move to top
+  zh reorder 679 5      # Move to position 5
+  zh reorder 679 bottom # Move to bottom"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Get the issue's current pipeline
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            number
+            title
+            pipelineIssues {
+                nodes {
+                    pipeline {
+                        id
+                        name
+                        issues {
+                            totalCount
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title pipeline_id pipeline_name total_count
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+    pipeline_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.id // empty')
+    pipeline_name=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.name // "Unknown"')
+    total_count=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.issues.totalCount // 0')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found in ZenHub"
+    fi
+
+    if [[ -z "$pipeline_id" ]]; then
+        error "Issue #${issue_num} is not in any pipeline"
+    fi
+
+    # Handle special position keywords
+    local pos_int
+    case "$position" in
+        top|first|0)
+            pos_int=0
+            ;;
+        bottom|last)
+            pos_int=$((total_count - 1))
+            ;;
+        *)
+            if [[ "$position" =~ ^[0-9]+$ ]]; then
+                pos_int=$position
+            else
+                error "Invalid position: $position (use a number, 'top', or 'bottom')"
+            fi
+            ;;
+    esac
+
+    info "Moving issue #${issue_num} to position ${pos_int} in '${pipeline_name}'..."
+
+    # Move the issue (to same pipeline but different position)
+    local move_mutation='
+    mutation($input: MoveIssueInput!) {
+        moveIssue(input: $input) {
+            issue {
+                id
+            }
+        }
+    }'
+
+    local move_vars
+    move_vars=$(jq -n \
+        --arg issue_id "$issue_id" \
+        --arg pipeline_id "$pipeline_id" \
+        --argjson position "$pos_int" \
+        '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: $position}}')
+
+    zh_graphql "$move_mutation" "$move_vars" > /dev/null
+
+    echo ""
+    success "Reordered issue #${issue_num}: ${issue_title}"
+    echo -e "  Now at position ${CYAN}${pos_int}${NC} in ${GREEN}${pipeline_name}${NC}"
+}
+
+cmd_estimate() {
+    load_config
+
+    local issue_num="${1:-}"
+    local points="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$points" ]]; then
+        error "Usage: zh estimate <issue_number> <points>
+Example: zh estimate 679 3
+         zh estimate 679 0.5
+         zh estimate 679 clear  # Remove estimate"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Get the issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            estimate {
+                value
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title old_estimate
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+    old_estimate=$(echo "$issue_response" | jq -r '.data.issueByInfo.estimate.value // "none"')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    # Handle clear/remove
+    local estimate_value
+    if [[ "$points" == "clear" ]] || [[ "$points" == "remove" ]] || [[ "$points" == "none" ]]; then
+        estimate_value="null"
+    else
+        if ! [[ "$points" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+            error "Invalid estimate: $points (use a number or 'clear')"
+        fi
+        estimate_value="$points"
+    fi
+
+    info "Setting estimate for issue #${issue_num}..."
+
+    local mutation='
+    mutation($input: SetEstimateInput!) {
+        setEstimate(input: $input) {
+            issue {
+                id
+                estimate {
+                    value
+                }
+            }
+        }
+    }'
+
+    local mutation_vars
+    if [[ "$estimate_value" == "null" ]]; then
+        mutation_vars=$(jq -n --arg issue_id "$issue_id" \
+            '{input: {issueId: $issue_id, value: null}}')
+    else
+        mutation_vars=$(jq -n --arg issue_id "$issue_id" --argjson value "$estimate_value" \
+            '{input: {issueId: $issue_id, value: $value}}')
+    fi
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local new_estimate
+    new_estimate=$(echo "$response" | jq -r '.data.setEstimate.issue.estimate.value // "none"')
+
+    echo ""
+    success "Updated estimate for #${issue_num}: ${issue_title}"
+    echo -e "  ${CYAN}${old_estimate}${NC} → ${GREEN}${new_estimate}${NC} points"
+}
+
+cmd_assign() {
+    load_config
+
+    local issue_num="${1:-}"
+    local username="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$username" ]]; then
+        error "Usage: zh assign <issue_number> <github_username>
+Example: zh assign 679 daniel-pittman
+         zh assign 679 @daniel-pittman"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+    # Strip @ prefix if present
+    username="${username#@}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Get the issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            assignees {
+                nodes {
+                    login
+                }
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title current_assignees
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+    current_assignees=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].login] | join(", ") | if . == "" then "none" else . end')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    # Get the GitHub user ID
+    local gh_user_id
+    gh_user_id=$(gh api "users/${username}" --jq '.id' 2>/dev/null)
+
+    if [[ -z "$gh_user_id" ]]; then
+        error "GitHub user '${username}' not found"
+    fi
+
+    info "Assigning ${username} to issue #${issue_num}..."
+
+    local mutation='
+    mutation($input: AddAssigneesToIssuesInput!) {
+        addAssigneesToIssues(input: $input) {
+            issues {
+                id
+                assignees {
+                    nodes {
+                        login
+                    }
+                }
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --argjson user_id "$gh_user_id" \
+        '{input: {issueIds: [$issue_id], assigneeIds: [$user_id]}}')
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local new_assignees
+    new_assignees=$(echo "$response" | jq -r '[.data.addAssigneesToIssues.issues[0].assignees.nodes[].login] | join(", ")')
+
+    echo ""
+    success "Assigned ${username} to #${issue_num}: ${issue_title}"
+    echo -e "  Assignees: ${GREEN}${new_assignees}${NC}"
+}
+
+cmd_create() {
+    load_config
+
+    local title=""
+    local body=""
+    local body_file=""
+    local issue_type=""
+    local labels=""
+    local assignee=""
+    local pipeline=""
+    local estimate=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--type)
+                issue_type="$2"
+                shift 2
+                ;;
+            -l|--label|--labels)
+                labels="$2"
+                shift 2
+                ;;
+            -a|--assign|--assignee)
+                assignee="$2"
+                shift 2
+                ;;
+            -p|--pipeline)
+                pipeline="$2"
+                shift 2
+                ;;
+            -e|--estimate)
+                estimate="$2"
+                shift 2
+                ;;
+            -b|--body)
+                body="$2"
+                shift 2
+                ;;
+            -f|--file|--body-file)
+                body_file="$2"
+                shift 2
+                ;;
+            --stdin)
+                body=$(cat)
+                shift
+                ;;
+            *)
+                if [[ -z "$title" ]]; then
+                    title="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Read body from file if specified
+    if [[ -n "$body_file" ]]; then
+        if [[ -f "$body_file" ]]; then
+            body=$(cat "$body_file")
+        else
+            error "Body file not found: $body_file"
+        fi
+    fi
+
+    if [[ -z "$title" ]]; then
+        error "Usage: zh create <title> [options]
+
+Options:
+  -t, --type <type>       Issue type (Task, Bug, Feature, etc.)
+  -l, --labels <labels>   Comma-separated labels
+  -a, --assignee <user>   GitHub username to assign
+  -p, --pipeline <name>   Pipeline to place issue in
+  -e, --estimate <pts>    Story points estimate
+  -b, --body <text>       Issue body/description (short)
+  -f, --file <path>       Read body from file (for longer descriptions)
+  --stdin                 Read body from stdin
+
+Examples:
+  zh create \"Fix login bug\" -t Bug -l \"priority:high\"
+  zh create \"Add dark mode\" -t Feature -a daniel-pittman -e 5
+  zh create \"Research OAuth options\" -t Spike -p \"TO DO\""
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    info "Creating issue: ${title}..."
+
+    # Build the create mutation variables
+    local create_vars
+    create_vars=$(jq -n --arg repo_id "$repo_id" --arg title "$title" \
+        '{input: {repositoryId: $repo_id, title: $title}}')
+
+    # Add body if provided
+    if [[ -n "$body" ]]; then
+        create_vars=$(echo "$create_vars" | jq --arg body "$body" '.input.body = $body')
+    fi
+
+    # Add labels if provided (as array of label names)
+    if [[ -n "$labels" ]]; then
+        local labels_array
+        labels_array=$(echo "$labels" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+        create_vars=$(echo "$create_vars" | jq --argjson labels "$labels_array" '.input.labels = $labels')
+    fi
+
+    # Add assignee if provided
+    if [[ -n "$assignee" ]]; then
+        assignee="${assignee#@}"
+        create_vars=$(echo "$create_vars" | jq --arg assignee "$assignee" '.input.assignees = [$assignee]')
+    fi
+
+    # Add issue type if provided
+    if [[ -n "$issue_type" ]]; then
+        # Get GitHub repo ID for issue types query
+        local gh_id
+        gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+        # Look up issue type ID
+        local types_query='
+        query($ghIds: [Int!]!) {
+            repositoriesByGhId(ghIds: $ghIds) {
+                githubIssueTypes {
+                    nodes {
+                        id
+                        name
+                    }
+                }
+            }
+        }'
+
+        local types_vars
+        types_vars=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+        local types_response
+        types_response=$(zh_graphql "$types_query" "$types_vars")
+
+        local type_id
+        type_id=$(echo "$types_response" | jq -r --arg name "$issue_type" \
+            '.data.repositoriesByGhId[0].githubIssueTypes.nodes[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id')
+
+        if [[ -n "$type_id" ]]; then
+            create_vars=$(echo "$create_vars" | jq --arg type_id "$type_id" '.input.issueTypeId = $type_id')
+        else
+            warn "Issue type '${issue_type}' not found, creating without type"
+        fi
+    fi
+
+    local mutation='
+    mutation($input: CreateIssueInput!) {
+        createIssue(input: $input) {
+            issue {
+                id
+                number
+                title
+                htmlUrl
+            }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$create_vars")
+
+    local new_issue_id new_issue_num new_issue_url
+    new_issue_id=$(echo "$response" | jq -r '.data.createIssue.issue.id')
+    new_issue_num=$(echo "$response" | jq -r '.data.createIssue.issue.number')
+    new_issue_url=$(echo "$response" | jq -r '.data.createIssue.issue.htmlUrl')
+
+    echo ""
+    success "Created issue #${new_issue_num}: ${title}"
+    echo -e "  URL: ${CYAN}${new_issue_url}${NC}"
+
+    # Set estimate if provided
+    if [[ -n "$estimate" ]]; then
+        local est_mutation='
+        mutation($input: SetEstimateInput!) {
+            setEstimate(input: $input) {
+                issue { id }
+            }
+        }'
+
+        local est_vars
+        est_vars=$(jq -n --arg issue_id "$new_issue_id" --argjson value "$estimate" \
+            '{input: {issueId: $issue_id, value: $value}}')
+
+        zh_graphql "$est_mutation" "$est_vars" > /dev/null
+        echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
+    fi
+
+    # Move to pipeline if provided
+    if [[ -n "$pipeline" ]]; then
+        local workspace_id
+        workspace_id=$(get_workspace_id "$owner_repo")
+
+        # Get pipeline ID
+        local pipelines_query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                pipelinesConnection {
+                    nodes {
+                        id
+                        name
+                    }
+                }
+            }
+        }'
+
+        local pipelines_vars
+        pipelines_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+        local pipelines_response
+        pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars")
+
+        local pipeline_id
+        pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline" \
+            '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .id')
+
+        if [[ -n "$pipeline_id" ]]; then
+            local move_mutation='
+            mutation($input: MoveIssueInput!) {
+                moveIssue(input: $input) {
+                    issue { id }
+                }
+            }'
+
+            local move_vars
+            move_vars=$(jq -n --arg issue_id "$new_issue_id" --arg pipeline_id "$pipeline_id" \
+                '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: 0}}')
+
+            zh_graphql "$move_mutation" "$move_vars" > /dev/null
+            echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
+        else
+            warn "Pipeline '${pipeline}' not found"
+        fi
+    fi
+}
+
+cmd_types() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting issue types for ${owner_repo}..."
+
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+    local query='
+    query($ghIds: [Int!]!) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            githubIssueTypes {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    echo ""
+    echo -e "${BOLD}Issue Types:${NC}"
+    echo ""
+
+    echo "$response" | jq -r '.data.repositoriesByGhId[0].githubIssueTypes.nodes[] | "  \(.name)"'
+    echo ""
+}
+
+cmd_labels() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting labels for ${owner_repo}..."
+
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+    local query='
+    query($ghIds: [Int!]!) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            labels {
+                nodes {
+                    name
+                    color
+                    description
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    echo ""
+    echo -e "${BOLD}Labels:${NC}"
+    echo ""
+
+    echo "$response" | jq -r '.data.repositoriesByGhId[0].labels.nodes[] |
+        "  \(.name)\(.description | if . and . != "" then " - \(.)" else "" end)"'
+    echo ""
+}
+
+cmd_block() {
+    load_config
+
+    local blocked_num="${1:-}"
+    local blocking_num="${2:-}"
+
+    if [[ -z "$blocked_num" ]] || [[ -z "$blocking_num" ]]; then
+        error "Usage: zh block <blocked_issue> <blocking_issue>
+
+Sets up a dependency: blocked_issue is blocked BY blocking_issue
+
+Example: zh block 123 456
+         (Issue #123 is blocked by issue #456 - can't work on 123 until 456 is done)"
+    fi
+
+    # Strip # prefix if present
+    blocked_num="${blocked_num#\#}"
+    blocking_num="${blocking_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    info "Setting #${blocked_num} as blocked by #${blocking_num}..."
+
+    # Get both issue IDs
+    local query='
+    query($repoId: ID!, $num1: Int!, $num2: Int!) {
+        blocked: issueByInfo(repositoryId: $repoId, issueNumber: $num1) {
+            id
+            title
+        }
+        blocking: issueByInfo(repositoryId: $repoId, issueNumber: $num2) {
+            id
+            title
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson num1 "$blocked_num" --argjson num2 "$blocking_num" \
+        '{repoId: $repo_id, num1: $num1, num2: $num2}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local blocked_id blocked_title blocking_id blocking_title
+    blocked_id=$(echo "$response" | jq -r '.data.blocked.id // empty')
+    blocked_title=$(echo "$response" | jq -r '.data.blocked.title')
+    blocking_id=$(echo "$response" | jq -r '.data.blocking.id // empty')
+    blocking_title=$(echo "$response" | jq -r '.data.blocking.title')
+
+    if [[ -z "$blocked_id" ]]; then
+        error "Issue #${blocked_num} not found"
+    fi
+    if [[ -z "$blocking_id" ]]; then
+        error "Issue #${blocking_num} not found"
+    fi
+
+    # Create the blockage
+    local mutation='
+    mutation($input: CreateBlockageInput!) {
+        createBlockage(input: $input) {
+            blockage {
+                id
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg blocked_id "$blocked_id" --arg blocking_id "$blocking_id" \
+        '{input: {blocked: {id: $blocked_id, type: "ISSUE"}, blocking: {id: $blocking_id, type: "ISSUE"}}}')
+
+    local result
+    result=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local blockage_id
+    blockage_id=$(echo "$result" | jq -r '.data.createBlockage.blockage.id // empty')
+
+    if [[ -z "$blockage_id" ]]; then
+        error "Failed to create blockage"
+    fi
+
+    echo ""
+    success "Created dependency"
+    echo -e "  #${blocked_num} (${blocked_title})"
+    echo -e "  ${YELLOW}is blocked by${NC}"
+    echo -e "  #${blocking_num} (${blocking_title})"
+}
+
+# NOTE: The ZenHub GraphQL API does not have a deleteBlockage mutation.
+# This command uses the deprecated REST API which requires a separate token.
+# The REST API is scheduled for deprecation - request GraphQL support at:
+# https://community.zenhub.com/
+cmd_unblock() {
+    load_config
+
+    local blocked_num="${1:-}"
+    local blocking_num="${2:-}"
+
+    if [[ -z "$blocked_num" ]] || [[ -z "$blocking_num" ]]; then
+        error "Usage: zh unblock <blocked_issue> <blocking_issue>
+
+Removes a dependency: blocked_issue is no longer blocked by blocking_issue
+
+Example: zh unblock 123 456
+         (Issue #123 is no longer blocked by issue #456)
+
+NOTE: This command requires a REST API token (different from the GraphQL token).
+      Generate one at: https://app.zenhub.com/dashboard/tokens
+      Add to config as: ZH_REST_TOKEN=your_token_here"
+    fi
+
+    # Strip # prefix if present
+    blocked_num="${blocked_num#\#}"
+    blocking_num="${blocking_num#\#}"
+
+    # Check for REST API token
+    local rest_token="${ZH_REST_TOKEN:-}"
+    if [[ -z "$rest_token" ]] && [[ -f "$CONFIG_FILE" ]]; then
+        rest_token=$(grep -E '^ZH_REST_TOKEN=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2)
+    fi
+
+    if [[ -z "$rest_token" ]]; then
+        error "REST API token required for unblock command.
+
+The ZenHub GraphQL API does not support removing dependencies.
+This command uses the deprecated REST API which requires a separate token.
+
+To set up:
+1. Generate a token at: https://app.zenhub.com/dashboard/tokens
+2. Add to ~/.config/zh/config:
+   ZH_REST_TOKEN=your_token_here
+
+NOTE: Consider requesting GraphQL support for this feature at:
+      https://community.zenhub.com/"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    # Get GitHub repo ID (REST API uses GitHub IDs, not ZenHub IDs)
+    local gh_repo_id
+    gh_repo_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+    if [[ -z "$gh_repo_id" ]]; then
+        error "Could not get GitHub repo ID for: $owner_repo"
+    fi
+
+    info "Removing dependency: #${blocked_num} blocked by #${blocking_num}..."
+
+    # REST API DELETE endpoint - uses JSON body with blocking/blocked objects
+    # Note: endpoint is /p1/dependencies (not /p1/repositories/:id/dependencies)
+    local response
+    local http_code
+    http_code=$(curl -s -o /tmp/zh_unblock_response.json -w "%{http_code}" \
+        -X DELETE \
+        "https://api.zenhub.com/p1/dependencies" \
+        -H "X-Authentication-Token: ${rest_token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"blocking\":{\"repo_id\":${gh_repo_id},\"issue_number\":${blocking_num}},\"blocked\":{\"repo_id\":${gh_repo_id},\"issue_number\":${blocked_num}}}")
+
+    response=$(cat /tmp/zh_unblock_response.json 2>/dev/null)
+    rm -f /tmp/zh_unblock_response.json
+
+    if [[ "$http_code" == "204" ]] || [[ "$http_code" == "200" ]]; then
+        echo ""
+        success "Removed dependency"
+        echo -e "  #${blocked_num} is no longer blocked by #${blocking_num}"
+    elif [[ "$http_code" == "401" ]]; then
+        error "Authentication failed. Check your ZH_REST_TOKEN.
+Generate a new token at: https://app.zenhub.com/dashboard/tokens"
+    elif [[ "$http_code" == "404" ]]; then
+        error "Dependency not found between #${blocked_num} and #${blocking_num}"
+    else
+        error "Failed to remove dependency (HTTP ${http_code}): ${response}"
+    fi
+}
+
+cmd_priority() {
+    load_config
+
+    local issue_num="${1:-}"
+    local priority_action="${2:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh priority <issue_number> [high|clear]
+
+Examples:
+  zh priority 679 high   # Set high priority
+  zh priority 679 clear  # Remove priority
+  zh priority 679        # Show current priority"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Get the issue and its pipeline issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            pipelineIssue(workspaceId: $workspaceId) {
+                id
+                priority {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" --arg workspace_id "$workspace_id" \
+        '{repoId: $repo_id, issueNumber: $issue_num, workspaceId: $workspace_id}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_title pipeline_issue_id current_priority
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title // empty')
+    pipeline_issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
+    current_priority=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssue.priority.name // "None"')
+
+    if [[ -z "$issue_title" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    if [[ -z "$pipeline_issue_id" ]]; then
+        error "Issue #${issue_num} is not in any pipeline"
+    fi
+
+    # If no action specified, just show current priority
+    if [[ -z "$priority_action" ]]; then
+        echo ""
+        echo -e "${BOLD}#${issue_num}${NC} ${issue_title}"
+        echo -e "  Priority: ${CYAN}${current_priority}${NC}"
+        echo ""
+        return
+    fi
+
+    # Get priority ID (if setting to high)
+    local priority_id=""
+    if [[ "$priority_action" == "high" ]]; then
+        # Get the high priority ID from workspace
+        local priorities_query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                prioritiesConnection {
+                    nodes {
+                        id
+                        name
+                    }
+                }
+            }
+        }'
+
+        local priorities_vars
+        priorities_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+        local priorities_response
+        priorities_response=$(zh_graphql "$priorities_query" "$priorities_vars")
+
+        priority_id=$(echo "$priorities_response" | jq -r '.data.workspace.prioritiesConnection.nodes[0].id // empty')
+
+        if [[ -z "$priority_id" ]]; then
+            error "No priority levels configured in this workspace"
+        fi
+    fi
+
+    info "Setting priority for issue #${issue_num}..."
+
+    # Set priority
+    local mutation='
+    mutation($input: SetPriorityOnPipelineIssuesInput!) {
+        setPriorityOnPipelineIssues(input: $input) {
+            pipelineIssues {
+                id
+                priority {
+                    name
+                }
+            }
+        }
+    }'
+
+    local mutation_vars
+    if [[ "$priority_action" == "clear" ]] || [[ "$priority_action" == "none" ]] || [[ "$priority_action" == "remove" ]]; then
+        mutation_vars=$(jq -n --arg pipeline_issue_id "$pipeline_issue_id" \
+            '{input: {pipelineIssueIds: [$pipeline_issue_id], priorityId: null}}')
+    else
+        mutation_vars=$(jq -n --arg pipeline_issue_id "$pipeline_issue_id" --arg priority_id "$priority_id" \
+            '{input: {pipelineIssueIds: [$pipeline_issue_id], priorityId: $priority_id}}')
+    fi
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local new_priority
+    new_priority=$(echo "$response" | jq -r '.data.setPriorityOnPipelineIssues.pipelineIssues[0].priority.name // "None"')
+
+    echo ""
+    success "Updated priority for #${issue_num}: ${issue_title}"
+    echo -e "  ${CYAN}${current_priority}${NC} → ${GREEN}${new_priority}${NC}"
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case "$command" in
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            echo "zh version ${VERSION}"
+            ;;
+        issue|i|show)
+            cmd_issue "$@"
+            ;;
+        mine|my)
+            cmd_mine "$@"
+            ;;
+        board|b|overview)
+            cmd_board "$@"
+            ;;
+        pipeline|pipe|col)
+            cmd_pipeline "$@"
+            ;;
+        pipelines|pipes|p)
+            cmd_pipelines "$@"
+            ;;
+        workspaces|ws)
+            cmd_workspaces "$@"
+            ;;
+        move|mv|m)
+            cmd_move "$@"
+            ;;
+        reorder|order|pos)
+            cmd_reorder "$@"
+            ;;
+        estimate|est|points)
+            cmd_estimate "$@"
+            ;;
+        assign)
+            cmd_assign "$@"
+            ;;
+        create|new)
+            cmd_create "$@"
+            ;;
+        types)
+            cmd_types "$@"
+            ;;
+        labels)
+            cmd_labels "$@"
+            ;;
+        block|blocked-by|depends)
+            cmd_block "$@"
+            ;;
+        unblock)
+            cmd_unblock "$@"
+            ;;
+        priority|prio)
+            cmd_priority "$@"
+            ;;
+        *)
+            error "Unknown command: $command
+
+Run 'zh help' for usage information."
+            ;;
+    esac
+}
+
+main "$@"

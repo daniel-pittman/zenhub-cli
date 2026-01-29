@@ -1,0 +1,25 @@
+# Config files with tokens
+.env
+config
+
+# macOS
+.DS_Store
+
+# Editor/IDE files
+*.swp
+*.swo
+*~
+
+# IntelliJ / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# VS Code
+.vscode/
+
+# Temporary files
+*.tmp
+*.log
