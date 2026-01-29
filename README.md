@@ -11,6 +11,8 @@ A powerful command-line interface for ZenHub. Manage issues, pipelines, sprints,
 - 🔄 **Sprint planning** - Board overview, pipeline management, bulk operations
 - 🎯 **Prioritization** - Reorder issues, set priorities, manage dependencies
 - ✨ **Create issues** - Full support for types, labels, assignees, and descriptions
+- 🔗 **ZenHub URLs** - Clickable links to issues in the ZenHub board
+- 📁 **Multi-repo workspaces** - Works with workspaces containing multiple repositories
 - 🤖 **AI-friendly** - Designed for use with AI assistants like Claude
 
 ## Requirements
@@ -125,6 +127,8 @@ ZH_REST_TOKEN=your_rest_token_here
 | `unassign <issue> [user]` | | Remove assignee(s) from an issue |
 | `comment <issue> [text]` | `c` | Add a comment to an issue |
 | `attach <issue>` | | Open issue in browser to add attachments |
+| `close <issue> [comment]` | | Close an issue |
+| `reopen <issue>` | | Reopen a closed issue |
 | `create <title> [options]` | `new` | Create a new issue |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
@@ -258,6 +262,19 @@ EOF
 - `-f, --file <path>` - Read description from file
 - `--stdin` - Read description from stdin
 
+### Close & Reopen Issues
+
+```bash
+# Close an issue (moves to Closed pipeline in ZenHub)
+zh close 42
+
+# Close with a comment
+zh close 42 "Completed in PR #99"
+
+# Reopen a closed issue
+zh reopen 42
+```
+
 ### Dependencies & Priority
 
 ```bash
@@ -294,7 +311,30 @@ zh users
 zh workspaces
 ```
 
-## Filtering
+## Output Options
+
+### ZenHub URLs
+
+By default, `zh mine` and `zh pipeline` show clickable ZenHub URLs for each issue:
+
+```bash
+$ zh mine
+
+Issues assigned to daniel-pittman (3):
+
+  #98 │ msu-denver/sustainability-hub │ Product Backlog
+    Fix login bug
+    → https://app.zenhub.com/workspaces/.../issues/gh/msu-denver/sustainability-hub/98
+```
+
+Use `--no-urls` for compact output:
+
+```bash
+zh mine --no-urls
+zh pipeline "TO DO" --no-urls
+```
+
+### Filtering
 
 By default, `board` and `pipeline` commands exclude closed issues to reduce noise:
 

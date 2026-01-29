@@ -12,12 +12,13 @@ This file provides guidance to Claude Code and other AI assistants when working 
 
 ```bash
 # View issues and board
-zh issue <number>       # View issue details
-zh mine                 # Your assigned issues
+zh issue <number>       # View issue details (shows ZenHub + GitHub URLs)
+zh mine                 # Your assigned issues (with ZenHub URLs)
 zh mine @username       # Issues assigned to user
+zh mine --no-urls       # Compact output without URLs
 zh users                # List assignable users
 zh board                # Board overview
-zh pipeline "Name"      # Issues in a pipeline
+zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 
 # Manage issues
 zh move <issue> "Pipeline"    # Move to pipeline
@@ -26,6 +27,8 @@ zh estimate <issue> <points>  # Set estimate
 zh assign <issue> <user>      # Assign user
 zh unassign <issue> [user]    # Remove assignee(s)
 zh comment <issue> "text"     # Add comment
+zh close <issue> [comment]    # Close issue
+zh reopen <issue>             # Reopen closed issue
 
 # Create issues
 zh create "Title" -t Bug -l "label1,label2" -e 3 -p "TO DO"
@@ -46,6 +49,8 @@ zh pipelines            # List pipelines
 1. **Issue numbers**: Can use `#` prefix or not: `zh issue 42` or `zh issue #42`
 2. **Pipeline names**: Case-insensitive, partial matching: `zh pipeline todo` matches "TO DO"
 3. **Closed issues**: Use `--all` flag to include closed: `zh board --all`
+4. **ZenHub URLs**: Shown by default in `mine` and `pipeline`; use `--no-urls` to hide
+5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
 
 ## For AI Assistants
 
@@ -108,6 +113,18 @@ zh estimate 456 5
 # View issue to see blocking relationships
 zh issue 42
 # Output includes "Blocked by: #41" if blocked
+```
+
+**Closing completed work:**
+```bash
+# Close an issue when done
+zh close 123
+
+# Close with a comment
+zh close 123 "Completed in PR #456"
+
+# Reopen if needed
+zh reopen 123
 ```
 
 ## Project Structure
