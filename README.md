@@ -123,6 +123,8 @@ ZH_REST_TOKEN=your_rest_token_here
 | `estimate <issue> <points>` | `est`, `points` | Set story point estimate |
 | `assign <issue> <user>` | | Assign a user to an issue |
 | `unassign <issue> [user]` | | Remove assignee(s) from an issue |
+| `comment <issue> [text]` | `c` | Add a comment to an issue |
+| `attach <issue>` | | Open issue in browser to add attachments |
 | `create <title> [options]` | `new` | Create a new issue |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
@@ -193,6 +195,22 @@ zh assign 42 @username    # @ prefix works too
 # Remove assignees
 zh unassign 42 username   # Remove specific user
 zh unassign 42            # Remove all assignees
+```
+
+### Comments
+
+```bash
+# Add inline comment
+zh comment 42 "Fixed in PR #99"
+
+# With -m flag
+zh comment 42 -m "Still investigating this issue"
+
+# From file (for longer comments)
+zh comment 42 -f ./investigation-notes.md
+
+# From stdin (useful for piping)
+echo "Automated update: build passed" | zh comment 42 --stdin
 ```
 
 ### Create Issues

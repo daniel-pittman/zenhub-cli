@@ -11,7 +11,15 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+# Read version from VERSION file (same directory as script, resolving symlinks)
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+VERSION=$(cat "${SCRIPT_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || echo "unknown")
 
 # =============================================================================
 # Configuration
@@ -262,6 +270,17 @@ COMMANDS:
                            -b, --body <text>     Short description
                            -f, --file <path>     Read description from file
                            --stdin               Read description from stdin
+
+    comment <issue> [opts]  Add a comment to an issue
+                           -m, --message <text>  Comment text
+                           -f, --file <path>     Read from file
+                           --stdin               Read from stdin
+                           Example: zh comment 42 "Fixed in PR #99"
+                           Example: zh comment 42 -f notes.md
+
+    attach <issue>          Open issue in browser to add attachments
+                           (GitHub API doesn't support file uploads)
+                           Example: zh attach 42
 
     block <issue> <blocker> Set issue as blocked by another
                            Example: zh block 123 456
@@ -731,7 +750,7 @@ cmd_mine() {
 
         local variables
         variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg user "$gh_user" \
-            '{pipelineId: $pipeline_id, filters: {assignees: {logins: [$user]}}}')
+            '{pipelineId: $pipeline_id, filters: {assignees: {in: [$user]}}}')
 
         local response
         response=$(zh_graphql "$query" "$variables" 2>/dev/null) || continue
@@ -1411,6 +1430,141 @@ Examples:
         success "Removed all assignees from #${issue_num}: ${issue_title}"
     fi
     echo -e "  Assignees: ${CYAN}${remaining_assignees}${NC}"
+}
+
+cmd_comment() {
+    load_config
+
+    local issue_num=""
+    local body=""
+    local body_file=""
+    local from_stdin=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--file)
+                body_file="$2"
+                shift 2
+                ;;
+            --stdin)
+                from_stdin=true
+                shift
+                ;;
+            -m|--message)
+                body="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "$issue_num" ]]; then
+                    issue_num="$1"
+                elif [[ -z "$body" ]]; then
+                    body="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh comment <issue_number> [message] [options]
+
+Add a comment to an issue.
+
+Options:
+  -m, --message <text>  Comment text (inline)
+  -f, --file <path>     Read comment from file
+  --stdin               Read comment from stdin
+
+Examples:
+  zh comment 42 \"This is fixed in PR #123\"
+  zh comment 42 -m \"Quick update: still investigating\"
+  zh comment 42 -f ./detailed-notes.md
+  echo \"Automated comment\" | zh comment 42 --stdin"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    # Read body from file if specified
+    if [[ -n "$body_file" ]]; then
+        if [[ ! -f "$body_file" ]]; then
+            error "File not found: $body_file"
+        fi
+        body=$(cat "$body_file")
+    fi
+
+    # Read body from stdin if specified
+    if [[ "$from_stdin" == true ]]; then
+        body=$(cat)
+    fi
+
+    if [[ -z "$body" ]]; then
+        error "Comment body is required. Use -m, -f, --stdin, or provide text as argument."
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Adding comment to issue #${issue_num}..."
+
+    # Use GitHub CLI to add comments (comments are a GitHub feature, synced to ZenHub)
+    if ! echo "$body" | gh issue comment "$issue_num" --repo "$owner_repo" --body-file - 2>/dev/null; then
+        error "Failed to add comment. Issue #${issue_num} may not exist."
+    fi
+
+    echo ""
+    success "Added comment to #${issue_num}"
+    # Show preview of comment (first 100 chars)
+    local preview
+    preview=$(echo "$body" | head -c 100)
+    if [[ ${#body} -gt 100 ]]; then
+        preview="${preview}..."
+    fi
+    echo -e "  Comment: ${preview}"
+}
+
+cmd_attach() {
+    local issue_num="${1:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh attach <issue_number>
+
+Opens the issue in your browser so you can drag-and-drop attachments.
+
+Note: GitHub's API does not support uploading attachments programmatically.
+      File attachments must be added through the web interface.
+
+Example: zh attach 42"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local url="https://github.com/${owner_repo}/issues/${issue_num}"
+
+    echo ""
+    info "Opening issue #${issue_num} in browser for attachment upload..."
+    echo ""
+    echo -e "  ${YELLOW}Note:${NC} GitHub's API does not support file uploads to issues."
+    echo -e "  Drag and drop files into the comment box in your browser."
+    echo ""
+
+    # Open in browser (works on macOS and Linux)
+    if command -v open &> /dev/null; then
+        open "$url"
+    elif command -v xdg-open &> /dev/null; then
+        xdg-open "$url"
+    else
+        echo -e "  URL: ${CYAN}${url}${NC}"
+        echo "  (Could not auto-open browser)"
+    fi
 }
 
 cmd_create() {
@@ -2095,6 +2249,12 @@ main() {
             ;;
         create|new)
             cmd_create "$@"
+            ;;
+        comment|c)
+            cmd_comment "$@"
+            ;;
+        attach)
+            cmd_attach "$@"
             ;;
         types)
             cmd_types "$@"

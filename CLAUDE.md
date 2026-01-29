@@ -23,6 +23,7 @@ zh reorder <issue> top        # Prioritize
 zh estimate <issue> <points>  # Set estimate
 zh assign <issue> <user>      # Assign user
 zh unassign <issue> [user]    # Remove assignee(s)
+zh comment <issue> "text"     # Add comment
 
 # Create issues
 zh create "Title" -t Bug -l "label1,label2" -e 3 -p "TO DO"
