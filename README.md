@@ -114,7 +114,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | Command | Aliases | Description |
 |---------|---------|-------------|
 | `issue <number>` | `i`, `show` | View issue details |
-| `mine` | `my` | List issues assigned to you |
+| `mine [user]` | `my` | List issues assigned to you (or specified user) |
 | `board [--all]` | `b`, `overview` | Show board overview with issue counts |
 | `pipeline <name> [--all]` | `pipe`, `col` | List issues in a specific pipeline |
 | `pipelines [repo]` | `pipes`, `p` | List pipeline names for a workspace |
@@ -131,6 +131,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
+| `users` | | List users who can be assigned to issues |
 | `workspaces` | `ws` | List available workspaces |
 | `help` | `-h`, `--help` | Show help message |
 
@@ -144,6 +145,9 @@ zh issue 42
 
 # See issues assigned to you
 zh mine
+
+# See issues assigned to a specific user
+zh mine daniel-pittman
 
 # Board overview (open issues only by default)
 zh board
@@ -282,6 +286,9 @@ zh types
 
 # List available labels
 zh labels
+
+# List users who can be assigned to issues
+zh users
 
 # List workspaces
 zh workspaces

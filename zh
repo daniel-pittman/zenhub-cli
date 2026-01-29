@@ -229,7 +229,9 @@ COMMANDS:
     issue <number>          View issue details
                            Example: zh issue 679
 
-    mine                    List issues assigned to you
+    mine [user]             List issues assigned to you (or specified user)
+                           Example: zh mine
+                           Example: zh mine daniel-pittman
 
     board [--all]           Show board overview (issue count per pipeline)
                            Excludes closed issues by default
@@ -299,6 +301,9 @@ COMMANDS:
 
     labels                  List available labels
 
+    users                   List users who can be assigned to issues
+                           Example: zh users
+
     workspaces              List available workspaces for current repo
 
     help                    Show this help message
@@ -327,6 +332,8 @@ ALIASES:
 EXAMPLES:
     zh issue 679                    # View issue details
     zh mine                         # See your assigned issues
+    zh mine daniel-pittman          # See issues assigned to user
+    zh users                        # List all assignable users
     zh board                        # Overview of all pipelines
     zh pipeline "TO DO"             # List issues in TO DO
     zh move 679 "In Review"         # Move issue to pipeline
@@ -682,15 +689,20 @@ cmd_mine() {
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    # Get current GitHub username
-    local gh_user
-    gh_user=$(gh api user --jq '.login' 2>/dev/null)
+    local target_user="${1:-}"
 
-    if [[ -z "$gh_user" ]]; then
-        error "Could not get GitHub username (is gh CLI authenticated?)"
+    # If no user specified, use current GitHub user
+    if [[ -z "$target_user" ]]; then
+        target_user=$(gh api user --jq '.login' 2>/dev/null)
+        if [[ -z "$target_user" ]]; then
+            error "Could not get GitHub username (is gh CLI authenticated?)"
+        fi
+    else
+        # Strip @ prefix if present
+        target_user="${target_user#@}"
     fi
 
-    info "Finding issues assigned to ${gh_user}..."
+    info "Finding issues assigned to ${target_user}..."
 
     local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
@@ -749,7 +761,7 @@ cmd_mine() {
         }'
 
         local variables
-        variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg user "$gh_user" \
+        variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg user "$target_user" \
             '{pipelineId: $pipeline_id, filters: {assignees: {in: [$user]}}}')
 
         local response
@@ -1844,6 +1856,50 @@ cmd_types() {
     echo ""
 }
 
+cmd_users() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting users for workspace..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            name
+            assignees {
+                nodes {
+                    login
+                    name
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local workspace_name
+    workspace_name=$(echo "$response" | jq -r '.data.workspace.name')
+
+    echo ""
+    echo -e "${BOLD}Users in ${workspace_name}:${NC}"
+    echo ""
+
+    echo "$response" | jq -r '.data.workspace.assignees.nodes[] |
+        "  \(.login)\(.name | if . and . != "" then " (\(.))" else "" end)"' | sort
+
+    echo ""
+    echo -e "${CYAN}Tip:${NC} Use 'zh mine <username>' to see issues assigned to a specific user"
+}
+
 cmd_labels() {
     load_config
 
@@ -2261,6 +2317,9 @@ main() {
             ;;
         labels)
             cmd_labels "$@"
+            ;;
+        users)
+            cmd_users "$@"
             ;;
         block|blocked-by|depends)
             cmd_block "$@"

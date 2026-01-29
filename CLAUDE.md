@@ -14,6 +14,8 @@ This file provides guidance to Claude Code and other AI assistants when working 
 # View issues and board
 zh issue <number>       # View issue details
 zh mine                 # Your assigned issues
+zh mine @username       # Issues assigned to user
+zh users                # List assignable users
 zh board                # Board overview
 zh pipeline "Name"      # Issues in a pipeline
 
