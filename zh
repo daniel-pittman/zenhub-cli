@@ -214,6 +214,16 @@ get_workspace_id() {
     echo "$workspace_id"
 }
 
+# Build ZenHub URL for an issue
+# Format: https://app.zenhub.com/workspaces/<workspace-id>/issues/gh/<owner>/<repo>/<issue-number>
+build_zenhub_url() {
+    local workspace_id="$1"
+    local owner_repo="$2"
+    local issue_num="$3"
+
+    echo "https://app.zenhub.com/workspaces/${workspace_id}/issues/gh/${owner_repo}/${issue_num}"
+}
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -283,6 +293,13 @@ COMMANDS:
     attach <issue>          Open issue in browser to add attachments
                            (GitHub API doesn't support file uploads)
                            Example: zh attach 42
+
+    close <issue> [comment] Close an issue (moves to Closed pipeline)
+                           Example: zh close 42
+                           Example: zh close 42 "Fixed in PR #99"
+
+    reopen <issue>          Reopen a closed issue
+                           Example: zh reopen 42
 
     block <issue> <blocker> Set issue as blocked by another
                            Example: zh block 123 456
@@ -592,6 +609,9 @@ Example: zh issue 679"
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
     local query='
     query($repoId: ID!, $issueNumber: Int!) {
         issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
@@ -654,14 +674,15 @@ Example: zh issue 679"
         error "Issue #${issue_num} not found"
     fi
 
-    local title state pipeline estimate assignees labels url blocking_issues blocked_issues
+    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues
     title=$(echo "$issue" | jq -r '.title')
     state=$(echo "$issue" | jq -r '.state')
     pipeline=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
     estimate=$(echo "$issue" | jq -r '.estimate.value // "—"')
     assignees=$(echo "$issue" | jq -r '[.assignees.nodes[].login] | join(", ") | if . == "" then "Unassigned" else . end')
     labels=$(echo "$issue" | jq -r '[.labels.nodes[].name] | join(", ") | if . == "" then "None" else . end')
-    url=$(echo "$issue" | jq -r '.htmlUrl')
+    gh_url=$(echo "$issue" | jq -r '.htmlUrl')
+    zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$issue_num")
     blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
 
@@ -679,7 +700,8 @@ Example: zh issue 679"
     if [[ -n "$blocked_issues" ]]; then
         echo -e "  ${YELLOW}Blocking:${NC}  ${blocked_issues}"
     fi
-    echo -e "  ${CYAN}URL:${NC}       ${url}"
+    echo -e "  ${CYAN}ZenHub:${NC}    ${zh_url}"
+    echo -e "  ${CYAN}GitHub:${NC}    ${gh_url}"
     echo ""
 }
 
@@ -689,7 +711,27 @@ cmd_mine() {
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    local target_user="${1:-}"
+    local target_user=""
+    local show_urls=true
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-urls)
+                show_urls=false
+                shift
+                ;;
+            -*)
+                shift
+                ;;
+            *)
+                if [[ -z "$target_user" ]]; then
+                    target_user="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     # If no user specified, use current GitHub user
     if [[ -z "$target_user" ]]; then
@@ -739,7 +781,7 @@ cmd_mine() {
 
         # Search issues in this pipeline filtered by assignee
         local query='
-        query($pipelineId: ID!, $filters: IssueSearchFiltersInput!) {
+        query($pipelineId: ID!, $workspaceId: ID!, $filters: IssueSearchFiltersInput!) {
             searchIssuesByPipeline(
                 pipelineId: $pipelineId
                 filters: $filters
@@ -748,6 +790,7 @@ cmd_mine() {
                 nodes {
                     number
                     title
+                    zenhubUrl(workspaceId: $workspaceId)
                     estimate {
                         value
                     }
@@ -756,13 +799,17 @@ cmd_mine() {
                             login
                         }
                     }
+                    repository {
+                        ownerName
+                        name
+                    }
                 }
             }
         }'
 
         local variables
-        variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg user "$target_user" \
-            '{pipelineId: $pipeline_id, filters: {assignees: {in: [$user]}}}')
+        variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg workspace_id "$workspace_id" --arg user "$target_user" \
+            '{pipelineId: $pipeline_id, workspaceId: $workspace_id, filters: {assignees: {in: [$user]}}}')
 
         local response
         response=$(zh_graphql "$query" "$variables" 2>/dev/null) || continue
@@ -779,16 +826,23 @@ cmd_mine() {
     count=$(echo "$all_issues" | jq 'length')
 
     echo ""
-    echo -e "${BOLD}Your Issues (${count}):${NC}"
+    echo -e "${BOLD}Issues assigned to ${target_user} (${count}):${NC}"
     echo ""
 
     if [[ "$count" -eq 0 ]]; then
-        echo "  No issues assigned to you"
+        echo "  No issues assigned"
     else
-        echo "$all_issues" | jq -r '.[] |
-            "  #\(.number | tostring | (" " * (5 - length)) + .) │ \(.pipeline | if length > 18 then .[:15] + "..." else . + (" " * (18 - length)) end) │ \(.title | if length > 45 then .[:42] + "..." else . end)"'
+        if [[ "$show_urls" == "true" ]]; then
+            # Show with URLs and repo info (one issue per block)
+            echo "$all_issues" | jq -r '.[] |
+                "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \(.pipeline)\n    \(.title)\n    → \(.zenhubUrl)\n"'
+        else
+            # Compact view without URLs
+            echo "$all_issues" | jq -r '.[] |
+                "\(.repository.ownerName)/\(.repository.name)" as $repo |
+                "  #\(.number | tostring | (" " * (5 - length)) + .) │ \($repo | if length > 20 then .[:17] + "..." else . + (" " * (20 - length)) end) │ \(.pipeline | if length > 15 then .[:12] + "..." else . + (" " * (15 - length)) end) │ \(.title | if length > 35 then .[:32] + "..." else . end)"'
+        fi
     fi
-    echo ""
 }
 
 cmd_board() {
@@ -896,12 +950,17 @@ cmd_pipeline() {
 
     local pipeline_name=""
     local include_closed=false
+    local show_urls=true
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all|-a)
                 include_closed=true
+                shift
+                ;;
+            --no-urls)
+                show_urls=false
                 shift
                 ;;
             *)
@@ -914,9 +973,10 @@ cmd_pipeline() {
     done
 
     if [[ -z "$pipeline_name" ]]; then
-        error "Usage: zh pipeline <pipeline_name> [--all]
+        error "Usage: zh pipeline <pipeline_name> [--all] [--no-urls]
 Example: zh pipeline \"In Progress\"
-         zh pipeline todo --all    # Include closed issues"
+         zh pipeline todo --all       # Include closed issues
+         zh pipeline todo --no-urls   # Hide URLs"
     fi
 
     local owner_repo
@@ -963,7 +1023,7 @@ Example: zh pipeline \"In Progress\"
 
     # Get issues in this pipeline
     local query='
-    query($pipelineId: ID!, $filters: IssueSearchFiltersInput!) {
+    query($pipelineId: ID!, $workspaceId: ID!, $filters: IssueSearchFiltersInput!) {
         searchIssuesByPipeline(
             pipelineId: $pipelineId
             filters: $filters
@@ -973,6 +1033,7 @@ Example: zh pipeline \"In Progress\"
                 number
                 title
                 state
+                zenhubUrl(workspaceId: $workspaceId)
                 estimate {
                     value
                 }
@@ -981,13 +1042,17 @@ Example: zh pipeline \"In Progress\"
                         login
                     }
                 }
+                repository {
+                    ownerName
+                    name
+                }
             }
         }
     }'
 
     local variables
-    variables=$(jq -n --arg pipeline_id "$pipeline_id" \
-        '{pipelineId: $pipeline_id, filters: {}}')
+    variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg workspace_id "$workspace_id" \
+        '{pipelineId: $pipeline_id, workspaceId: $workspace_id, filters: {}}')
 
     local response
     response=$(zh_graphql "$query" "$variables")
@@ -1022,9 +1087,17 @@ Example: zh pipeline \"In Progress\"
     if [[ "$count" -eq 0 ]]; then
         echo "  No issues in this pipeline"
     else
-        echo "$issues" | jq -r '.[] |
-            "\(.state)" as $state |
-            "  #\(.number | tostring | (" " * (5 - length)) + .) │ \((.estimate.value // "—") | tostring | (" " * (3 - length)) + .) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end | if length > 12 then .[:9] + "..." else . end | . + (" " * (12 - length))) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title | if length > 43 then .[:40] + "..." else . end)"'
+        if [[ "$show_urls" == "true" ]]; then
+            # Show with URLs and repo info
+            echo "$issues" | jq -r '.[] |
+                "\(.state)" as $state |
+                "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\n    \(if $state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.zenhubUrl)\n"'
+        else
+            # Compact view without URLs
+            echo "$issues" | jq -r '.[] |
+                "\(.state)" as $state |
+                "  #\(.number | tostring | (" " * (5 - length)) + .) │ \((.estimate.value // "—") | tostring | (" " * (3 - length)) + .) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end | if length > 12 then .[:9] + "..." else . end | . + (" " * (12 - length))) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title | if length > 43 then .[:40] + "..." else . end)"'
+        fi
     fi
     echo ""
 }
@@ -1294,12 +1367,47 @@ Example: zh assign 679 daniel-pittman
         error "Issue #${issue_num} not found"
     fi
 
-    # Get the GitHub user ID
-    local gh_user_id
-    gh_user_id=$(gh api "users/${username}" --jq '.id' 2>/dev/null)
+    # Get workspace ID to look up user
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
 
-    if [[ -z "$gh_user_id" ]]; then
-        error "GitHub user '${username}' not found"
+    # Get the ZenHub user ID from workspace assignees
+    local user_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            assignees {
+                nodes {
+                    id
+                    login
+                }
+            }
+        }
+    }'
+
+    local user_vars
+    user_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local user_response
+    user_response=$(zh_graphql "$user_query" "$user_vars")
+
+    local zh_user_id
+    zh_user_id=$(echo "$user_response" | jq -r --arg user "$username" \
+        '.data.workspace.assignees.nodes[] | select(.login == $user) | .id // empty')
+
+    if [[ -z "$zh_user_id" ]]; then
+        error "User '${username}' not found in workspace. Use 'zh users' to list available users."
+    fi
+
+    # Check if user is already assigned
+    local already_assigned
+    already_assigned=$(echo "$issue_response" | jq -r --arg user "$username" \
+        '[.data.issueByInfo.assignees.nodes[].login] | index($user) // empty')
+
+    if [[ -n "$already_assigned" ]]; then
+        echo ""
+        success "${username} is already assigned to #${issue_num}: ${issue_title}"
+        echo -e "  Assignees: ${GREEN}${current_assignees}${NC}"
+        return 0
     fi
 
     info "Assigning ${username} to issue #${issue_num}..."
@@ -1307,26 +1415,32 @@ Example: zh assign 679 daniel-pittman
     local mutation='
     mutation($input: AddAssigneesToIssuesInput!) {
         addAssigneesToIssues(input: $input) {
-            issues {
-                id
-                assignees {
-                    nodes {
-                        login
-                    }
-                }
-            }
+            successCount
+            githubErrors
         }
     }'
 
     local mutation_vars
-    mutation_vars=$(jq -n --arg issue_id "$issue_id" --argjson user_id "$gh_user_id" \
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg user_id "$zh_user_id" \
         '{input: {issueIds: [$issue_id], assigneeIds: [$user_id]}}')
 
     local response
     response=$(zh_graphql "$mutation" "$mutation_vars")
 
+    local success_count
+    success_count=$(echo "$response" | jq -r '.data.addAssigneesToIssues.successCount // 0')
+
+    if [[ "$success_count" -eq 0 ]]; then
+        local github_errors
+        github_errors=$(echo "$response" | jq -r '.data.addAssigneesToIssues.githubErrors // "Unknown error"')
+        error "Failed to assign ${username}: ${github_errors}"
+    fi
+
+    # Brief delay then re-fetch to get updated assignees list
+    sleep 0.5
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
     local new_assignees
-    new_assignees=$(echo "$response" | jq -r '[.data.addAssigneesToIssues.issues[0].assignees.nodes[].login] | join(", ")')
+    new_assignees=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].login] | join(", ")')
 
     echo ""
     success "Assigned ${username} to #${issue_num}: ${issue_title}"
@@ -1414,14 +1528,8 @@ Examples:
     local mutation='
     mutation($input: RemoveAssigneesFromIssuesInput!) {
         removeAssigneesFromIssues(input: $input) {
-            issues {
-                id
-                assignees {
-                    nodes {
-                        login
-                    }
-                }
-            }
+            successCount
+            githubErrors
         }
     }'
 
@@ -1432,8 +1540,20 @@ Examples:
     local response
     response=$(zh_graphql "$mutation" "$mutation_vars")
 
+    local success_count
+    success_count=$(echo "$response" | jq -r '.data.removeAssigneesFromIssues.successCount // 0')
+
+    if [[ "$success_count" -eq 0 ]]; then
+        local github_errors
+        github_errors=$(echo "$response" | jq -r '.data.removeAssigneesFromIssues.githubErrors // "Unknown error"')
+        error "Failed to remove assignee(s): ${github_errors}"
+    fi
+
+    # Brief delay then re-fetch to get updated assignees list
+    sleep 0.5
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
     local remaining_assignees
-    remaining_assignees=$(echo "$response" | jq -r '[.data.removeAssigneesFromIssues.issues[0].assignees.nodes[].login] | join(", ") | if . == "" then "none" else . end')
+    remaining_assignees=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].login] | join(", ") | if . == "" then "none" else . end')
 
     echo ""
     if [[ -n "$username" ]]; then
@@ -1576,6 +1696,99 @@ Example: zh attach 42"
     else
         echo -e "  URL: ${CYAN}${url}${NC}"
         echo "  (Could not auto-open browser)"
+    fi
+}
+
+cmd_close() {
+    load_config
+
+    local issue_num="${1:-}"
+    local comment="${2:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh close <issue_number> [comment]
+
+Close an issue (moves it to Closed pipeline in ZenHub).
+
+Examples:
+  zh close 42
+  zh close 42 \"Completed in PR #99\""
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    # Get issue title first for confirmation message
+    local issue_title
+    issue_title=$(gh issue view "$issue_num" --repo "$owner_repo" --json title --jq '.title' 2>/dev/null)
+
+    if [[ -z "$issue_title" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    info "Closing issue #${issue_num}..."
+
+    # Close the issue via GitHub CLI (syncs to ZenHub automatically)
+    if [[ -n "$comment" ]]; then
+        # Add comment and close
+        gh issue close "$issue_num" --repo "$owner_repo" --comment "$comment" 2>/dev/null
+    else
+        gh issue close "$issue_num" --repo "$owner_repo" 2>/dev/null
+    fi
+
+    if [[ $? -eq 0 ]]; then
+        echo ""
+        success "Closed #${issue_num}: ${issue_title}"
+        if [[ -n "$comment" ]]; then
+            echo -e "  Comment: ${comment}"
+        fi
+        echo -e "  ${CYAN}Note:${NC} Issue moved to Closed pipeline in ZenHub"
+    else
+        error "Failed to close issue #${issue_num}"
+    fi
+}
+
+cmd_reopen() {
+    load_config
+
+    local issue_num="${1:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh reopen <issue_number>
+
+Reopen a closed issue.
+
+Example: zh reopen 42"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    # Get issue title first for confirmation message
+    local issue_title
+    issue_title=$(gh issue view "$issue_num" --repo "$owner_repo" --json title --jq '.title' 2>/dev/null)
+
+    if [[ -z "$issue_title" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    info "Reopening issue #${issue_num}..."
+
+    # Reopen the issue via GitHub CLI
+    gh issue reopen "$issue_num" --repo "$owner_repo" 2>/dev/null
+
+    if [[ $? -eq 0 ]]; then
+        echo ""
+        success "Reopened #${issue_num}: ${issue_title}"
+        echo -e "  ${CYAN}Note:${NC} Issue moved back to New Issues pipeline in ZenHub"
+    else
+        error "Failed to reopen issue #${issue_num}"
     fi
 }
 
@@ -2311,6 +2524,12 @@ main() {
             ;;
         attach)
             cmd_attach "$@"
+            ;;
+        close)
+            cmd_close "$@"
+            ;;
+        reopen)
+            cmd_reopen "$@"
             ;;
         types)
             cmd_types "$@"
