@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # =============================================================================
 # Configuration
@@ -105,7 +105,15 @@ get_repo_info() {
     remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 
     if [[ -z "$remote_url" ]]; then
-        error "Not in a git repository or no origin remote found"
+        error "Not in a git repository with a GitHub remote.
+
+This command must be run from within a git repository that:
+  1. Has a GitHub remote configured (origin)
+  2. Is connected to a ZenHub workspace
+
+To fix:
+  - cd into your project directory
+  - Ensure 'git remote -v' shows a GitHub URL"
     fi
 
     # Parse owner/repo from various URL formats
@@ -239,7 +247,11 @@ COMMANDS:
                            Example: zh estimate 679 clear
 
     assign <issue> <user>   Assign a user to an issue
-                           Example: zh assign 679 daniel-pittman
+                           Example: zh assign 42 johndoe
+
+    unassign <issue> [user] Remove assignee(s) from an issue
+                           Example: zh unassign 42 johndoe  (remove one)
+                           Example: zh unassign 42          (remove all)
 
     create <title> [opts]   Create a new issue
                            -t, --type <type>     Issue type
@@ -1290,6 +1302,117 @@ Example: zh assign 679 daniel-pittman
     echo -e "  Assignees: ${GREEN}${new_assignees}${NC}"
 }
 
+cmd_unassign() {
+    load_config
+
+    local issue_num="${1:-}"
+    local username="${2:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh unassign <issue_number> [username]
+
+Examples:
+  zh unassign 42 johndoe    # Remove johndoe from issue
+  zh unassign 42            # Remove all assignees from issue"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+    # Strip @ prefix if present (if username provided)
+    [[ -n "$username" ]] && username="${username#@}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Get the issue ID and current assignees
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            assignees {
+                nodes {
+                    id
+                    login
+                }
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    # Determine which assignees to remove
+    local assignee_ids_to_remove
+    if [[ -n "$username" ]]; then
+        # Remove specific user - get their ID from the issue's assignees
+        assignee_ids_to_remove=$(echo "$issue_response" | jq -r --arg user "$username" \
+            '[.data.issueByInfo.assignees.nodes[] | select(.login == $user) | .id]')
+
+        if [[ "$assignee_ids_to_remove" == "[]" ]]; then
+            error "User '${username}' is not assigned to issue #${issue_num}"
+        fi
+
+        info "Removing ${username} from issue #${issue_num}..."
+    else
+        # Remove all assignees
+        assignee_ids_to_remove=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].id]')
+
+        if [[ "$assignee_ids_to_remove" == "[]" ]]; then
+            error "Issue #${issue_num} has no assignees"
+        fi
+
+        info "Removing all assignees from issue #${issue_num}..."
+    fi
+
+    local mutation='
+    mutation($input: RemoveAssigneesFromIssuesInput!) {
+        removeAssigneesFromIssues(input: $input) {
+            issues {
+                id
+                assignees {
+                    nodes {
+                        login
+                    }
+                }
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --argjson assignee_ids "$assignee_ids_to_remove" \
+        '{input: {issueIds: [$issue_id], assigneeIds: $assignee_ids}}')
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local remaining_assignees
+    remaining_assignees=$(echo "$response" | jq -r '[.data.removeAssigneesFromIssues.issues[0].assignees.nodes[].login] | join(", ") | if . == "" then "none" else . end')
+
+    echo ""
+    if [[ -n "$username" ]]; then
+        success "Removed ${username} from #${issue_num}: ${issue_title}"
+    else
+        success "Removed all assignees from #${issue_num}: ${issue_title}"
+    fi
+    echo -e "  Assignees: ${CYAN}${remaining_assignees}${NC}"
+}
+
 cmd_create() {
     load_config
 
@@ -1966,6 +2089,9 @@ main() {
             ;;
         assign)
             cmd_assign "$@"
+            ;;
+        unassign)
+            cmd_unassign "$@"
             ;;
         create|new)
             cmd_create "$@"

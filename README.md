@@ -122,6 +122,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `reorder <issue> <position>` | `order`, `pos` | Reorder issue within its pipeline |
 | `estimate <issue> <points>` | `est`, `points` | Set story point estimate |
 | `assign <issue> <user>` | | Assign a user to an issue |
+| `unassign <issue> [user]` | | Remove assignee(s) from an issue |
 | `create <title> [options]` | `new` | Create a new issue |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
@@ -188,6 +189,10 @@ zh estimate 42 clear      # Remove estimate
 # Assign users
 zh assign 42 username
 zh assign 42 @username    # @ prefix works too
+
+# Remove assignees
+zh unassign 42 username   # Remove specific user
+zh unassign 42            # Remove all assignees
 ```
 
 ### Create Issues
