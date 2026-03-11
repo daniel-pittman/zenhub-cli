@@ -301,6 +301,26 @@ COMMANDS:
     reopen <issue>          Reopen a closed issue
                            Example: zh reopen 42
 
+    sprints [--all]         List sprints in workspace
+                           Shows open sprints by default
+                           Example: zh sprints
+                           Example: zh sprints --all
+
+    sprint <name> [opts]   View sprint details and issues
+                           Example: zh sprint "Sprint 5"
+                           Example: zh sprint current
+                           Example: zh sprint current --no-urls
+
+    sprint-add <issue> <sprint>
+                           Add an issue to a sprint
+                           Example: zh sprint-add 42 "Sprint 5"
+                           Example: zh sprint-add 42 current
+
+    sprint-remove <issue> <sprint>
+                           Remove an issue from a sprint
+                           Example: zh sprint-remove 42 "Sprint 5"
+                           Example: zh sprint-remove 42 current
+
     block <issue> <blocker> Set issue as blocked by another
                            Example: zh block 123 456
                            (123 is blocked by 456)
@@ -344,6 +364,9 @@ ALIASES:
     reorder: order, pos
     estimate: est, points
     create: new
+    sprints: sp
+    sprint-add: sa
+    sprint-remove: sr
     workspaces: ws
 
 EXAMPLES:
@@ -360,6 +383,10 @@ EXAMPLES:
     zh create "Fix bug" -t Bug -e 2 # Create new bug with estimate
     zh types                        # List issue types
     zh labels                       # List available labels
+    zh sprints                      # List open sprints
+    zh sprint current               # View active sprint issues
+    zh sprint-add 42 current        # Add issue to active sprint
+    zh sprint-remove 42 "Sprint 5"  # Remove issue from sprint
     zh block 123 456                # 123 blocked by 456
     zh priority 679 high            # Set high priority
     cat desc.md | zh create "Title" --stdin  # Body from stdin
@@ -2332,6 +2359,538 @@ Generate a new token at: https://app.zenhub.com/dashboard/tokens"
     fi
 }
 
+cmd_sprints() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local show_all=false
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a)
+                show_all=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    info "Getting sprints..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local query
+    if [[ "$show_all" == "true" ]]; then
+        query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                name
+                activeSprint {
+                    id
+                }
+                sprints(first: 50) {
+                    nodes {
+                        id
+                        name
+                        state
+                        startAt
+                        endAt
+                        completedPoints
+                        totalPoints
+                        closedIssuesCount
+                    }
+                }
+            }
+        }'
+    else
+        query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                name
+                activeSprint {
+                    id
+                }
+                sprints(first: 50, filters: { state: { eq: OPEN } }) {
+                    nodes {
+                        id
+                        name
+                        state
+                        startAt
+                        endAt
+                        completedPoints
+                        totalPoints
+                        closedIssuesCount
+                    }
+                }
+            }
+        }'
+    fi
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local workspace_name active_sprint_id
+    workspace_name=$(echo "$response" | jq -r '.data.workspace.name')
+    active_sprint_id=$(echo "$response" | jq -r '.data.workspace.activeSprint.id // empty')
+
+    local count
+    count=$(echo "$response" | jq '.data.workspace.sprints.nodes | length')
+
+    echo ""
+    if [[ "$show_all" == "true" ]]; then
+        echo -e "${BOLD}Sprints in ${workspace_name}${NC} (${count} total)"
+    else
+        echo -e "${BOLD}Sprints in ${workspace_name}${NC} (${count} open)"
+    fi
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  No sprints found"
+    else
+        echo "$response" | jq -r --arg active_id "$active_sprint_id" '.data.workspace.sprints.nodes[] |
+            "\(.id)" as $id |
+            "\(.startAt[:10] // "?")" as $start |
+            "\(.endAt[:10] // "?")" as $end |
+            "  \(if $id == $active_id then "● " else "  " end)\(.name)\n    \(.state) │ \($start) → \($end) │ \(.completedPoints // 0)/\(.totalPoints // 0) pts │ \(.closedIssuesCount) closed\n"'
+    fi
+
+    echo -e "${CYAN}Tip:${NC} Use 'zh sprint <name>' to view issues in a sprint"
+    if [[ "$show_all" != "true" ]]; then
+        echo -e "${CYAN}Tip:${NC} Use --all to include closed sprints"
+    fi
+    echo ""
+}
+
+cmd_sprint() {
+    load_config
+
+    local sprint_name=""
+    local show_urls=true
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-urls)
+                show_urls=false
+                shift
+                ;;
+            *)
+                if [[ -z "$sprint_name" ]]; then
+                    sprint_name="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$sprint_name" ]]; then
+        error "Usage: zh sprint <name> [--no-urls]
+
+View issues in a sprint.
+
+Examples:
+  zh sprint \"Sprint 5\"
+  zh sprint current          # View active sprint
+  zh sprint current --no-urls"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting sprint details..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Get all open sprints to find the one we want
+    local sprints_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            activeSprint {
+                id
+                name
+            }
+            sprints(first: 50, filters: {}) {
+                nodes {
+                    id
+                    name
+                    state
+                }
+            }
+        }
+    }'
+
+    local sprints_vars
+    sprints_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local sprints_response
+    sprints_response=$(zh_graphql "$sprints_query" "$sprints_vars")
+
+    local sprint_id
+    if [[ "$sprint_name" == "current" ]] || [[ "$sprint_name" == "active" ]]; then
+        sprint_id=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.id // empty')
+        if [[ -z "$sprint_id" ]]; then
+            error "No active sprint found"
+        fi
+        sprint_name=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.name')
+    else
+        # Find sprint by name (case-insensitive)
+        sprint_id=$(echo "$sprints_response" | jq -r --arg name "$sprint_name" \
+            '.data.workspace.sprints.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+
+        if [[ -z "$sprint_id" ]]; then
+            echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            echo ""
+            echo "Available sprints:"
+            echo "$sprints_response" | jq -r '.data.workspace.sprints.nodes[] | "  - \(.name) (\(.state))"'
+            exit 1
+        fi
+    fi
+
+    # Get sprint details with issues
+    local detail_query='
+    query($sprintId: ID!) {
+        node(id: $sprintId) {
+            ... on Sprint {
+                id
+                name
+                description
+                state
+                startAt
+                endAt
+                completedPoints
+                totalPoints
+                closedIssuesCount
+                sprintIssues(first: 100) {
+                    nodes {
+                        issue {
+                            number
+                            title
+                            state
+                            htmlUrl
+                            estimate {
+                                value
+                            }
+                            assignees {
+                                nodes {
+                                    login
+                                }
+                            }
+                            repository {
+                                ownerName
+                                name
+                            }
+                            pipelineIssues {
+                                nodes {
+                                    pipeline {
+                                        name
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local detail_vars
+    detail_vars=$(jq -n --arg sprint_id "$sprint_id" '{sprintId: $sprint_id}')
+
+    local detail_response
+    detail_response=$(zh_graphql "$detail_query" "$detail_vars")
+
+    local sprint_state start_at end_at completed_pts total_pts closed_count description
+    sprint_state=$(echo "$detail_response" | jq -r '.data.node.state // "UNKNOWN"')
+    start_at=$(echo "$detail_response" | jq -r '.data.node.startAt[:10] // "?"')
+    end_at=$(echo "$detail_response" | jq -r '.data.node.endAt[:10] // "?"')
+    completed_pts=$(echo "$detail_response" | jq -r '.data.node.completedPoints // 0')
+    total_pts=$(echo "$detail_response" | jq -r '.data.node.totalPoints // 0')
+    closed_count=$(echo "$detail_response" | jq -r '.data.node.closedIssuesCount // 0')
+    description=$(echo "$detail_response" | jq -r '.data.node.description // empty')
+
+    local issue_count
+    issue_count=$(echo "$detail_response" | jq '.data.node.sprintIssues.nodes | length')
+
+    echo ""
+    echo -e "${BOLD}Sprint: ${sprint_name}${NC}"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}     ${sprint_state}"
+    echo -e "  ${CYAN}Period:${NC}    ${start_at} → ${end_at}"
+    echo -e "  ${CYAN}Points:${NC}    ${completed_pts}/${total_pts} completed"
+    echo -e "  ${CYAN}Closed:${NC}    ${closed_count} issues"
+    if [[ -n "$description" ]]; then
+        echo -e "  ${CYAN}Description:${NC} ${description}"
+    fi
+    echo ""
+    echo -e "${BOLD}Issues (${issue_count}):${NC}"
+    echo ""
+
+    if [[ "$issue_count" -eq 0 ]]; then
+        echo "  No issues in this sprint"
+    else
+        if [[ "$show_urls" == "true" ]]; then
+            echo "$detail_response" | jq -r '.data.node.sprintIssues.nodes[].issue |
+                "\(.state)" as $state |
+                "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(.pipelineIssues.nodes[0].pipeline.name // "—")\n    \(if $state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.htmlUrl)\n"'
+        else
+            echo "$detail_response" | jq -r '.data.node.sprintIssues.nodes[].issue |
+                "\(.state)" as $state |
+                "  #\(.number | tostring | (" " * (5 - length)) + .) │ \((.estimate.value // "—") | tostring | (" " * (3 - length)) + .) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end | if length > 12 then .[:9] + "..." else . end | . + (" " * (12 - length))) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title | if length > 40 then .[:37] + "..." else . end)"'
+        fi
+    fi
+    echo ""
+}
+
+cmd_sprint_add() {
+    load_config
+
+    local issue_num="${1:-}"
+    local sprint_name="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$sprint_name" ]]; then
+        error "Usage: zh sprint-add <issue_number> <sprint_name>
+
+Add an issue to a sprint.
+
+Examples:
+  zh sprint-add 42 \"Sprint 5\"
+  zh sprint-add 42 current    # Add to active sprint"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Adding issue #${issue_num} to sprint '${sprint_name}'..."
+
+    # Get issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    # Get sprint ID
+    local sprints_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            activeSprint {
+                id
+                name
+            }
+            sprints(first: 50, filters: { state: { eq: OPEN } }) {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local sprints_vars
+    sprints_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local sprints_response
+    sprints_response=$(zh_graphql "$sprints_query" "$sprints_vars")
+
+    local sprint_id sprint_actual_name
+    if [[ "$sprint_name" == "current" ]] || [[ "$sprint_name" == "active" ]]; then
+        sprint_id=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.id // empty')
+        sprint_actual_name=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.name')
+        if [[ -z "$sprint_id" ]]; then
+            error "No active sprint found"
+        fi
+    else
+        sprint_id=$(echo "$sprints_response" | jq -r --arg name "$sprint_name" \
+            '.data.workspace.sprints.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+        sprint_actual_name=$(echo "$sprints_response" | jq -r --arg name "$sprint_name" \
+            '.data.workspace.sprints.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .name' | head -1)
+
+        if [[ -z "$sprint_id" ]]; then
+            echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            echo ""
+            echo "Available open sprints:"
+            echo "$sprints_response" | jq -r '.data.workspace.sprints.nodes[] | "  - \(.name)"'
+            exit 1
+        fi
+    fi
+
+    # Add issue to sprint
+    local mutation='
+    mutation($issueIds: [ID!]!, $sprintIds: [ID!]!) {
+        addIssuesToSprints(input: {
+            issueIds: $issueIds,
+            sprintIds: $sprintIds
+        }) {
+            clientMutationId
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg sprint_id "$sprint_id" \
+        '{issueIds: [$issue_id], sprintIds: [$sprint_id]}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Added #${issue_num} (${issue_title}) to sprint '${sprint_actual_name}'"
+}
+
+cmd_sprint_remove() {
+    load_config
+
+    local issue_num="${1:-}"
+    local sprint_name="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$sprint_name" ]]; then
+        error "Usage: zh sprint-remove <issue_number> <sprint_name>
+
+Remove an issue from a sprint.
+
+Examples:
+  zh sprint-remove 42 \"Sprint 5\"
+  zh sprint-remove 42 current    # Remove from active sprint"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Removing issue #${issue_num} from sprint '${sprint_name}'..."
+
+    # Get issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    # Get sprint ID
+    local sprints_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            activeSprint {
+                id
+                name
+            }
+            sprints(first: 50, filters: {}) {
+                nodes {
+                    id
+                    name
+                }
+            }
+        }
+    }'
+
+    local sprints_vars
+    sprints_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local sprints_response
+    sprints_response=$(zh_graphql "$sprints_query" "$sprints_vars")
+
+    local sprint_id sprint_actual_name
+    if [[ "$sprint_name" == "current" ]] || [[ "$sprint_name" == "active" ]]; then
+        sprint_id=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.id // empty')
+        sprint_actual_name=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.name')
+        if [[ -z "$sprint_id" ]]; then
+            error "No active sprint found"
+        fi
+    else
+        sprint_id=$(echo "$sprints_response" | jq -r --arg name "$sprint_name" \
+            '.data.workspace.sprints.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+        sprint_actual_name=$(echo "$sprints_response" | jq -r --arg name "$sprint_name" \
+            '.data.workspace.sprints.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .name' | head -1)
+
+        if [[ -z "$sprint_id" ]]; then
+            echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            echo ""
+            echo "Available sprints:"
+            echo "$sprints_response" | jq -r '.data.workspace.sprints.nodes[] | "  - \(.name)"'
+            exit 1
+        fi
+    fi
+
+    # Remove issue from sprint
+    local mutation='
+    mutation($issueIds: [ID!]!, $sprintIds: [ID!]!) {
+        removeIssuesFromSprints(input: {
+            issueIds: $issueIds,
+            sprintIds: $sprintIds
+        }) {
+            clientMutationId
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg sprint_id "$sprint_id" \
+        '{issueIds: [$issue_id], sprintIds: [$sprint_id]}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Removed #${issue_num} (${issue_title}) from sprint '${sprint_actual_name}'"
+}
+
 cmd_priority() {
     load_config
 
@@ -2539,6 +3098,18 @@ main() {
             ;;
         users)
             cmd_users "$@"
+            ;;
+        sprints|sp)
+            cmd_sprints "$@"
+            ;;
+        sprint)
+            cmd_sprint "$@"
+            ;;
+        sprint-add|sa)
+            cmd_sprint_add "$@"
+            ;;
+        sprint-remove|sr)
+            cmd_sprint_remove "$@"
             ;;
         block|blocked-by|depends)
             cmd_block "$@"

@@ -133,6 +133,10 @@ ZH_REST_TOKEN=your_rest_token_here
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
+| `sprints [--all]` | `sp` | List sprints in workspace |
+| `sprint <name>` | | View sprint details and issues |
+| `sprint-add <issue> <sprint>` | `sa` | Add an issue to a sprint |
+| `sprint-remove <issue> <sprint>` | `sr` | Remove an issue from a sprint |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -295,6 +299,35 @@ zh priority 42 high
 zh priority 42 clear
 ```
 
+### Sprints
+
+```bash
+# List open sprints (● marks the active sprint)
+zh sprints
+
+# Include closed sprints
+zh sprints --all
+
+# View active sprint details and issues
+zh sprint current
+
+# View a specific sprint
+zh sprint "Sprint 5"
+zh sprint "Sprint 5" --no-urls   # Compact output
+
+# Add an issue to a sprint
+zh sprint-add 42 "Sprint 5"
+zh sprint-add 42 current         # Add to active sprint
+
+# Remove an issue from a sprint
+zh sprint-remove 42 "Sprint 5"
+zh sprint-remove 42 current
+
+# Move an issue between sprints
+zh sprint-remove 42 "Sprint 4"
+zh sprint-add 42 "Sprint 5"
+```
+
 ### Discovery Commands
 
 ```bash
@@ -353,27 +386,33 @@ zh pipeline todo -a   # All issues including closed
 ```bash
 # 1. Get the big picture
 zh board
+zh sprints
 
-# 2. Review backlog
+# 2. Review backlog and current sprint
 zh pipeline "Product Backlog"
+zh sprint current
 
-# 3. Move items to sprint
+# 3. Add items to the sprint
+zh sprint-add 123 current
+zh sprint-add 456 current
+
+# 4. Move to pipeline
 zh move 123 "TO DO"
 zh move 456 "TO DO"
 
-# 4. Prioritize the sprint
+# 5. Prioritize the sprint
 zh reorder 123 top
 zh reorder 456 1
 
-# 5. Set estimates
+# 6. Set estimates
 zh estimate 123 3
 zh estimate 456 5
 
-# 6. Assign work
+# 7. Assign work
 zh assign 123 developer1
 zh assign 456 developer2
 
-# 7. Check specific issues
+# 8. Check specific issues
 zh issue 123
 ```
 
@@ -395,11 +434,9 @@ AI: [runs zh labels, zh types to see options]
 ```
 User: What's in our current sprint?
 
-AI: [runs zh board]
-    [runs zh pipeline "TO DO"]
-    [runs zh pipeline "In Progress"]
+AI: [runs zh sprint current]
 
-    Summarizes work and blockers
+    Summarizes work, progress, and blockers
 ```
 
 **Bulk Operations:**

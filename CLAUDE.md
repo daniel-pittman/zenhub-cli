@@ -20,6 +20,15 @@ zh users                # List assignable users
 zh board                # Board overview
 zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 
+# Sprints
+zh sprints                        # List open sprints (● = active)
+zh sprints --all                  # Include closed sprints
+zh sprint "Sprint 5"              # View sprint details and issues
+zh sprint current                 # View active sprint
+zh sprint-add <issue> "Sprint"    # Add issue to sprint
+zh sprint-add <issue> current     # Add issue to active sprint
+zh sprint-remove <issue> "Sprint" # Remove issue from sprint
+
 # Manage issues
 zh move <issue> "Pipeline"    # Move to pipeline
 zh reorder <issue> top        # Prioritize
@@ -51,6 +60,7 @@ zh pipelines            # List pipelines
 3. **Closed issues**: Use `--all` flag to include closed: `zh board --all`
 4. **ZenHub URLs**: Shown by default in `mine` and `pipeline`; use `--no-urls` to hide
 5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
+6. **Sprint names**: Case-insensitive; use `current` or `active` as alias for the active sprint
 
 ## For AI Assistants
 
@@ -91,19 +101,20 @@ zh create "Login fails with special characters" \
 ```bash
 # Get overview
 zh board
+zh sprints
 
-# Review backlog
+# Review backlog and current sprint
 zh pipeline "Product Backlog"
+zh sprint current
 
-# Move items to sprint
+# Add items to sprint and move to pipeline
+zh sprint-add 123 current
+zh sprint-add 456 current
 zh move 123 "TO DO"
 zh move 456 "TO DO"
 
-# Prioritize
+# Prioritize and estimate
 zh reorder 123 top
-zh reorder 456 1
-
-# Estimate
 zh estimate 123 3
 zh estimate 456 5
 ```
