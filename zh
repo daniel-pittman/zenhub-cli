@@ -203,12 +203,32 @@ get_workspace_id() {
     local response
     response=$(zh_graphql "$query" "$variables")
 
-    # Get first workspace
     local workspace_id
-    workspace_id=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[0].id // empty')
+    local workspace_nodes
+    workspace_nodes=$(echo "$response" | jq -c '.data.repositoriesByGhId[0].workspacesConnection.nodes')
 
-    if [[ -z "$workspace_id" ]]; then
+    local node_count
+    node_count=$(echo "$workspace_nodes" | jq 'length')
+
+    if [[ "$node_count" -eq 0 ]]; then
         error "No workspace found for this repository"
+    fi
+
+    if [[ -n "${ZH_WORKSPACE_NAME:-}" ]]; then
+        # Find workspace by name (case-insensitive)
+        workspace_id=$(echo "$workspace_nodes" | jq -r --arg name "$ZH_WORKSPACE_NAME" \
+            '[.[] | select((.name | ascii_downcase) == ($name | ascii_downcase))] | .[0].id // empty')
+
+        if [[ -z "$workspace_id" ]]; then
+            echo -e "${RED}Error:${NC} Workspace '${ZH_WORKSPACE_NAME}' not found." >&2
+            echo "" >&2
+            echo "Available workspaces:" >&2
+            echo "$workspace_nodes" | jq -r '.[] | "  - \(.name)"' >&2
+            exit 1
+        fi
+    else
+        # Default to first workspace
+        workspace_id=$(echo "$workspace_nodes" | jq -r '.[0].id // empty')
     fi
 
     echo "$workspace_id"
@@ -233,7 +253,11 @@ cmd_help() {
 zh - ZenHub CLI Tool
 
 USAGE:
-    zh <command> [options]
+    zh [-w <workspace>] <command> [options]
+
+GLOBAL OPTIONS:
+    -w, --workspace <name>  Target a specific workspace (default: first found)
+                            Can also set ZH_WORKSPACE in config/env
 
 COMMANDS:
     issue <number>          View issue details
@@ -349,6 +373,7 @@ CONFIGURATION:
     Create ~/.config/zh/config with:
         ZH_TOKEN=your_graphql_token
         ZH_REST_TOKEN=your_rest_token
+        ZH_WORKSPACE=your_default_workspace  (optional)
 
     Generate tokens at:
         GraphQL: https://app.zenhub.com/settings/tokens
@@ -390,6 +415,9 @@ EXAMPLES:
     zh block 123 456                # 123 blocked by 456
     zh priority 679 high            # Set high priority
     cat desc.md | zh create "Title" --stdin  # Body from stdin
+    zh -w "Backend" board           # Board for specific workspace
+    zh -w "Backend" sprints         # Sprints in specific workspace
+    zh -w "Backend" move 42 "Done"  # Move issue in specific workspace
 EOF
 }
 
@@ -3032,6 +3060,28 @@ Examples:
 # =============================================================================
 
 main() {
+    # Parse global flags before command
+    ZH_WORKSPACE_NAME="${ZH_WORKSPACE:-}"
+
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -w|--workspace)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires a workspace name"
+                fi
+                ZH_WORKSPACE_NAME="$2"
+                shift 2
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    set -- "${args[@]}"
+
     local command="${1:-help}"
     shift || true
 

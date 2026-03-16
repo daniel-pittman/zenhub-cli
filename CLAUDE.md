@@ -51,6 +51,14 @@ zh priority <issue> high      # Set priority
 zh types                # List issue types
 zh labels               # List labels
 zh pipelines            # List pipelines
+zh workspaces           # List available workspaces
+
+# Workspace targeting (global -w flag)
+zh -w "Backend" board               # Board for a specific workspace
+zh -w "Backend" sprints             # Sprints in a specific workspace
+zh -w "Backend" sprint current      # Active sprint in a workspace
+zh -w "Backend" move 42 "Done"      # Move issue in a specific workspace
+zh -w "Backend" pipeline "TO DO"    # Pipeline in a specific workspace
 ```
 
 ### Important Patterns
@@ -61,6 +69,7 @@ zh pipelines            # List pipelines
 4. **ZenHub URLs**: Shown by default in `mine` and `pipeline`; use `--no-urls` to hide
 5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
 6. **Sprint names**: Case-insensitive; use `current` or `active` as alias for the active sprint
+7. **Workspace targeting**: Use `-w "Name"` before any command to target a specific workspace, or set `ZH_WORKSPACE` in config
 
 ## For AI Assistants
 
@@ -157,6 +166,7 @@ The tool reads tokens from `~/.config/zh/config`:
 ```bash
 ZH_TOKEN=...        # GraphQL API token (most commands)
 ZH_REST_TOKEN=...   # REST API token (unblock command only)
+ZH_WORKSPACE=...    # Default workspace name (optional, uses first found if unset)
 ```
 
 ## Development Notes
