@@ -577,13 +577,6 @@ Example: zh move 679 \"In Review\""
             id
             number
             title
-            pipelineIssues {
-                nodes {
-                    pipeline {
-                        name
-                    }
-                }
-            }
         }
     }'
 
@@ -604,8 +597,10 @@ Example: zh move 679 \"In Review\""
     local issue_title
     issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
 
-    local current_pipeline
-    current_pipeline=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.name // "Unknown"')
+    # Get actual pipeline name we matched (for display)
+    local target_pipeline_name
+    target_pipeline_name=$(echo "$pipelines_response" | jq -r --arg id "$pipeline_id" \
+        '.data.workspace.pipelinesConnection.nodes[] | select(.id == $id) | .name')
 
     # Move the issue
     local move_mutation='
@@ -613,13 +608,6 @@ Example: zh move 679 \"In Review\""
         moveIssue(input: $input) {
             issue {
                 id
-                pipelineIssues {
-                    nodes {
-                        pipeline {
-                            name
-                        }
-                    }
-                }
             }
         }
     }'
@@ -630,19 +618,11 @@ Example: zh move 679 \"In Review\""
         --arg pipeline_id "$pipeline_id" \
         '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: 0}}')
 
-    local move_response
-    move_response=$(zh_graphql "$move_mutation" "$move_vars")
+    zh_graphql "$move_mutation" "$move_vars" > /dev/null
 
-    local new_pipeline
-    new_pipeline=$(echo "$move_response" | jq -r '.data.moveIssue.issue.pipelineIssues.nodes[0].pipeline.name // empty')
-
-    if [[ -n "$new_pipeline" ]]; then
-        echo ""
-        success "Moved issue #${issue_num}: ${issue_title}"
-        echo -e "  ${CYAN}${current_pipeline}${NC} → ${GREEN}${new_pipeline}${NC}"
-    else
-        error "Failed to move issue"
-    fi
+    echo ""
+    success "Moved issue #${issue_num}: ${issue_title}"
+    echo -e "  → ${GREEN}${target_pipeline_name}${NC}"
 }
 
 cmd_issue() {
