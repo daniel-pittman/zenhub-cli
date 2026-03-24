@@ -378,6 +378,13 @@ COMMANDS:
     children <issue>        List sub-issues of an issue
                            Example: zh children 100
 
+    link <pr> <issue>      Link a PR to an issue
+                           Example: zh link 42 100
+                           Example: zh link owner/repo#42 owner/repo#100
+
+    unlink <pr> <issue>    Unlink a PR from an issue
+                           Example: zh unlink 42 100
+
     block <issue> <blocker> Set issue as blocked by another
                            Example: zh block 123 456
                            (123 is blocked by 456)
@@ -424,6 +431,8 @@ ALIASES:
     create: new
     set-type: type
     set-parent: add-parent
+    link: connect
+    unlink: disconnect
     children: sub-issues, subs
     sprints: sp
     sprint-add: sa
@@ -2532,6 +2541,202 @@ Examples:
     echo -e "  ${parent_display} (${parent_title})"
 }
 
+cmd_link() {
+    load_config
+
+    local pr_ref="${1:-}"
+    local issue_ref="${2:-}"
+
+    if [[ -z "$pr_ref" ]] || [[ -z "$issue_ref" ]]; then
+        error "Usage: zh link <pr> <issue>
+
+Link a pull request to an issue.
+
+Examples:
+  zh link 42 100                                       # Same repo
+  zh link owner/repo#42 owner/other-repo#100           # Cross-repo"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
+
+    # Parse PR reference
+    parse_issue_ref "$pr_ref" "$default_repo_id"
+    local pr_repo_id="$PARSED_REPO_ID"
+    local pr_num="$PARSED_ISSUE_NUM"
+    local pr_display="$PARSED_DISPLAY"
+
+    # Parse issue reference
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local issue_repo_id="$PARSED_REPO_ID"
+    local issue_num="$PARSED_ISSUE_NUM"
+    local issue_display="$PARSED_DISPLAY"
+
+    info "Linking PR ${pr_display} to issue ${issue_display}..."
+
+    # Get PR ID
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            pullRequest
+        }
+    }'
+
+    local pr_vars
+    pr_vars=$(jq -n --arg repo_id "$pr_repo_id" --argjson issue_num "$pr_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local pr_response
+    pr_response=$(zh_graphql "$query" "$pr_vars")
+
+    local pr_id pr_title
+    pr_id=$(echo "$pr_response" | jq -r '.data.issueByInfo.id // empty')
+    pr_title=$(echo "$pr_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$pr_id" ]]; then
+        error "PR ${pr_display} not found"
+    fi
+
+    # Get issue ID
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$issue_repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$query" "$issue_vars")
+
+    local issue_id issue_title
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue ${issue_display} not found"
+    fi
+
+    local mutation='
+    mutation($input: CreateIssuePrConnectionInput!) {
+        createIssuePrConnection(input: $input) {
+            issue {
+                id
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg pr_id "$pr_id" \
+        '{input: {issueId: $issue_id, pullRequestId: $pr_id}}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Linked PR to issue"
+    echo -e "  ${pr_display} (${pr_title})"
+    echo -e "  ${CYAN}→${NC}"
+    echo -e "  ${issue_display} (${issue_title})"
+}
+
+cmd_unlink() {
+    load_config
+
+    local pr_ref="${1:-}"
+    local issue_ref="${2:-}"
+
+    if [[ -z "$pr_ref" ]] || [[ -z "$issue_ref" ]]; then
+        error "Usage: zh unlink <pr> <issue>
+
+Unlink a pull request from an issue.
+
+Examples:
+  zh unlink 42 100                                       # Same repo
+  zh unlink owner/repo#42 owner/other-repo#100           # Cross-repo"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
+
+    # Parse PR reference
+    parse_issue_ref "$pr_ref" "$default_repo_id"
+    local pr_repo_id="$PARSED_REPO_ID"
+    local pr_num="$PARSED_ISSUE_NUM"
+    local pr_display="$PARSED_DISPLAY"
+
+    # Parse issue reference
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local issue_repo_id="$PARSED_REPO_ID"
+    local issue_num="$PARSED_ISSUE_NUM"
+    local issue_display="$PARSED_DISPLAY"
+
+    info "Unlinking PR ${pr_display} from issue ${issue_display}..."
+
+    # Get both IDs
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+        }
+    }'
+
+    local pr_vars
+    pr_vars=$(jq -n --arg repo_id "$pr_repo_id" --argjson issue_num "$pr_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local pr_response
+    pr_response=$(zh_graphql "$query" "$pr_vars")
+
+    local pr_id pr_title
+    pr_id=$(echo "$pr_response" | jq -r '.data.issueByInfo.id // empty')
+    pr_title=$(echo "$pr_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$pr_id" ]]; then
+        error "PR ${pr_display} not found"
+    fi
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$issue_repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$query" "$issue_vars")
+
+    local issue_id issue_title
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue ${issue_display} not found"
+    fi
+
+    local mutation='
+    mutation($input: DeleteIssuePrConnectionInput!) {
+        deleteIssuePrConnection(input: $input) {
+            issue {
+                id
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg pr_id "$pr_id" \
+        '{input: {issueId: $issue_id, pullRequestId: $pr_id}}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Unlinked PR from issue"
+    echo -e "  ${pr_display} (${pr_title})"
+    echo -e "  ${CYAN}✗${NC}"
+    echo -e "  ${issue_display} (${issue_title})"
+}
+
 cmd_children() {
     load_config
 
@@ -3188,32 +3393,36 @@ Examples:
 cmd_sprint_add() {
     load_config
 
-    local issue_num="${1:-}"
+    local issue_ref="${1:-}"
     local sprint_name="${2:-}"
 
-    if [[ -z "$issue_num" ]] || [[ -z "$sprint_name" ]]; then
-        error "Usage: zh sprint-add <issue_number> <sprint_name>
+    if [[ -z "$issue_ref" ]] || [[ -z "$sprint_name" ]]; then
+        error "Usage: zh sprint-add <issue> <sprint_name>
 
 Add an issue to a sprint.
 
 Examples:
   zh sprint-add 42 \"Sprint 5\"
-  zh sprint-add 42 current    # Add to active sprint"
+  zh sprint-add 42 current                             # Add to active sprint
+  zh sprint-add owner/repo#42 current                  # Cross-repo"
     fi
-
-    # Strip # prefix if present
-    issue_num="${issue_num#\#}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
+
+    # Parse issue reference (supports owner/repo#num and plain numbers)
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local repo_id="$PARSED_REPO_ID"
+    local issue_num="$PARSED_ISSUE_NUM"
+    local issue_display="$PARSED_DISPLAY"
 
     local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
 
-    info "Adding issue #${issue_num} to sprint '${sprint_name}'..."
+    info "Adding issue ${issue_display} to sprint '${sprint_name}'..."
 
     # Get issue ID
     local issue_query='
@@ -3236,7 +3445,7 @@ Examples:
     issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
 
     if [[ -z "$issue_id" ]]; then
-        error "Issue #${issue_num} not found"
+        error "Issue ${issue_display} not found"
     fi
 
     # Get sprint ID
@@ -3302,38 +3511,42 @@ Examples:
     zh_graphql "$mutation" "$mutation_vars" > /dev/null
 
     echo ""
-    success "Added #${issue_num} (${issue_title}) to sprint '${sprint_actual_name}'"
+    success "Added ${issue_display} (${issue_title}) to sprint '${sprint_actual_name}'"
 }
 
 cmd_sprint_remove() {
     load_config
 
-    local issue_num="${1:-}"
+    local issue_ref="${1:-}"
     local sprint_name="${2:-}"
 
-    if [[ -z "$issue_num" ]] || [[ -z "$sprint_name" ]]; then
-        error "Usage: zh sprint-remove <issue_number> <sprint_name>
+    if [[ -z "$issue_ref" ]] || [[ -z "$sprint_name" ]]; then
+        error "Usage: zh sprint-remove <issue> <sprint_name>
 
 Remove an issue from a sprint.
 
 Examples:
   zh sprint-remove 42 \"Sprint 5\"
-  zh sprint-remove 42 current    # Remove from active sprint"
+  zh sprint-remove 42 current                          # Remove from active sprint
+  zh sprint-remove owner/repo#42 current               # Cross-repo"
     fi
-
-    # Strip # prefix if present
-    issue_num="${issue_num#\#}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
+
+    # Parse issue reference (supports owner/repo#num and plain numbers)
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local repo_id="$PARSED_REPO_ID"
+    local issue_num="$PARSED_ISSUE_NUM"
+    local issue_display="$PARSED_DISPLAY"
 
     local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
 
-    info "Removing issue #${issue_num} from sprint '${sprint_name}'..."
+    info "Removing issue ${issue_display} from sprint '${sprint_name}'..."
 
     # Get issue ID
     local issue_query='
@@ -3356,7 +3569,7 @@ Examples:
     issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
 
     if [[ -z "$issue_id" ]]; then
-        error "Issue #${issue_num} not found"
+        error "Issue ${issue_display} not found"
     fi
 
     # Get sprint ID
@@ -3422,7 +3635,7 @@ Examples:
     zh_graphql "$mutation" "$mutation_vars" > /dev/null
 
     echo ""
-    success "Removed #${issue_num} (${issue_title}) from sprint '${sprint_actual_name}'"
+    success "Removed ${issue_display} (${issue_title}) from sprint '${sprint_actual_name}'"
 }
 
 cmd_priority() {
@@ -3678,6 +3891,12 @@ main() {
             ;;
         children|sub-issues|subs)
             cmd_children "$@"
+            ;;
+        link|connect)
+            cmd_link "$@"
+            ;;
+        unlink|disconnect)
+            cmd_unlink "$@"
             ;;
         block|blocked-by|depends)
             cmd_block "$@"

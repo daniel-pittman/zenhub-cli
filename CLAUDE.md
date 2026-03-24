@@ -49,6 +49,10 @@ zh set-parent <issue> <parent>    # Make issue a sub-issue
 zh remove-parent <issue> <parent> # Remove parent relationship
 zh children <issue>           # List sub-issues
 
+# PR linking
+zh link <pr> <issue>          # Link a PR to an issue
+zh unlink <pr> <issue>        # Unlink a PR from an issue
+
 # Dependencies & priority
 zh block <blocked> <blocker>  # Set dependency
 zh unblock <blocked> <blocker> # Remove dependency
