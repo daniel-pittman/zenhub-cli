@@ -228,6 +228,28 @@ get_workspace_id() {
     echo "$workspace_id"
 }
 
+# Parse an issue reference: "123", "#123", or "owner/repo#123"
+# Sets PARSED_REPO_ID and PARSED_ISSUE_NUM in the caller's scope.
+# For cross-repo refs, resolves the repo ID from the given owner/repo.
+# For plain numbers, uses the provided default repo ID.
+parse_issue_ref() {
+    local ref="$1"
+    local default_repo_id="${2:-}"
+
+    if [[ "$ref" =~ ^([^#]+/[^#]+)#([0-9]+)$ ]]; then
+        # Cross-repo reference: owner/repo#number
+        local cross_repo="${BASH_REMATCH[1]}"
+        PARSED_ISSUE_NUM="${BASH_REMATCH[2]}"
+        PARSED_REPO_ID=$(get_repo_id "$cross_repo")
+        PARSED_DISPLAY="${cross_repo}#${PARSED_ISSUE_NUM}"
+    else
+        # Plain number (with optional # prefix)
+        PARSED_ISSUE_NUM="${ref#\#}"
+        PARSED_REPO_ID="$default_repo_id"
+        PARSED_DISPLAY="#${PARSED_ISSUE_NUM}"
+    fi
+}
+
 # Build ZenHub URL for an issue
 # Format: https://app.zenhub.com/workspaces/<workspace-id>/issues/gh/<owner>/<repo>/<issue-number>
 build_zenhub_url() {
@@ -533,24 +555,28 @@ cmd_pipelines() {
 cmd_move() {
     load_config
 
-    local issue_num="${1:-}"
+    local issue_ref="${1:-}"
     local pipeline_name="${2:-}"
 
-    if [[ -z "$issue_num" ]] || [[ -z "$pipeline_name" ]]; then
-        error "Usage: zh move <issue_number> <pipeline_name>
-Example: zh move 679 \"In Review\""
+    if [[ -z "$issue_ref" ]] || [[ -z "$pipeline_name" ]]; then
+        error "Usage: zh move <issue> <pipeline_name>
+Example: zh move 679 \"In Review\"
+         zh move owner/repo#679 \"In Review\""
     fi
-
-    # Strip # prefix if present
-    issue_num="${issue_num#\#}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    info "Moving issue #${issue_num} to '${pipeline_name}'..."
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
 
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
+    # Parse issue reference (supports owner/repo#num and plain numbers)
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local repo_id="$PARSED_REPO_ID"
+    local issue_num="$PARSED_ISSUE_NUM"
+    local issue_display="$PARSED_DISPLAY"
+
+    info "Moving issue ${issue_display} to '${pipeline_name}'..."
 
     local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
@@ -608,7 +634,7 @@ Example: zh move 679 \"In Review\""
     issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
 
     if [[ -z "$issue_id" ]]; then
-        error "Issue #${issue_num} not found in ZenHub"
+        error "Issue ${issue_display} not found in ZenHub"
     fi
 
     local issue_title
@@ -638,7 +664,7 @@ Example: zh move 679 \"In Review\""
     zh_graphql "$move_mutation" "$move_vars" > /dev/null
 
     echo ""
-    success "Moved issue #${issue_num}: ${issue_title}"
+    success "Moved issue ${issue_display}: ${issue_title}"
     echo -e "  → ${GREEN}${target_pipeline_name}${NC}"
 }
 
@@ -2210,27 +2236,30 @@ Examples:
         error "Issue #${issue_num} not found"
     fi
 
+    local mutation='
+    mutation($input: ChangeIssueTypeOfIssuesInput!) {
+        changeIssueTypeOfIssues(input: $input) {
+            successCount
+        }
+    }'
+
     if [[ "$type_name" == "clear" ]] || [[ "$type_name" == "remove" ]] || [[ "$type_name" == "none" ]]; then
         # Clear the issue type
         info "Clearing issue type for #${issue_num}..."
 
-        local mutation='
-        mutation($input: UpdateIssueInput!) {
-            updateIssue(input: $input) {
-                issue {
-                    id
-                    issueType {
-                        name
-                    }
-                }
-            }
-        }'
-
         local mutation_vars
         mutation_vars=$(jq -n --arg issue_id "$issue_id" \
-            '{input: {id: $issue_id, patch: {issueTypeId: null}}}')
+            '{input: {issueIds: [$issue_id], removeIssueType: true}}')
 
-        zh_graphql "$mutation" "$mutation_vars" > /dev/null
+        local result
+        result=$(zh_graphql "$mutation" "$mutation_vars")
+
+        local success_count
+        success_count=$(echo "$result" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+
+        if [[ "$success_count" -eq 0 ]]; then
+            error "Failed to clear issue type"
+        fi
 
         echo ""
         success "Cleared issue type for #${issue_num}: ${issue_title}"
@@ -2272,27 +2301,19 @@ Examples:
 
         info "Setting issue type for #${issue_num}..."
 
-        local mutation='
-        mutation($input: UpdateIssueInput!) {
-            updateIssue(input: $input) {
-                issue {
-                    id
-                    issueType {
-                        name
-                    }
-                }
-            }
-        }'
-
         local mutation_vars
         mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg type_id "$type_id" \
-            '{input: {id: $issue_id, patch: {issueTypeId: $type_id}}}')
+            '{input: {issueIds: [$issue_id], issueTypeId: $type_id}}')
 
         local result
         result=$(zh_graphql "$mutation" "$mutation_vars")
 
-        local new_type
-        new_type=$(echo "$result" | jq -r '.data.updateIssue.issue.issueType.name // "none"')
+        local success_count
+        success_count=$(echo "$result" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+
+        if [[ "$success_count" -eq 0 ]]; then
+            error "Failed to set issue type"
+        fi
 
         echo ""
         success "Updated issue type for #${issue_num}: ${issue_title}"
@@ -2303,165 +2324,212 @@ Examples:
 cmd_set_parent() {
     load_config
 
-    local issue_num="${1:-}"
-    local parent_num="${2:-}"
+    local issue_ref="${1:-}"
+    local parent_ref="${2:-}"
 
-    if [[ -z "$issue_num" ]] || [[ -z "$parent_num" ]]; then
-        error "Usage: zh set-parent <issue_number> <parent_issue_number>
+    if [[ -z "$issue_ref" ]] || [[ -z "$parent_ref" ]]; then
+        error "Usage: zh set-parent <issue> <parent_issue>
 
 Make an issue a sub-issue of a parent (e.g., an Epic).
 
 Examples:
-  zh set-parent 42 100    # Issue #42 becomes a child of #100"
+  zh set-parent 42 100                                       # Same repo
+  zh set-parent owner/repo#42 owner/other-repo#100           # Cross-repo"
     fi
-
-    # Strip # prefix if present
-    issue_num="${issue_num#\#}"
-    parent_num="${parent_num#\#}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
 
-    info "Setting #${parent_num} as parent of #${issue_num}..."
+    # Parse child issue reference
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local child_repo_id="$PARSED_REPO_ID"
+    local child_num="$PARSED_ISSUE_NUM"
+    local child_display="$PARSED_DISPLAY"
 
-    # Get both issue IDs
-    local query='
-    query($repoId: ID!, $childNum: Int!, $parentNum: Int!) {
-        child: issueByInfo(repositoryId: $repoId, issueNumber: $childNum) {
-            id
-            title
-        }
-        parent: issueByInfo(repositoryId: $repoId, issueNumber: $parentNum) {
+    # Parse parent issue reference
+    parse_issue_ref "$parent_ref" "$default_repo_id"
+    local parent_repo_id="$PARSED_REPO_ID"
+    local parent_num="$PARSED_ISSUE_NUM"
+    local parent_display="$PARSED_DISPLAY"
+
+    info "Setting ${parent_display} as parent of ${child_display}..."
+
+    # Get child issue ID
+    local child_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
             id
             title
         }
     }'
 
-    local variables
-    variables=$(jq -n --arg repo_id "$repo_id" --argjson childNum "$issue_num" --argjson parentNum "$parent_num" \
-        '{repoId: $repo_id, childNum: $childNum, parentNum: $parentNum}')
+    local child_vars
+    child_vars=$(jq -n --arg repo_id "$child_repo_id" --argjson issue_num "$child_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
 
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    local child_response
+    child_response=$(zh_graphql "$child_query" "$child_vars")
 
-    local child_id child_title parent_id parent_title
-    child_id=$(echo "$response" | jq -r '.data.child.id // empty')
-    child_title=$(echo "$response" | jq -r '.data.child.title')
-    parent_id=$(echo "$response" | jq -r '.data.parent.id // empty')
-    parent_title=$(echo "$response" | jq -r '.data.parent.title')
+    local child_id child_title
+    child_id=$(echo "$child_response" | jq -r '.data.issueByInfo.id // empty')
+    child_title=$(echo "$child_response" | jq -r '.data.issueByInfo.title')
 
     if [[ -z "$child_id" ]]; then
-        error "Issue #${issue_num} not found"
+        error "Issue ${child_display} not found"
     fi
+
+    # Get parent issue ID
+    local parent_vars
+    parent_vars=$(jq -n --arg repo_id "$parent_repo_id" --argjson issue_num "$parent_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local parent_response
+    parent_response=$(zh_graphql "$child_query" "$parent_vars")
+
+    local parent_id parent_title
+    parent_id=$(echo "$parent_response" | jq -r '.data.issueByInfo.id // empty')
+    parent_title=$(echo "$parent_response" | jq -r '.data.issueByInfo.title')
+
     if [[ -z "$parent_id" ]]; then
-        error "Issue #${parent_num} not found"
+        error "Issue ${parent_display} not found"
     fi
 
     local mutation='
-    mutation($input: AddIssuesToParentIssueInput!) {
-        addIssuesToParentIssue(input: $input) {
-            parentIssue {
-                id
-            }
+    mutation($input: AddSubIssuesInput!) {
+        addSubIssues(input: $input) {
+            successCount
         }
     }'
 
     local mutation_vars
     mutation_vars=$(jq -n --arg child_id "$child_id" --arg parent_id "$parent_id" \
-        '{input: {issueIds: [$child_id], parentIssueId: $parent_id}}')
+        '{input: {parentId: $parent_id, childIssueIds: [$child_id]}}')
 
-    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+    local result
+    result=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local success_count
+    success_count=$(echo "$result" | jq -r '.data.addSubIssues.successCount // 0')
+
+    if [[ "$success_count" -eq 0 ]]; then
+        error "Failed to set parent relationship"
+    fi
 
     echo ""
     success "Set parent relationship"
-    echo -e "  #${issue_num} (${child_title})"
+    echo -e "  ${child_display} (${child_title})"
     echo -e "  ${CYAN}is a sub-issue of${NC}"
-    echo -e "  #${parent_num} (${parent_title})"
+    echo -e "  ${parent_display} (${parent_title})"
 }
 
 cmd_remove_parent() {
     load_config
 
-    local issue_num="${1:-}"
-    local parent_num="${2:-}"
+    local issue_ref="${1:-}"
+    local parent_ref="${2:-}"
 
-    if [[ -z "$issue_num" ]] || [[ -z "$parent_num" ]]; then
-        error "Usage: zh remove-parent <issue_number> <parent_issue_number>
+    if [[ -z "$issue_ref" ]] || [[ -z "$parent_ref" ]]; then
+        error "Usage: zh remove-parent <issue> <parent_issue>
 
 Remove a sub-issue from its parent.
 
 Examples:
-  zh remove-parent 42 100    # Issue #42 is no longer a child of #100"
+  zh remove-parent 42 100                                    # Same repo
+  zh remove-parent owner/repo#42 owner/other-repo#100       # Cross-repo"
     fi
-
-    # Strip # prefix if present
-    issue_num="${issue_num#\#}"
-    parent_num="${parent_num#\#}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
 
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
+    local default_repo_id
+    default_repo_id=$(get_repo_id "$owner_repo")
 
-    info "Removing #${parent_num} as parent of #${issue_num}..."
+    # Parse child issue reference
+    parse_issue_ref "$issue_ref" "$default_repo_id"
+    local child_repo_id="$PARSED_REPO_ID"
+    local child_num="$PARSED_ISSUE_NUM"
+    local child_display="$PARSED_DISPLAY"
 
-    # Get both issue IDs
-    local query='
-    query($repoId: ID!, $childNum: Int!, $parentNum: Int!) {
-        child: issueByInfo(repositoryId: $repoId, issueNumber: $childNum) {
-            id
-            title
-        }
-        parent: issueByInfo(repositoryId: $repoId, issueNumber: $parentNum) {
+    # Parse parent issue reference
+    parse_issue_ref "$parent_ref" "$default_repo_id"
+    local parent_repo_id="$PARSED_REPO_ID"
+    local parent_num="$PARSED_ISSUE_NUM"
+    local parent_display="$PARSED_DISPLAY"
+
+    info "Removing ${parent_display} as parent of ${child_display}..."
+
+    # Get child issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
             id
             title
         }
     }'
 
-    local variables
-    variables=$(jq -n --arg repo_id "$repo_id" --argjson childNum "$issue_num" --argjson parentNum "$parent_num" \
-        '{repoId: $repo_id, childNum: $childNum, parentNum: $parentNum}')
+    local child_vars
+    child_vars=$(jq -n --arg repo_id "$child_repo_id" --argjson issue_num "$child_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
 
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    local child_response
+    child_response=$(zh_graphql "$issue_query" "$child_vars")
 
-    local child_id child_title parent_id parent_title
-    child_id=$(echo "$response" | jq -r '.data.child.id // empty')
-    child_title=$(echo "$response" | jq -r '.data.child.title')
-    parent_id=$(echo "$response" | jq -r '.data.parent.id // empty')
-    parent_title=$(echo "$response" | jq -r '.data.parent.title')
+    local child_id child_title
+    child_id=$(echo "$child_response" | jq -r '.data.issueByInfo.id // empty')
+    child_title=$(echo "$child_response" | jq -r '.data.issueByInfo.title')
 
     if [[ -z "$child_id" ]]; then
-        error "Issue #${issue_num} not found"
+        error "Issue ${child_display} not found"
+    fi
+
+    # Get parent issue ID
+    local parent_vars
+    parent_vars=$(jq -n --arg repo_id "$parent_repo_id" --argjson issue_num "$parent_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local parent_response
+    parent_response=$(zh_graphql "$issue_query" "$parent_vars")
+
+    local parent_id parent_title
+    parent_id=$(echo "$parent_response" | jq -r '.data.issueByInfo.id // empty')
+    parent_title=$(echo "$parent_response" | jq -r '.data.issueByInfo.title')
+
+    if [[ -z "$child_id" ]]; then
+        error "Issue ${child_display} not found"
     fi
     if [[ -z "$parent_id" ]]; then
-        error "Issue #${parent_num} not found"
+        error "Issue ${parent_display} not found"
     fi
 
     local mutation='
-    mutation($input: RemoveIssuesFromParentIssueInput!) {
-        removeIssuesFromParentIssue(input: $input) {
-            parentIssue {
-                id
-            }
+    mutation($input: RemoveSubIssuesInput!) {
+        removeSubIssues(input: $input) {
+            successCount
         }
     }'
 
     local mutation_vars
-    mutation_vars=$(jq -n --arg child_id "$child_id" --arg parent_id "$parent_id" \
-        '{input: {issueIds: [$child_id], parentIssueId: $parent_id}}')
+    mutation_vars=$(jq -n --arg child_id "$child_id" \
+        '{input: {childIssueIds: [$child_id]}}')
 
-    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+    local result
+    result=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local success_count
+    success_count=$(echo "$result" | jq -r '.data.removeSubIssues.successCount // 0')
+
+    if [[ "$success_count" -eq 0 ]]; then
+        error "Failed to remove parent relationship"
+    fi
 
     echo ""
     success "Removed parent relationship"
-    echo -e "  #${issue_num} (${child_title})"
+    echo -e "  ${child_display} (${child_title})"
     echo -e "  ${CYAN}is no longer a sub-issue of${NC}"
-    echo -e "  #${parent_num} (${parent_title})"
+    echo -e "  ${parent_display} (${parent_title})"
 }
 
 cmd_children() {
