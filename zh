@@ -67,12 +67,6 @@ load_config() {
         source "$CONFIG_FILE"
     fi
 
-    # Check for local .env file
-    if [[ -f ".env" ]]; then
-        # shellcheck source=/dev/null
-        source ".env"
-    fi
-
     # Validate required config
     if [[ -z "${ZH_TOKEN:-}" ]]; then
         error "ZH_TOKEN not set. Create ${CONFIG_FILE} with:
