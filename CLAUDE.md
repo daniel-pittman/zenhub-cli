@@ -42,6 +42,13 @@ zh reopen <issue>             # Reopen closed issue
 # Create issues
 zh create "Title" -t Bug -l "label1,label2" -e 3 -p "TO DO"
 
+# Issue type & hierarchy
+zh set-type <issue> Epic      # Set issue type
+zh set-type <issue> clear     # Remove issue type
+zh set-parent <issue> <parent>    # Make issue a sub-issue
+zh remove-parent <issue> <parent> # Remove parent relationship
+zh children <issue>           # List sub-issues
+
 # Dependencies & priority
 zh block <blocked> <blocker>  # Set dependency
 zh unblock <blocked> <blocker> # Remove dependency

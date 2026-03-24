@@ -345,6 +345,23 @@ COMMANDS:
                            Example: zh sprint-remove 42 "Sprint 5"
                            Example: zh sprint-remove 42 current
 
+    set-type <issue> <type> Set or change issue type
+                           Example: zh set-type 42 Epic
+                           Example: zh set-type 42 Bug
+                           Example: zh set-type 42 clear  (remove type)
+
+    set-parent <issue> <parent>
+                           Make an issue a sub-issue of a parent
+                           Example: zh set-parent 42 100
+                           (Issue #42 becomes a child of #100)
+
+    remove-parent <issue> <parent>
+                           Remove a sub-issue from its parent
+                           Example: zh remove-parent 42 100
+
+    children <issue>        List sub-issues of an issue
+                           Example: zh children 100
+
     block <issue> <blocker> Set issue as blocked by another
                            Example: zh block 123 456
                            (123 is blocked by 456)
@@ -389,6 +406,9 @@ ALIASES:
     reorder: order, pos
     estimate: est, points
     create: new
+    set-type: type
+    set-parent: add-parent
+    children: sub-issues, subs
     sprints: sp
     sprint-add: sa
     sprint-remove: sr
@@ -412,6 +432,9 @@ EXAMPLES:
     zh sprint current               # View active sprint issues
     zh sprint-add 42 current        # Add issue to active sprint
     zh sprint-remove 42 "Sprint 5"  # Remove issue from sprint
+    zh set-type 42 Epic              # Set issue type to Epic
+    zh set-parent 42 100             # Make #42 a sub-issue of #100
+    zh children 100                  # List sub-issues of #100
     zh block 123 456                # 123 blocked by 456
     zh priority 679 high            # Set high priority
     cat desc.md | zh create "Title" --stdin  # Body from stdin
@@ -659,6 +682,30 @@ Example: zh issue 679"
             estimate {
                 value
             }
+            issueType {
+                name
+            }
+            parentIssues {
+                nodes {
+                    number
+                    title
+                    repository {
+                        ownerName
+                        name
+                    }
+                }
+            }
+            childIssues {
+                nodes {
+                    number
+                    title
+                    state
+                    repository {
+                        ownerName
+                        name
+                    }
+                }
+            }
             assignees {
                 nodes {
                     login
@@ -709,26 +756,37 @@ Example: zh issue 679"
         error "Issue #${issue_num} not found"
     fi
 
-    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues
+    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues issue_type parent_issues child_issues
     title=$(echo "$issue" | jq -r '.title')
     state=$(echo "$issue" | jq -r '.state')
     pipeline=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
     estimate=$(echo "$issue" | jq -r '.estimate.value // "—"')
+    issue_type=$(echo "$issue" | jq -r '.issueType.name // "—"')
     assignees=$(echo "$issue" | jq -r '[.assignees.nodes[].login] | join(", ") | if . == "" then "Unassigned" else . end')
     labels=$(echo "$issue" | jq -r '[.labels.nodes[].name] | join(", ") | if . == "" then "None" else . end')
     gh_url=$(echo "$issue" | jq -r '.htmlUrl')
     zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$issue_num")
     blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
+    parent_issues=$(echo "$issue" | jq -r '[.parentIssues.nodes[] | "#\(.number) (\(.repository.ownerName)/\(.repository.name))"] | join(", ")')
+    child_issues=$(echo "$issue" | jq -r '[.childIssues.nodes[] | "#\(.number) \(if .state == "CLOSED" then "✓" else "" end)\(.title)"] | join("\n    ")')
 
     echo ""
     echo -e "${BOLD}#${issue_num}${NC} ${title}"
     echo ""
     echo -e "  ${CYAN}State:${NC}     ${state}"
+    echo -e "  ${CYAN}Type:${NC}      ${issue_type}"
     echo -e "  ${CYAN}Pipeline:${NC}  ${pipeline}"
     echo -e "  ${CYAN}Estimate:${NC}  ${estimate}"
     echo -e "  ${CYAN}Assignees:${NC} ${assignees}"
     echo -e "  ${CYAN}Labels:${NC}    ${labels}"
+    if [[ -n "$parent_issues" ]]; then
+        echo -e "  ${CYAN}Parent:${NC}    ${parent_issues}"
+    fi
+    if [[ -n "$child_issues" ]]; then
+        echo -e "  ${CYAN}Children:${NC}"
+        echo -e "    ${child_issues}"
+    fi
     if [[ -n "$blocking_issues" ]]; then
         echo -e "  ${YELLOW}Blocked by:${NC} ${blocking_issues}"
     fi
@@ -2104,6 +2162,412 @@ cmd_types() {
     echo ""
 }
 
+cmd_set_type() {
+    load_config
+
+    local issue_num="${1:-}"
+    local type_name="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$type_name" ]]; then
+        error "Usage: zh set-type <issue_number> <type_name>
+
+Set or change the issue type.
+
+Examples:
+  zh set-type 42 Epic
+  zh set-type 42 Bug
+  zh set-type 42 clear    # Remove issue type"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Get the issue ID
+    local issue_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            issueType {
+                name
+            }
+        }
+    }'
+
+    local issue_vars
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local issue_response
+    issue_response=$(zh_graphql "$issue_query" "$issue_vars")
+
+    local issue_id issue_title old_type
+    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
+    old_type=$(echo "$issue_response" | jq -r '.data.issueByInfo.issueType.name // "none"')
+
+    if [[ -z "$issue_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    if [[ "$type_name" == "clear" ]] || [[ "$type_name" == "remove" ]] || [[ "$type_name" == "none" ]]; then
+        # Clear the issue type
+        info "Clearing issue type for #${issue_num}..."
+
+        local mutation='
+        mutation($input: UpdateIssueInput!) {
+            updateIssue(input: $input) {
+                issue {
+                    id
+                    issueType {
+                        name
+                    }
+                }
+            }
+        }'
+
+        local mutation_vars
+        mutation_vars=$(jq -n --arg issue_id "$issue_id" \
+            '{input: {id: $issue_id, patch: {issueTypeId: null}}}')
+
+        zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+        echo ""
+        success "Cleared issue type for #${issue_num}: ${issue_title}"
+        echo -e "  ${CYAN}${old_type}${NC} → ${GREEN}none${NC}"
+    else
+        # Look up issue type ID
+        local gh_id
+        gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+
+        local types_query='
+        query($ghIds: [Int!]!) {
+            repositoriesByGhId(ghIds: $ghIds) {
+                githubIssueTypes {
+                    nodes {
+                        id
+                        name
+                    }
+                }
+            }
+        }'
+
+        local types_vars
+        types_vars=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+
+        local types_response
+        types_response=$(zh_graphql "$types_query" "$types_vars")
+
+        local type_id
+        type_id=$(echo "$types_response" | jq -r --arg name "$type_name" \
+            '.data.repositoriesByGhId[0].githubIssueTypes.nodes[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id')
+
+        if [[ -z "$type_id" ]]; then
+            echo -e "${RED}Error:${NC} Issue type '${type_name}' not found." >&2
+            echo ""
+            echo "Available types:"
+            echo "$types_response" | jq -r '.data.repositoriesByGhId[0].githubIssueTypes.nodes[] | "  - \(.name)"'
+            exit 1
+        fi
+
+        info "Setting issue type for #${issue_num}..."
+
+        local mutation='
+        mutation($input: UpdateIssueInput!) {
+            updateIssue(input: $input) {
+                issue {
+                    id
+                    issueType {
+                        name
+                    }
+                }
+            }
+        }'
+
+        local mutation_vars
+        mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg type_id "$type_id" \
+            '{input: {id: $issue_id, patch: {issueTypeId: $type_id}}}')
+
+        local result
+        result=$(zh_graphql "$mutation" "$mutation_vars")
+
+        local new_type
+        new_type=$(echo "$result" | jq -r '.data.updateIssue.issue.issueType.name // "none"')
+
+        echo ""
+        success "Updated issue type for #${issue_num}: ${issue_title}"
+        echo -e "  ${CYAN}${old_type}${NC} → ${GREEN}${new_type}${NC}"
+    fi
+}
+
+cmd_set_parent() {
+    load_config
+
+    local issue_num="${1:-}"
+    local parent_num="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$parent_num" ]]; then
+        error "Usage: zh set-parent <issue_number> <parent_issue_number>
+
+Make an issue a sub-issue of a parent (e.g., an Epic).
+
+Examples:
+  zh set-parent 42 100    # Issue #42 becomes a child of #100"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+    parent_num="${parent_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    info "Setting #${parent_num} as parent of #${issue_num}..."
+
+    # Get both issue IDs
+    local query='
+    query($repoId: ID!, $childNum: Int!, $parentNum: Int!) {
+        child: issueByInfo(repositoryId: $repoId, issueNumber: $childNum) {
+            id
+            title
+        }
+        parent: issueByInfo(repositoryId: $repoId, issueNumber: $parentNum) {
+            id
+            title
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson childNum "$issue_num" --argjson parentNum "$parent_num" \
+        '{repoId: $repo_id, childNum: $childNum, parentNum: $parentNum}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local child_id child_title parent_id parent_title
+    child_id=$(echo "$response" | jq -r '.data.child.id // empty')
+    child_title=$(echo "$response" | jq -r '.data.child.title')
+    parent_id=$(echo "$response" | jq -r '.data.parent.id // empty')
+    parent_title=$(echo "$response" | jq -r '.data.parent.title')
+
+    if [[ -z "$child_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+    if [[ -z "$parent_id" ]]; then
+        error "Issue #${parent_num} not found"
+    fi
+
+    local mutation='
+    mutation($input: AddIssuesToParentIssueInput!) {
+        addIssuesToParentIssue(input: $input) {
+            parentIssue {
+                id
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg child_id "$child_id" --arg parent_id "$parent_id" \
+        '{input: {issueIds: [$child_id], parentIssueId: $parent_id}}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Set parent relationship"
+    echo -e "  #${issue_num} (${child_title})"
+    echo -e "  ${CYAN}is a sub-issue of${NC}"
+    echo -e "  #${parent_num} (${parent_title})"
+}
+
+cmd_remove_parent() {
+    load_config
+
+    local issue_num="${1:-}"
+    local parent_num="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$parent_num" ]]; then
+        error "Usage: zh remove-parent <issue_number> <parent_issue_number>
+
+Remove a sub-issue from its parent.
+
+Examples:
+  zh remove-parent 42 100    # Issue #42 is no longer a child of #100"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+    parent_num="${parent_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    info "Removing #${parent_num} as parent of #${issue_num}..."
+
+    # Get both issue IDs
+    local query='
+    query($repoId: ID!, $childNum: Int!, $parentNum: Int!) {
+        child: issueByInfo(repositoryId: $repoId, issueNumber: $childNum) {
+            id
+            title
+        }
+        parent: issueByInfo(repositoryId: $repoId, issueNumber: $parentNum) {
+            id
+            title
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson childNum "$issue_num" --argjson parentNum "$parent_num" \
+        '{repoId: $repo_id, childNum: $childNum, parentNum: $parentNum}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local child_id child_title parent_id parent_title
+    child_id=$(echo "$response" | jq -r '.data.child.id // empty')
+    child_title=$(echo "$response" | jq -r '.data.child.title')
+    parent_id=$(echo "$response" | jq -r '.data.parent.id // empty')
+    parent_title=$(echo "$response" | jq -r '.data.parent.title')
+
+    if [[ -z "$child_id" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+    if [[ -z "$parent_id" ]]; then
+        error "Issue #${parent_num} not found"
+    fi
+
+    local mutation='
+    mutation($input: RemoveIssuesFromParentIssueInput!) {
+        removeIssuesFromParentIssue(input: $input) {
+            parentIssue {
+                id
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg child_id "$child_id" --arg parent_id "$parent_id" \
+        '{input: {issueIds: [$child_id], parentIssueId: $parent_id}}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Removed parent relationship"
+    echo -e "  #${issue_num} (${child_title})"
+    echo -e "  ${CYAN}is no longer a sub-issue of${NC}"
+    echo -e "  #${parent_num} (${parent_title})"
+}
+
+cmd_children() {
+    load_config
+
+    local issue_num="${1:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh children <issue_number>
+
+List sub-issues (children) of an issue.
+
+Examples:
+  zh children 100    # List sub-issues of #100"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    info "Getting sub-issues of #${issue_num}..."
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            issueType {
+                name
+            }
+            childIssues {
+                nodes {
+                    number
+                    title
+                    state
+                    estimate {
+                        value
+                    }
+                    issueType {
+                        name
+                    }
+                    assignees {
+                        nodes {
+                            login
+                        }
+                    }
+                    repository {
+                        ownerName
+                        name
+                    }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local issue_title issue_type
+    issue_title=$(echo "$response" | jq -r '.data.issueByInfo.title // empty')
+    issue_type=$(echo "$response" | jq -r '.data.issueByInfo.issueType.name // ""')
+
+    if [[ -z "$issue_title" ]]; then
+        error "Issue #${issue_num} not found"
+    fi
+
+    local children
+    children=$(echo "$response" | jq '.data.issueByInfo.childIssues.nodes')
+
+    local count
+    count=$(echo "$children" | jq 'length')
+
+    echo ""
+    if [[ -n "$issue_type" ]]; then
+        echo -e "${BOLD}#${issue_num}${NC} [${issue_type}] ${issue_title}"
+    else
+        echo -e "${BOLD}#${issue_num}${NC} ${issue_title}"
+    fi
+    echo -e "${BOLD}Sub-issues (${count}):${NC}"
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  No sub-issues"
+    else
+        echo "$children" | jq -r '.[] |
+            "\(.state)" as $state |
+            "  #\(.number | tostring | (" " * (5 - length)) + .) │ \((.estimate.value // "—") | tostring | (" " * (3 - length)) + .) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end | if length > 12 then .[:9] + "..." else . end | . + (" " * (12 - length))) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title | if length > 40 then .[:37] + "..." else . end)"'
+    fi
+    echo ""
+}
+
 cmd_users() {
     load_config
 
@@ -3140,6 +3604,18 @@ main() {
             ;;
         sprint-remove|sr)
             cmd_sprint_remove "$@"
+            ;;
+        set-type|type)
+            cmd_set_type "$@"
+            ;;
+        set-parent|add-parent)
+            cmd_set_parent "$@"
+            ;;
+        remove-parent)
+            cmd_remove_parent "$@"
+            ;;
+        children|sub-issues|subs)
+            cmd_children "$@"
             ;;
         block|blocked-by|depends)
             cmd_block "$@"
