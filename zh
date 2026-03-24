@@ -712,7 +712,8 @@ Example: zh issue 679"
                 value
             }
             issueType {
-                name
+                ... on GithubIssueType { name }
+                ... on ZenhubIssueType { name }
             }
             parentIssues {
                 nodes {
@@ -2224,7 +2225,8 @@ Examples:
             id
             title
             issueType {
-                name
+                ... on GithubIssueType { name }
+                ... on ZenhubIssueType { name }
             }
         }
     }'
@@ -2768,7 +2770,8 @@ Examples:
             id
             title
             issueType {
-                name
+                ... on GithubIssueType { name }
+                ... on ZenhubIssueType { name }
             }
             childIssues {
                 nodes {
@@ -2779,7 +2782,8 @@ Examples:
                         value
                     }
                     issueType {
-                        name
+                        ... on GithubIssueType { name }
+                        ... on ZenhubIssueType { name }
                     }
                     assignees {
                         nodes {
