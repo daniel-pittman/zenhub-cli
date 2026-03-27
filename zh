@@ -59,6 +59,15 @@ success() {
     echo -e "${GREEN}✓${NC} $1"
 }
 
+# GitHub API helper (uses curl + gh auth token to avoid TLS issues with gh cli)
+gh_api() {
+    local endpoint="$1"
+    local jq_filter="${2:-.}"
+    curl -s "https://api.github.com/${endpoint}" \
+        -H "Authorization: token $(gh auth token)" \
+        -H "Accept: application/vnd.github+json" | jq -r "$jq_filter"
+}
+
 # Load configuration
 load_config() {
     # Check for config file
@@ -133,7 +142,7 @@ get_repo_id() {
 
     # First get the GitHub repo ID using gh CLI
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
     if [[ -z "$gh_id" ]]; then
         error "Could not get GitHub repo ID for: $owner_repo (is gh CLI authenticated?)"
@@ -171,7 +180,7 @@ get_workspace_id() {
 
     # Get GitHub repo ID
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
     if [[ -z "$gh_id" ]]; then
         error "Could not get GitHub repo ID for: $owner_repo"
@@ -478,7 +487,7 @@ cmd_workspaces() {
 
     # Get GitHub repo ID
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
     if [[ -z "$gh_id" ]]; then
         error "Could not get GitHub repo ID for: $owner_repo"
@@ -858,7 +867,7 @@ cmd_mine() {
 
     # If no user specified, use current GitHub user
     if [[ -z "$target_user" ]]; then
-        target_user=$(gh api user --jq '.login' 2>/dev/null)
+        target_user=$(gh_api "user" '.login' 2>/dev/null)
         if [[ -z "$target_user" ]]; then
             error "Could not get GitHub username (is gh CLI authenticated?)"
         fi
@@ -2034,7 +2043,7 @@ Examples:
     if [[ -n "$issue_type" ]]; then
         # Get GitHub repo ID for issue types query
         local gh_id
-        gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+        gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
         # Look up issue type ID
         local types_query='
@@ -2164,7 +2173,7 @@ cmd_types() {
     info "Getting issue types for ${owner_repo}..."
 
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
     local query='
     query($ghIds: [Int!]!) {
@@ -2278,7 +2287,7 @@ Examples:
     else
         # Look up issue type ID
         local gh_id
-        gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+        gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
         local types_query='
         query($ghIds: [Int!]!) {
@@ -2892,7 +2901,7 @@ cmd_labels() {
     info "Getting labels for ${owner_repo}..."
 
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
     local query='
     query($ghIds: [Int!]!) {
@@ -3066,7 +3075,7 @@ NOTE: Consider requesting GraphQL support for this feature at:
 
     # Get GitHub repo ID (REST API uses GitHub IDs, not ZenHub IDs)
     local gh_repo_id
-    gh_repo_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_repo_id=$(gh_api "repos/${owner_repo}" '.id' 2>/dev/null)
 
     if [[ -z "$gh_repo_id" ]]; then
         error "Could not get GitHub repo ID for: $owner_repo"
