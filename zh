@@ -732,7 +732,26 @@ Example: zh issue 679"
                     name
                 }
             }
+            githubParentIssue {
+                number
+                title
+                repository {
+                    ownerName
+                    name
+                }
+            }
             zenhubChildIssues {
+                nodes {
+                    number
+                    title
+                    state
+                    repository {
+                        ownerName
+                        name
+                    }
+                }
+            }
+            githubChildIssues {
                 nodes {
                     number
                     title
@@ -805,8 +824,8 @@ Example: zh issue 679"
     zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$issue_num")
     blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
-    parent_issue=$(echo "$issue" | jq -r '.parentIssue | if . then "#\(.number) (\(.repository.ownerName)/\(.repository.name))" else "" end')
-    child_issues=$(echo "$issue" | jq -r '[.zenhubChildIssues.nodes[] | "#\(.number) \(if .state == "CLOSED" then "✓ " else "" end)\(.title)"] | join("\n    ")')
+    parent_issue=$(echo "$issue" | jq -r '(.parentIssue // .githubParentIssue) | if . then "#\(.number) (\(.repository.ownerName)/\(.repository.name))" else "" end')
+    child_issues=$(echo "$issue" | jq -r '[(.zenhubChildIssues.nodes + .githubChildIssues.nodes) | unique_by(.number)[] | "#\(.number) \(if .state == "CLOSED" then "✓ " else "" end)\(.title)"] | join("\n    ")')
 
     echo ""
     echo -e "${BOLD}#${issue_num}${NC} ${title}"
@@ -2916,6 +2935,29 @@ Examples:
                     }
                 }
             }
+            githubChildIssues {
+                nodes {
+                    number
+                    title
+                    state
+                    estimate {
+                        value
+                    }
+                    issueType {
+                        ... on GithubIssueType { name }
+                        ... on ZenhubIssueType { name }
+                    }
+                    assignees {
+                        nodes {
+                            login
+                        }
+                    }
+                    repository {
+                        ownerName
+                        name
+                    }
+                }
+            }
         }
     }'
 
@@ -2935,7 +2977,7 @@ Examples:
     fi
 
     local children
-    children=$(echo "$response" | jq '.data.issueByInfo.zenhubChildIssues.nodes')
+    children=$(echo "$response" | jq '[.data.issueByInfo.zenhubChildIssues.nodes, .data.issueByInfo.githubChildIssues.nodes] | add | unique_by(.number)')
 
     local count
     count=$(echo "$children" | jq 'length')
