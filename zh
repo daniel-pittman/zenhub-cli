@@ -724,27 +724,6 @@ Example: zh issue 679"
                 ... on GithubIssueType { name }
                 ... on ZenhubIssueType { name }
             }
-            parentIssues {
-                nodes {
-                    number
-                    title
-                    repository {
-                        ownerName
-                        name
-                    }
-                }
-            }
-            childIssues {
-                nodes {
-                    number
-                    title
-                    state
-                    repository {
-                        ownerName
-                        name
-                    }
-                }
-            }
             assignees {
                 nodes {
                     login
@@ -785,71 +764,8 @@ Example: zh issue 679"
     variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
         '{repoId: $repo_id, issueNumber: $issue_num}')
 
-    # Try the full query first (may fail for PRs which don't support parentIssues/childIssues)
-    local body
-    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
-
     local response
-    response=$(curl -s -X POST "$ZENHUB_API" \
-        -H "Authorization: Bearer ${ZH_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "$body")
-
-    # If the query fails (e.g. PRs don't support parentIssues/childIssues), retry without hierarchy fields
-    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
-        local fallback_query='
-        query($repoId: ID!, $issueNumber: Int!) {
-            issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
-                id
-                number
-                title
-                body
-                state
-                htmlUrl
-                estimate {
-                    value
-                }
-                issueType {
-                    ... on GithubIssueType { name }
-                    ... on ZenhubIssueType { name }
-                }
-                assignees {
-                    nodes {
-                        login
-                        name
-                    }
-                }
-                labels {
-                    nodes {
-                        name
-                        color
-                    }
-                }
-                pipelineIssues {
-                    nodes {
-                        pipeline {
-                            name
-                        }
-                    }
-                }
-                blockingIssues {
-                    nodes {
-                        number
-                        title
-                    }
-                }
-                blockedIssues {
-                    nodes {
-                        number
-                        title
-                    }
-                }
-                createdAt
-                updatedAt
-            }
-        }'
-        response=$(zh_graphql "$fallback_query" "$variables")
-    fi
+    response=$(zh_graphql "$query" "$variables")
 
     local issue
     issue=$(echo "$response" | jq '.data.issueByInfo')
@@ -858,7 +774,7 @@ Example: zh issue 679"
         error "Issue #${issue_num} not found"
     fi
 
-    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues issue_type parent_issues child_issues
+    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues issue_type
     title=$(echo "$issue" | jq -r '.title')
     state=$(echo "$issue" | jq -r '.state')
     pipeline=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
@@ -870,8 +786,6 @@ Example: zh issue 679"
     zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$issue_num")
     blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
-    parent_issues=$(echo "$issue" | jq -r '[(.parentIssues.nodes // [])[] | "#\(.number) (\(.repository.ownerName)/\(.repository.name))"] | join(", ")')
-    child_issues=$(echo "$issue" | jq -r '[(.childIssues.nodes // [])[] | "#\(.number) \(if .state == "CLOSED" then "✓" else "" end)\(.title)"] | join("\n    ")')
 
     echo ""
     echo -e "${BOLD}#${issue_num}${NC} ${title}"
@@ -882,13 +796,119 @@ Example: zh issue 679"
     echo -e "  ${CYAN}Estimate:${NC}  ${estimate}"
     echo -e "  ${CYAN}Assignees:${NC} ${assignees}"
     echo -e "  ${CYAN}Labels:${NC}    ${labels}"
-    if [[ -n "$parent_issues" ]]; then
-        echo -e "  ${CYAN}Parent:${NC}    ${parent_issues}"
+    if [[ -n "$blocking_issues" ]]; then
+        echo -e "  ${YELLOW}Blocked by:${NC} ${blocking_issues}"
     fi
-    if [[ -n "$child_issues" ]]; then
-        echo -e "  ${CYAN}Children:${NC}"
-        echo -e "    ${child_issues}"
+    if [[ -n "$blocked_issues" ]]; then
+        echo -e "  ${YELLOW}Blocking:${NC}  ${blocked_issues}"
     fi
+    echo -e "  ${CYAN}ZenHub:${NC}    ${zh_url}"
+    echo -e "  ${CYAN}GitHub:${NC}    ${gh_url}"
+    echo ""
+}
+
+cmd_pr() {
+    load_config
+
+    local pr_num="${1:-}"
+
+    if [[ -z "$pr_num" ]]; then
+        error "Usage: zh pr <pr_number>
+Example: zh pr 172"
+    fi
+
+    # Strip # prefix if present
+    pr_num="${pr_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id workspace_id
+    repo_id=$(get_repo_id "$owner_repo")
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            number
+            title
+            body
+            state
+            htmlUrl
+            estimate {
+                value
+            }
+            assignees {
+                nodes {
+                    login
+                    name
+                }
+            }
+            labels {
+                nodes {
+                    name
+                    color
+                }
+            }
+            pipelineIssues {
+                nodes {
+                    pipeline {
+                        name
+                    }
+                }
+            }
+            blockingIssues {
+                nodes {
+                    number
+                    title
+                }
+            }
+            blockedIssues {
+                nodes {
+                    number
+                    title
+                }
+            }
+            createdAt
+            updatedAt
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson pr_num "$pr_num" \
+        '{repoId: $repo_id, issueNumber: $pr_num}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local pr
+    pr=$(echo "$response" | jq '.data.issueByInfo')
+
+    if [[ "$pr" == "null" ]]; then
+        error "PR #${pr_num} not found"
+    fi
+
+    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues
+    title=$(echo "$pr" | jq -r '.title')
+    state=$(echo "$pr" | jq -r '.state')
+    pipeline=$(echo "$pr" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
+    estimate=$(echo "$pr" | jq -r '.estimate.value // "—"')
+    assignees=$(echo "$pr" | jq -r '[.assignees.nodes[].login] | join(", ") | if . == "" then "Unassigned" else . end')
+    labels=$(echo "$pr" | jq -r '[.labels.nodes[].name] | join(", ") | if . == "" then "None" else . end')
+    gh_url=$(echo "$pr" | jq -r '.htmlUrl')
+    zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$pr_num")
+    blocking_issues=$(echo "$pr" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
+    blocked_issues=$(echo "$pr" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
+
+    echo ""
+    echo -e "${BOLD}#${pr_num}${NC} ${title}"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}     ${state}"
+    echo -e "  ${CYAN}Pipeline:${NC}  ${pipeline}"
+    echo -e "  ${CYAN}Estimate:${NC}  ${estimate}"
+    echo -e "  ${CYAN}Assignees:${NC} ${assignees}"
+    echo -e "  ${CYAN}Labels:${NC}    ${labels}"
     if [[ -n "$blocking_issues" ]]; then
         echo -e "  ${YELLOW}Blocked by:${NC} ${blocking_issues}"
     fi
@@ -2812,114 +2832,9 @@ Examples:
 }
 
 cmd_children() {
-    load_config
+    error "The ZenHub API no longer supports the childIssues field.
 
-    local issue_num="${1:-}"
-
-    if [[ -z "$issue_num" ]]; then
-        error "Usage: zh children <issue_number>
-
-List sub-issues (children) of an issue.
-
-Examples:
-  zh children 100    # List sub-issues of #100"
-    fi
-
-    # Strip # prefix if present
-    issue_num="${issue_num#\#}"
-
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
-
-    info "Getting sub-issues of #${issue_num}..."
-
-    local query='
-    query($repoId: ID!, $issueNumber: Int!) {
-        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
-            id
-            title
-            issueType {
-                ... on GithubIssueType { name }
-                ... on ZenhubIssueType { name }
-            }
-            childIssues {
-                nodes {
-                    number
-                    title
-                    state
-                    estimate {
-                        value
-                    }
-                    issueType {
-                        ... on GithubIssueType { name }
-                        ... on ZenhubIssueType { name }
-                    }
-                    assignees {
-                        nodes {
-                            login
-                        }
-                    }
-                    repository {
-                        ownerName
-                        name
-                    }
-                }
-            }
-        }
-    }'
-
-    local variables
-    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
-        '{repoId: $repo_id, issueNumber: $issue_num}')
-
-    # Try directly first — childIssues is not supported for PRs
-    local body
-    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
-
-    local response
-    response=$(curl -s -X POST "$ZENHUB_API" \
-        -H "Authorization: Bearer ${ZH_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "$body")
-
-    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
-        error "Pull requests do not support sub-issues. Use an issue number instead."
-    fi
-
-    local issue_title issue_type
-    issue_title=$(echo "$response" | jq -r '.data.issueByInfo.title // empty')
-    issue_type=$(echo "$response" | jq -r '.data.issueByInfo.issueType.name // ""')
-
-    if [[ -z "$issue_title" ]]; then
-        error "Issue #${issue_num} not found"
-    fi
-
-    local children
-    children=$(echo "$response" | jq '.data.issueByInfo.childIssues.nodes')
-
-    local count
-    count=$(echo "$children" | jq 'length')
-
-    echo ""
-    if [[ -n "$issue_type" ]]; then
-        echo -e "${BOLD}#${issue_num}${NC} [${issue_type}] ${issue_title}"
-    else
-        echo -e "${BOLD}#${issue_num}${NC} ${issue_title}"
-    fi
-    echo -e "${BOLD}Sub-issues (${count}):${NC}"
-    echo ""
-
-    if [[ "$count" -eq 0 ]]; then
-        echo "  No sub-issues"
-    else
-        echo "$children" | jq -r '.[] |
-            "\(.state)" as $state |
-            "  #\(.number | tostring | (" " * (5 - length)) + .) │ \((.estimate.value // "—") | tostring | (" " * (3 - length)) + .) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end | if length > 12 then .[:9] + "..." else . end | . + (" " * (12 - length))) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title | if length > 40 then .[:37] + "..." else . end)"'
-    fi
-    echo ""
+View sub-issues on the ZenHub board instead."
 }
 
 cmd_users() {
@@ -3900,6 +3815,9 @@ main() {
             ;;
         issue|i|show)
             cmd_issue "$@"
+            ;;
+        pr|pull-request)
+            cmd_pr "$@"
             ;;
         mine|my)
             cmd_mine "$@"
