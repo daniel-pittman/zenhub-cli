@@ -785,8 +785,71 @@ Example: zh issue 679"
     variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
         '{repoId: $repo_id, issueNumber: $issue_num}')
 
+    # Try the full query first (may fail for PRs which don't support parentIssues/childIssues)
+    local body
+    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
+
     local response
-    response=$(zh_graphql "$query" "$variables")
+    response=$(curl -s -X POST "$ZENHUB_API" \
+        -H "Authorization: Bearer ${ZH_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    # If the query fails (e.g. PRs don't support parentIssues/childIssues), retry without hierarchy fields
+    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+        local fallback_query='
+        query($repoId: ID!, $issueNumber: Int!) {
+            issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+                id
+                number
+                title
+                body
+                state
+                htmlUrl
+                estimate {
+                    value
+                }
+                issueType {
+                    ... on GithubIssueType { name }
+                    ... on ZenhubIssueType { name }
+                }
+                assignees {
+                    nodes {
+                        login
+                        name
+                    }
+                }
+                labels {
+                    nodes {
+                        name
+                        color
+                    }
+                }
+                pipelineIssues {
+                    nodes {
+                        pipeline {
+                            name
+                        }
+                    }
+                }
+                blockingIssues {
+                    nodes {
+                        number
+                        title
+                    }
+                }
+                blockedIssues {
+                    nodes {
+                        number
+                        title
+                    }
+                }
+                createdAt
+                updatedAt
+            }
+        }'
+        response=$(zh_graphql "$fallback_query" "$variables")
+    fi
 
     local issue
     issue=$(echo "$response" | jq '.data.issueByInfo')
@@ -807,8 +870,8 @@ Example: zh issue 679"
     zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$issue_num")
     blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
-    parent_issues=$(echo "$issue" | jq -r '[.parentIssues.nodes[] | "#\(.number) (\(.repository.ownerName)/\(.repository.name))"] | join(", ")')
-    child_issues=$(echo "$issue" | jq -r '[.childIssues.nodes[] | "#\(.number) \(if .state == "CLOSED" then "✓" else "" end)\(.title)"] | join("\n    ")')
+    parent_issues=$(echo "$issue" | jq -r '[(.parentIssues.nodes // [])[] | "#\(.number) (\(.repository.ownerName)/\(.repository.name))"] | join(", ")')
+    child_issues=$(echo "$issue" | jq -r '[(.childIssues.nodes // [])[] | "#\(.number) \(if .state == "CLOSED" then "✓" else "" end)\(.title)"] | join("\n    ")')
 
     echo ""
     echo -e "${BOLD}#${issue_num}${NC} ${title}"
@@ -2812,8 +2875,19 @@ Examples:
     variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
         '{repoId: $repo_id, issueNumber: $issue_num}')
 
+    # Try directly first — childIssues is not supported for PRs
+    local body
+    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
+
     local response
-    response=$(zh_graphql "$query" "$variables")
+    response=$(curl -s -X POST "$ZENHUB_API" \
+        -H "Authorization: Bearer ${ZH_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+        error "Pull requests do not support sub-issues. Use an issue number instead."
+    fi
 
     local issue_title issue_type
     issue_title=$(echo "$response" | jq -r '.data.issueByInfo.title // empty')
