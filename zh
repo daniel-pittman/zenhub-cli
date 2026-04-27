@@ -110,21 +110,23 @@ zh_graphql() {
     echo "$response"
 }
 
-# Get GitHub repo info from current directory
+# Get GitHub repo info from -r flag, ZH_REPO config, or current directory
 get_repo_info() {
+    if [[ -n "${ZH_REPO_OVERRIDE:-}" ]]; then
+        echo "$ZH_REPO_OVERRIDE"
+        return
+    fi
+
     local remote_url
     remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 
     if [[ -z "$remote_url" ]]; then
-        error "Not in a git repository with a GitHub remote.
+        error "No repository specified.
 
-This command must be run from within a git repository that:
-  1. Has a GitHub remote configured (origin)
-  2. Is connected to a ZenHub workspace
-
-To fix:
-  - cd into your project directory
-  - Ensure 'git remote -v' shows a GitHub URL"
+Either:
+  - Use -r owner/repo to specify the repository
+  - Set ZH_REPO=owner/repo in ${CONFIG_FILE}
+  - Run from within a git repository with a GitHub remote (origin)"
     fi
 
     # Parse owner/repo from various URL formats
@@ -278,9 +280,12 @@ cmd_help() {
 zh - ZenHub CLI Tool
 
 USAGE:
-    zh [-w <workspace>] <command> [options]
+    zh [-r <owner/repo>] [-w <workspace>] <command> [options]
 
 GLOBAL OPTIONS:
+    -r, --repo <owner/repo> Target a specific GitHub repository
+                            Can also set ZH_REPO in config/env
+                            If omitted, detected from current git directory
     -w, --workspace <name>  Target a specific workspace (default: first found)
                             Can also set ZH_WORKSPACE in config/env
 
@@ -422,6 +427,7 @@ CONFIGURATION:
     Create ~/.config/zh/config with:
         ZH_TOKEN=your_graphql_token
         ZH_REST_TOKEN=your_rest_token
+        ZH_REPO=owner/repo               (optional, overrides git detection)
         ZH_WORKSPACE=your_default_workspace  (optional)
 
     Generate tokens at:
@@ -472,6 +478,8 @@ EXAMPLES:
     zh block 123 456                # 123 blocked by 456
     zh priority 679 high            # Set high priority
     cat desc.md | zh create "Title" --stdin  # Body from stdin
+    zh -r "owner/repo" board       # Board without being in the repo dir
+    zh -r "owner/repo" issue 42    # View issue from any directory
     zh -w "Backend" board           # Board for specific workspace
     zh -w "Backend" sprints         # Sprints in specific workspace
     zh -w "Backend" move 42 "Done"  # Move issue in specific workspace
@@ -3947,10 +3955,18 @@ Examples:
 main() {
     # Parse global flags before command
     ZH_WORKSPACE_NAME="${ZH_WORKSPACE:-}"
+    ZH_REPO_OVERRIDE="${ZH_REPO:-}"
 
     local args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -r|--repo)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires an owner/repo value"
+                fi
+                ZH_REPO_OVERRIDE="$2"
+                shift 2
+                ;;
             -w|--workspace)
                 if [[ -z "${2:-}" ]]; then
                     error "Option $1 requires a workspace name"

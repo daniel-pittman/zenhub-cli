@@ -64,6 +64,11 @@ zh labels               # List labels
 zh pipelines            # List pipelines
 zh workspaces           # List available workspaces
 
+# Repo targeting (global -r flag, for running outside a git repo)
+zh -r "owner/repo" board            # Board without being in the repo directory
+zh -r "owner/repo" issue 42         # View issue from any directory
+zh -r "owner/repo" link 77 96       # Link PR to issue from anywhere
+
 # Workspace targeting (global -w flag)
 zh -w "Backend" board               # Board for a specific workspace
 zh -w "Backend" sprints             # Sprints in a specific workspace
@@ -81,6 +86,7 @@ zh -w "Backend" pipeline "TO DO"    # Pipeline in a specific workspace
 5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
 6. **Sprint names**: Case-insensitive; use `current` or `active` as alias for the active sprint
 7. **Workspace targeting**: Use `-w "Name"` before any command to target a specific workspace, or set `ZH_WORKSPACE` in config
+8. **Repo targeting**: Use `-r "owner/repo"` to run from any directory without needing a git checkout, or set `ZH_REPO` in config
 
 ## For AI Assistants
 
@@ -177,6 +183,7 @@ The tool reads tokens from `~/.config/zh/config`:
 ```bash
 ZH_TOKEN=...        # GraphQL API token (most commands)
 ZH_REST_TOKEN=...   # REST API token (unblock command only)
+ZH_REPO=...         # Default owner/repo (optional, overrides git detection)
 ZH_WORKSPACE=...    # Default workspace name (optional, uses first found if unset)
 ```
 
