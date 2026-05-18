@@ -42,6 +42,7 @@ zh priority <issue> high      # Set priority
 zh epic list                       # List all epics in workspace
 zh epic show <epic#>               # Show epic + child issues
 zh epic create "Title" [-d body] [-l labels]
+zh epic update <epic#> [-t "New Title"] [-d "New body"]  # Edit existing epic
 zh epic add <epic#> <issue#> [...]    # Add one or more issues to an epic
 zh epic remove <epic#> <issue#> [...] # Remove one or more issues from an epic
 zh epic close <epic#>              # Close epic

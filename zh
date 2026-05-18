@@ -328,11 +328,13 @@ COMMANDS:
                              list                              List all epics in workspace
                              show <epic#>                      Show epic + child issues
                              create "Title" [-d body] [-l ...] Create new epic
+                             update <epic#> [-t ...] [-d ...]  Edit epic title and/or body
                              add <epic#> <issue#> [...]        Add issues to epic
                              remove <epic#> <issue#> [...]     Remove issues from epic
                              close <epic#>                     Close epic
                              reopen <epic#>                    Reopen epic
                            Example: zh epic create "Friends backend" -l backend,friends
+                           Example: zh epic update 17733 -t "Renamed" -d "New body"
                            Example: zh epic add 17733 369 370
 
     help                    Show this help message
@@ -3085,6 +3087,111 @@ Example: zh epic reopen 17733"
     cmd_epic_set_state "$epic_num" "OPEN" "Reopened"
 }
 
+cmd_epic_update() {
+    local epic_num=""
+    local title=""
+    local body=""
+    local title_set="false"
+    local body_set="false"
+
+    # Parse arguments. First positional is the epic number; -t/-d may follow
+    # in any order.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--title)
+                if [[ $# -lt 2 ]]; then
+                    error "Option ${1} requires a value"
+                fi
+                title="$2"
+                title_set="true"
+                shift 2
+                ;;
+            -d|--description|-b|--body)
+                if [[ $# -lt 2 ]]; then
+                    error "Option ${1} requires a value"
+                fi
+                body="$2"
+                body_set="true"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$epic_num" ]]; then
+                    epic_num="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$epic_num" ]]; then
+        error "Usage: zh epic update <epic#> [-t \"New Title\"] [-d \"New description\"]
+Example: zh epic update 17733 -t \"Renamed Epic\"
+Example: zh epic update 17733 -d \"Updated body text\"
+Example: zh epic update 17733 -t \"New Title\" -d \"New body\"
+
+At least one of -t (title) or -d (description) must be provided."
+    fi
+
+    if [[ "$title_set" != "true" && "$body_set" != "true" ]]; then
+        error "Nothing to update — provide -t (title) and/or -d (description).
+Usage: zh epic update <epic#> [-t \"New Title\"] [-d \"New description\"]"
+    fi
+
+    local epic_gid
+    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
+
+    info "Updating epic #${epic_num#\#}..."
+
+    # Build the input payload — only include fields that were actually set so
+    # we never accidentally clobber an unspecified field with an empty string.
+    local input_json
+    input_json=$(jq -n --arg gid "$epic_gid" '{zenhubEpicId: $gid}')
+
+    if [[ "$title_set" == "true" ]]; then
+        input_json=$(echo "$input_json" | jq --arg title "$title" '. + {title: $title}')
+    fi
+
+    if [[ "$body_set" == "true" ]]; then
+        input_json=$(echo "$input_json" | jq --arg body "$body" '. + {body: $body}')
+    fi
+
+    local mutation_vars
+    mutation_vars=$(jq -n --argjson input "$input_json" '{input: $input}')
+
+    local mutation='
+    mutation($input: UpdateZenhubEpicInput!) {
+        updateZenhubEpic(input: $input) {
+            zenhubEpic {
+                id
+                title
+                body
+                state
+            }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local resulting_title resulting_state
+    resulting_title=$(echo "$response" | jq -r '.data.updateZenhubEpic.zenhubEpic.title // empty')
+    resulting_state=$(echo "$response" | jq -r '.data.updateZenhubEpic.zenhubEpic.state // empty')
+
+    if [[ -z "$resulting_title" ]]; then
+        error "Failed to update epic #${epic_num#\#}"
+    fi
+
+    echo ""
+    success "Updated epic #${epic_num#\#}: ${resulting_title}"
+    if [[ "$title_set" == "true" ]]; then
+        echo -e "  ${CYAN}Title:${NC} ${resulting_title}"
+    fi
+    if [[ "$body_set" == "true" ]]; then
+        echo -e "  ${CYAN}Body:${NC}  updated (${#body} chars)"
+    fi
+    echo -e "  ${CYAN}State:${NC} ${resulting_state}"
+}
+
 cmd_epic_delete() {
     local epic_num="${1:-}"
     if [[ -z "$epic_num" ]]; then
@@ -3133,6 +3240,9 @@ cmd_epic() {
         create|new)
             cmd_epic_create "$@"
             ;;
+        update|edit|modify)
+            cmd_epic_update "$@"
+            ;;
         add)
             cmd_epic_add "$@"
             ;;
@@ -3161,6 +3271,10 @@ SUBCOMMANDS:
     create "Title" [opts]             Create a new epic
                                         -d, --description <text>
                                         -l, --labels <comma-separated>
+    update <epic#> [opts]             Edit an existing epic's title and/or body
+                                        -t, --title <text>
+                                        -d, --description <text>
+                                      (aliases: edit, modify)
     add <epic#> <issue#> [...]        Add one or more issues to an epic
     remove <epic#> <issue#> [...]     Remove one or more issues from an epic
     close <epic#>                     Mark an epic CLOSED
@@ -3171,6 +3285,7 @@ EXAMPLES:
     zh epic list
     zh epic show 17733
     zh epic create "Friends Backend" -d "Build friends API" -l backend,friends
+    zh epic update 17733 -t "Renamed" -d "New body"
     zh epic add 17733 369 370
     zh epic remove 17733 369
     zh epic close 17733

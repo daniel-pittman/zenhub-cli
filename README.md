@@ -312,6 +312,11 @@ zh epic show 17733
 # Create a new epic (optionally with description + comma-separated labels)
 zh epic create "Friends Backend" -d "Build friends API endpoints" -l backend,friends
 
+# Edit an existing epic's title and/or body (at least one of -t / -d required)
+zh epic update 17733 -t "Friends Backend (v2)"
+zh epic update 17733 -d "Updated body text"
+zh epic update 17733 -t "Renamed" -d "New body"
+
 # Add or remove issues from an epic (one OR MORE issue numbers per call)
 zh epic add 17733 369 370 412
 zh epic remove 17733 369
@@ -332,6 +337,7 @@ zh epic delete 17733
 | `list` | List all epics in the workspace (number, state, title) |
 | `show <epic#>` | Show epic metadata, body, and child-issue list |
 | `create "Title" [opts]` | Create a new epic. Options: `-d` description, `-l` comma-separated labels |
+| `update <epic#> [opts]` | Edit an epic's title and/or body. Options: `-t` new title, `-d` new description. At least one required. Aliases: `edit`, `modify` |
 | `add <epic#> <issue#>...` | Add one or more issues to an epic in a single API call |
 | `remove <epic#> <issue#>...` | Remove one or more issues from an epic |
 | `close <epic#>` | Mark an epic CLOSED |
