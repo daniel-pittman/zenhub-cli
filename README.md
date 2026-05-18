@@ -133,6 +133,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
+| `epic <subcommand>` | `epics` | Manage ZenHub native epics (see [Epics](#epics)) |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -294,6 +295,48 @@ zh priority 42 high
 # Remove priority
 zh priority 42 clear
 ```
+
+### Epics
+
+ZenHub *native* epics (the kind created via the workspace's Epics view, not legacy "epic" labels) are workspace-scoped objects that group related issues. `zh epic` exposes them via subcommands.
+
+The epic numbers shown by `zh epic list` are stable, ZenHub-assigned numeric IDs (the trailing portion of the internal global ID). Re-use them with all other epic subcommands.
+
+```bash
+# List all epics in the workspace
+zh epic list
+
+# Show an epic and its child issues
+zh epic show 17733
+
+# Create a new epic (optionally with description + comma-separated labels)
+zh epic create "Friends Backend" -d "Build friends API endpoints" -l backend,friends
+
+# Add or remove issues from an epic (one OR MORE issue numbers per call)
+zh epic add 17733 369 370 412
+zh epic remove 17733 369
+
+# Toggle epic state
+zh epic close 17733
+zh epic reopen 17733
+
+# DANGER: permanently delete an epic (no undo). Prefer `close` unless cleanup
+# is intended.
+zh epic delete 17733
+```
+
+**Epic subcommands:**
+
+| Subcommand | Description |
+|------------|-------------|
+| `list` | List all epics in the workspace (number, state, title) |
+| `show <epic#>` | Show epic metadata, body, and child-issue list |
+| `create "Title" [opts]` | Create a new epic. Options: `-d` description, `-l` comma-separated labels |
+| `add <epic#> <issue#>...` | Add one or more issues to an epic in a single API call |
+| `remove <epic#> <issue#>...` | Remove one or more issues from an epic |
+| `close <epic#>` | Mark an epic CLOSED |
+| `reopen <epic#>` | Mark an epic OPEN |
+| `delete <epic#>` | Permanently delete an epic (no undo) |
 
 ### Discovery Commands
 

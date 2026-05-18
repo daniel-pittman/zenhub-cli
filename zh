@@ -323,6 +323,18 @@ COMMANDS:
 
     workspaces              List available workspaces for current repo
 
+    epic <subcommand>       Manage ZenHub epics (native epics in the workspace)
+                           Subcommands:
+                             list                              List all epics in workspace
+                             show <epic#>                      Show epic + child issues
+                             create "Title" [-d body] [-l ...] Create new epic
+                             add <epic#> <issue#> [...]        Add issues to epic
+                             remove <epic#> <issue#> [...]     Remove issues from epic
+                             close <epic#>                     Close epic
+                             reopen <epic#>                    Reopen epic
+                           Example: zh epic create "Friends backend" -l backend,friends
+                           Example: zh epic add 17733 369 370
+
     help                    Show this help message
 
 CONFIGURATION:
@@ -363,6 +375,9 @@ EXAMPLES:
     zh block 123 456                # 123 blocked by 456
     zh priority 679 high            # Set high priority
     cat desc.md | zh create "Title" --stdin  # Body from stdin
+    zh epic list                    # List all epics
+    zh epic show 17733              # Show epic + child issues
+    zh epic add 17733 369 370       # Add issues to epic
 EOF
 }
 
@@ -2469,6 +2484,712 @@ Examples:
 }
 
 # =============================================================================
+# Epic Commands
+# =============================================================================
+#
+# ZenHub native epics (distinct from legacy "epic" issues). These live on the
+# workspace, not on a repository, and have an opaque GraphQL ID of the form
+# "gid://raptor/ZenhubEpic/<numeric>". We expose the trailing numeric portion
+# as the "epic#" the user types — it is stable and ZenHub-assigned. We re-encode
+# it into the full GID before sending API requests.
+
+# Encode a numeric epic ID into its GraphQL global-ID form.
+zh_epic_encode_id() {
+    local epic_num="$1"
+    printf 'gid://raptor/ZenhubEpic/%s' "$epic_num" | base64 | tr -d '\n'
+}
+
+# Decode a ZenHub epic GID back to its numeric form (for display).
+zh_epic_decode_id() {
+    local gid="$1"
+    local decoded
+    decoded=$(printf '%s' "$gid" | base64 -d 2>/dev/null || true)
+    # decoded looks like: gid://raptor/ZenhubEpic/177339
+    echo "${decoded##*/}"
+}
+
+# Build a best-effort ZenHub URL for an epic.
+zh_epic_build_url() {
+    local workspace_id="$1"
+    local epic_num="$2"
+    echo "https://app.zenhub.com/workspaces/${workspace_id}/zenhub-epics/${epic_num}"
+}
+
+# Verify an epic exists and return its full GID; errors out if not found.
+# We bypass zh_graphql's strict error handling here because looking up a
+# non-existent epic legitimately returns a NOT_FOUND error from the API, and
+# we want to surface a friendly "Epic #N not found" message rather than the
+# raw GraphQL error text.
+zh_epic_resolve() {
+    local epic_num="$1"
+    epic_num="${epic_num#\#}"
+
+    if ! [[ "$epic_num" =~ ^[0-9]+$ ]]; then
+        error "Invalid epic number: ${epic_num} (must be numeric)"
+    fi
+
+    local gid
+    gid=$(zh_epic_encode_id "$epic_num")
+
+    local query='query($id: ID!) { node(id: $id) { ... on ZenhubEpic { id } } }'
+    local variables
+    variables=$(jq -n --arg id "$gid" '{id: $id}')
+
+    local body
+    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
+
+    local response
+    response=$(curl -s -X POST "$ZENHUB_API" \
+        -H "Authorization: Bearer ${ZH_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$body")
+
+    local resolved
+    resolved=$(echo "$response" | jq -r '.data.node.id // empty')
+
+    if [[ -z "$resolved" ]]; then
+        # Distinguish "not found" from other errors (auth, network, etc.)
+        local err_code
+        err_code=$(echo "$response" | jq -r '.errors[0].extensions.code // empty')
+        if [[ "$err_code" == "NOT_FOUND" ]]; then
+            error "Epic #${epic_num} not found in this workspace"
+        fi
+
+        local err_msg
+        err_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"')
+        error "ZenHub API error resolving epic #${epic_num}: ${err_msg}"
+    fi
+
+    echo "$resolved"
+}
+
+cmd_epic_list() {
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting epics for ${owner_repo}..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            name
+            zenhubEpics(first: 100) {
+                totalCount
+                nodes {
+                    id
+                    title
+                    state
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local workspace_name total
+    workspace_name=$(echo "$response" | jq -r '.data.workspace.name // "Unknown"')
+    total=$(echo "$response" | jq -r '.data.workspace.zenhubEpics.totalCount // 0')
+
+    echo ""
+    echo -e "${BOLD}Epics in ${workspace_name}${NC} (${total} total)"
+    echo ""
+
+    if [[ "$total" -eq 0 ]]; then
+        echo "  No epics in this workspace"
+        echo ""
+        return
+    fi
+
+    # Decode each epic's GID to a numeric number; print "num | state | title"
+    echo "$response" | jq -r '.data.workspace.zenhubEpics.nodes[] |
+        "\(.id)\t\(.state)\t\(.title)"' | \
+        while IFS=$'\t' read -r gid state title; do
+            local epic_num
+            epic_num=$(zh_epic_decode_id "$gid")
+            local state_color="$GREEN"
+            if [[ "$state" == "CLOSED" ]]; then
+                state_color="$YELLOW"
+            fi
+            printf "  ${BOLD}#%s${NC}  ${state_color}%-6s${NC}  %s\n" "$epic_num" "$state" "$title"
+        done
+
+    echo ""
+    echo -e "${CYAN}Tip:${NC} Use 'zh epic show <epic#>' to see an epic and its child issues"
+}
+
+cmd_epic_show() {
+    local epic_num="${1:-}"
+
+    if [[ -z "$epic_num" ]]; then
+        error "Usage: zh epic show <epic#>
+Example: zh epic show 17733"
+    fi
+
+    epic_num="${epic_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Verify the epic exists and resolve to GID
+    local epic_gid
+    epic_gid=$(zh_epic_resolve "$epic_num")
+
+    local query='
+    query($id: ID!, $workspaceId: ID!) {
+        node(id: $id) {
+            ... on ZenhubEpic {
+                id
+                title
+                state
+                body
+                createdAt
+                updatedAt
+                childIssues(workspaceId: $workspaceId, first: 100) {
+                    totalCount
+                    nodes {
+                        number
+                        title
+                        state
+                        assignees {
+                            nodes { login }
+                        }
+                        pipelineIssue(workspaceId: $workspaceId) {
+                            pipeline { name }
+                        }
+                        repository {
+                            ownerName
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg id "$epic_gid" --arg workspace_id "$workspace_id" \
+        '{id: $id, workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local epic
+    epic=$(echo "$response" | jq '.data.node')
+
+    if [[ "$epic" == "null" ]]; then
+        error "Epic #${epic_num} not found"
+    fi
+
+    local title state body child_count zh_url
+    title=$(echo "$epic" | jq -r '.title')
+    state=$(echo "$epic" | jq -r '.state')
+    body=$(echo "$epic" | jq -r '.body // ""')
+    child_count=$(echo "$epic" | jq -r '.childIssues.totalCount // 0')
+    zh_url=$(zh_epic_build_url "$workspace_id" "$epic_num")
+
+    local state_color="$GREEN"
+    if [[ "$state" == "CLOSED" ]]; then
+        state_color="$YELLOW"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Epic #${epic_num}${NC} ${title}"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}    ${state_color}${state}${NC}"
+    echo -e "  ${CYAN}Children:${NC} ${child_count}"
+    echo -e "  ${CYAN}ZenHub:${NC}   ${zh_url}"
+    echo ""
+
+    if [[ -n "$body" ]] && [[ "$body" != "null" ]]; then
+        echo -e "${BOLD}Body:${NC}"
+        echo ""
+        echo "$body" | sed 's/^/  /'
+        echo ""
+    fi
+
+    echo -e "${BOLD}Child issues (${child_count}):${NC}"
+    echo ""
+
+    if [[ "$child_count" -eq 0 ]]; then
+        echo "  No child issues"
+        echo ""
+        return
+    fi
+
+    echo "$epic" | jq -r '.childIssues.nodes[] |
+        "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
+        while IFS=$'\t' read -r num istate pipeline assignees ititle; do
+            local marker="  "
+            local color="$NC"
+            if [[ "$istate" == "CLOSED" ]]; then
+                marker="✓ "
+                color="$YELLOW"
+            fi
+            printf "  ${BOLD}#%-5s${NC} │ %-20s │ %-15s │ ${color}%s%s${NC}\n" \
+                "$num" "${pipeline:0:20}" "${assignees:0:15}" "$marker" "$ititle"
+        done
+
+    echo ""
+}
+
+cmd_epic_create() {
+    local title=""
+    local body=""
+    local labels=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--description|-b|--body)
+                body="$2"
+                shift 2
+                ;;
+            -l|--label|--labels)
+                labels="$2"
+                shift 2
+                ;;
+            *)
+                if [[ -z "$title" ]]; then
+                    title="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$title" ]]; then
+        error "Usage: zh epic create \"<title>\" [-d <description>] [-l label1,label2]
+Example: zh epic create \"Friends Backend\" -d \"Build friends API\" -l backend,friends"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Creating epic: ${title}..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Get zenhubOrganization ID from the workspace. We deliberately do NOT pass
+    # zenhubRepositoryId — that field expects a ZenHub-internal repo ID (distinct
+    # from the GitHub-mirrored repo ID we have access to), and the field is
+    # optional. Without it, the epic is workspace-scoped, which matches what
+    # the ZenHub UI does for native epics.
+    local org_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            zenhubOrganization { id }
+        }
+    }'
+
+    local org_vars
+    org_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local org_response
+    org_response=$(zh_graphql "$org_query" "$org_vars")
+
+    local org_id
+    org_id=$(echo "$org_response" | jq -r '.data.workspace.zenhubOrganization.id // empty')
+
+    if [[ -z "$org_id" ]]; then
+        error "Could not determine ZenHub organization for workspace"
+    fi
+
+    # Build the epic-input payload
+    local epic_input
+    if [[ -n "$body" ]]; then
+        epic_input=$(jq -n --arg title "$title" --arg body "$body" \
+            '{title: $title, body: $body}')
+    else
+        epic_input=$(jq -n --arg title "$title" '{title: $title}')
+    fi
+
+    local create_vars
+    create_vars=$(jq -n \
+        --arg org_id "$org_id" \
+        --argjson epic "$epic_input" \
+        '{input: {zenhubOrganizationId: $org_id, zenhubEpic: $epic}}')
+
+    local mutation='
+    mutation($input: CreateZenhubEpicInput!) {
+        createZenhubEpic(input: $input) {
+            zenhubEpic {
+                id
+                title
+                state
+            }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$create_vars")
+
+    local new_gid
+    new_gid=$(echo "$response" | jq -r '.data.createZenhubEpic.zenhubEpic.id // empty')
+
+    if [[ -z "$new_gid" ]]; then
+        error "Failed to create epic"
+    fi
+
+    local new_num
+    new_num=$(zh_epic_decode_id "$new_gid")
+
+    local new_url
+    new_url=$(zh_epic_build_url "$workspace_id" "$new_num")
+
+    echo ""
+    success "Created epic #${new_num}: ${title}"
+    echo -e "  ${CYAN}URL:${NC} ${new_url}"
+
+    # Apply labels (best-effort) — uses LabelInfoInput {name, color}
+    if [[ -n "$labels" ]]; then
+        local labels_array
+        labels_array=$(echo "$labels" | jq -R \
+            'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map({name: ., color: "cccccc"})')
+
+        local label_vars
+        label_vars=$(jq -n --arg gid "$new_gid" --argjson infos "$labels_array" \
+            '{input: {zenhubEpicIds: [$gid], labelInfos: $infos}}')
+
+        local label_mutation='
+        mutation($input: AddZenhubLabelsToZenhubEpicsInput!) {
+            addZenhubLabelsToZenhubEpics(input: $input) {
+                zenhubEpics { id }
+            }
+        }'
+
+        if zh_graphql "$label_mutation" "$label_vars" > /dev/null 2>&1; then
+            echo -e "  ${CYAN}Labels:${NC} ${labels}"
+        else
+            warn "Failed to apply labels: ${labels}"
+        fi
+    fi
+}
+
+# Shared helper: resolve a list of issue numbers to ZenHub issue IDs.
+# Echoes a JSON array of IDs (one per resolved issue) on stdout; errors out
+# if any issue is missing.
+zh_resolve_issue_ids() {
+    local repo_id="$1"
+    shift
+    local issue_nums=("$@")
+
+    local ids="[]"
+    for num in "${issue_nums[@]}"; do
+        local stripped="${num#\#}"
+        if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${num}"
+        fi
+
+        local query='
+        query($repoId: ID!, $issueNumber: Int!) {
+            issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+                id
+            }
+        }'
+
+        local variables
+        variables=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
+            '{repoId: $repo_id, issueNumber: $n}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        local issue_id
+        issue_id=$(echo "$response" | jq -r '.data.issueByInfo.id // empty')
+
+        if [[ -z "$issue_id" ]]; then
+            error "Issue #${stripped} not found in this repository"
+        fi
+
+        ids=$(echo "$ids" | jq --arg id "$issue_id" '. + [$id]')
+    done
+
+    echo "$ids"
+}
+
+cmd_epic_add() {
+    local epic_num="${1:-}"
+    shift || true
+
+    if [[ -z "$epic_num" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh epic add <epic#> <issue#> [<issue#> ...]
+Example: zh epic add 17733 369 370"
+    fi
+
+    local issue_nums=("$@")
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Resolve epic and issue IDs
+    local epic_gid
+    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
+
+    info "Adding ${#issue_nums[@]} issue(s) to epic #${epic_num#\#}..."
+
+    local issue_ids_json
+    issue_ids_json=$(zh_resolve_issue_ids "$repo_id" "${issue_nums[@]}")
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg gid "$epic_gid" --argjson ids "$issue_ids_json" \
+        '{input: {issueIds: $ids, zenhubEpicIds: [$gid]}}')
+
+    local mutation='
+    mutation($input: AddIssuesToZenhubEpicsInput!) {
+        addIssuesToZenhubEpics(input: $input) {
+            zenhubEpics { id }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local ok
+    ok=$(echo "$response" | jq -r '.data.addIssuesToZenhubEpics.zenhubEpics[0].id // empty')
+
+    if [[ -z "$ok" ]]; then
+        error "Failed to add issues to epic"
+    fi
+
+    # Build a "#369, #370" style summary
+    local summary
+    summary=$(printf '#%s, ' "${issue_nums[@]/#\#/}")
+    summary="${summary%, }"
+
+    echo ""
+    success "Added ${summary} to epic #${epic_num#\#}"
+}
+
+cmd_epic_remove() {
+    local epic_num="${1:-}"
+    shift || true
+
+    if [[ -z "$epic_num" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh epic remove <epic#> <issue#> [<issue#> ...]
+Example: zh epic remove 17733 369"
+    fi
+
+    local issue_nums=("$@")
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local epic_gid
+    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
+
+    info "Removing ${#issue_nums[@]} issue(s) from epic #${epic_num#\#}..."
+
+    local issue_ids_json
+    issue_ids_json=$(zh_resolve_issue_ids "$repo_id" "${issue_nums[@]}")
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg gid "$epic_gid" --argjson ids "$issue_ids_json" \
+        '{input: {issueIds: $ids, zenhubEpicIds: [$gid]}}')
+
+    local mutation='
+    mutation($input: RemoveIssuesFromZenhubEpicsInput!) {
+        removeIssuesFromZenhubEpics(input: $input) {
+            zenhubEpics { id }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local ok
+    ok=$(echo "$response" | jq -r '.data.removeIssuesFromZenhubEpics.zenhubEpics[0].id // empty')
+
+    if [[ -z "$ok" ]]; then
+        error "Failed to remove issues from epic"
+    fi
+
+    local summary
+    summary=$(printf '#%s, ' "${issue_nums[@]/#\#/}")
+    summary="${summary%, }"
+
+    echo ""
+    success "Removed ${summary} from epic #${epic_num#\#}"
+}
+
+cmd_epic_set_state() {
+    local epic_num="$1"
+    local new_state="$2"     # OPEN or CLOSED
+    local verb="$3"          # "Closed" or "Reopened" (for output)
+
+    local epic_gid
+    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
+
+    info "Setting epic #${epic_num#\#} state to ${new_state}..."
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg gid "$epic_gid" --arg state "$new_state" \
+        '{input: {zenhubEpicId: $gid, state: $state}}')
+
+    # Note: ZenhubEpicState is an ENUM, but GraphQL accepts string-coerced enum
+    # values when sent as variables, so this works without special handling.
+    local mutation='
+    mutation($input: UpdateZenhubEpicStateInput!) {
+        updateZenhubEpicState(input: $input) {
+            zenhubEpic { id state title }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local resulting_state title
+    resulting_state=$(echo "$response" | jq -r '.data.updateZenhubEpicState.zenhubEpic.state // empty')
+    title=$(echo "$response" | jq -r '.data.updateZenhubEpicState.zenhubEpic.title // ""')
+
+    if [[ -z "$resulting_state" ]]; then
+        error "Failed to update epic state"
+    fi
+
+    echo ""
+    success "${verb} epic #${epic_num#\#}: ${title}"
+    echo -e "  ${CYAN}State:${NC} ${resulting_state}"
+}
+
+cmd_epic_close() {
+    local epic_num="${1:-}"
+    if [[ -z "$epic_num" ]]; then
+        error "Usage: zh epic close <epic#>
+Example: zh epic close 17733"
+    fi
+    cmd_epic_set_state "$epic_num" "CLOSED" "Closed"
+}
+
+cmd_epic_reopen() {
+    local epic_num="${1:-}"
+    if [[ -z "$epic_num" ]]; then
+        error "Usage: zh epic reopen <epic#>
+Example: zh epic reopen 17733"
+    fi
+    cmd_epic_set_state "$epic_num" "OPEN" "Reopened"
+}
+
+cmd_epic_delete() {
+    local epic_num="${1:-}"
+    if [[ -z "$epic_num" ]]; then
+        error "Usage: zh epic delete <epic#>
+Example: zh epic delete 17733
+
+DANGER: This permanently deletes the epic. Use 'zh epic close' instead if you
+just want to mark it done."
+    fi
+
+    local epic_gid
+    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
+
+    info "Deleting epic #${epic_num#\#}..."
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg gid "$epic_gid" \
+        '{input: {zenhubEpicId: $gid}}')
+
+    local mutation='
+    mutation($input: DeleteZenhubEpicInput!) {
+        deleteZenhubEpic(input: $input) {
+            clientMutationId
+        }
+    }'
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    echo ""
+    success "Deleted epic #${epic_num#\#}"
+}
+
+cmd_epic() {
+    load_config
+
+    local sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+        list|ls)
+            cmd_epic_list "$@"
+            ;;
+        show|view)
+            cmd_epic_show "$@"
+            ;;
+        create|new)
+            cmd_epic_create "$@"
+            ;;
+        add)
+            cmd_epic_add "$@"
+            ;;
+        remove|rm)
+            cmd_epic_remove "$@"
+            ;;
+        close)
+            cmd_epic_close "$@"
+            ;;
+        reopen|open)
+            cmd_epic_reopen "$@"
+            ;;
+        delete)
+            cmd_epic_delete "$@"
+            ;;
+        ""|help|-h|--help)
+            cat << 'EOF'
+zh epic - Manage ZenHub native epics
+
+USAGE:
+    zh epic <subcommand> [args]
+
+SUBCOMMANDS:
+    list                              List all epics in the workspace
+    show <epic#>                      Show epic details + child issues
+    create "Title" [opts]             Create a new epic
+                                        -d, --description <text>
+                                        -l, --labels <comma-separated>
+    add <epic#> <issue#> [...]        Add one or more issues to an epic
+    remove <epic#> <issue#> [...]     Remove one or more issues from an epic
+    close <epic#>                     Mark an epic CLOSED
+    reopen <epic#>                    Mark an epic OPEN
+    delete <epic#>                    Permanently delete an epic (DANGER)
+
+EXAMPLES:
+    zh epic list
+    zh epic show 17733
+    zh epic create "Friends Backend" -d "Build friends API" -l backend,friends
+    zh epic add 17733 369 370
+    zh epic remove 17733 369
+    zh epic close 17733
+    zh epic reopen 17733
+
+NOTES:
+    Epic numbers are the trailing numeric portion of ZenHub's internal IDs
+    (stable, workspace-scoped). They are shown by 'zh epic list'.
+EOF
+            ;;
+        *)
+            error "Unknown epic subcommand: ${sub}
+
+Run 'zh epic help' for usage information."
+            ;;
+    esac
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -2548,6 +3269,9 @@ main() {
             ;;
         priority|prio)
             cmd_priority "$@"
+            ;;
+        epic|epics)
+            cmd_epic "$@"
             ;;
         *)
             error "Unknown command: $command
