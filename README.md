@@ -476,6 +476,64 @@ Ensure the GitHub CLI is authenticated: `gh auth status`
 ### "Issue not found"
 The issue must exist in a repository that's part of your ZenHub workspace.
 
+## MCP Server (for Claude Code / AI agents)
+
+A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. It wraps `zh` over stdio so any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
+
+### What it exposes
+
+Roughly 20 tools covering the same surface as `zh`:
+
+| Category | Tools |
+|---|---|
+| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `list_users`, `list_labels`, `list_types` |
+| Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
+| Dependencies | `block_issue` |
+| Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
+
+`epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
+
+### Installation
+
+```bash
+# 1. Make sure zh itself is installed and configured (see Configuration above).
+
+# 2. Register the MCP server with Claude Code (user scope = all sessions on this machine):
+claude mcp add --scope user zenhub \
+    /usr/bin/python3 \
+    /absolute/path/to/zenhub-cli/mcp_server.py
+
+# 3. On first invocation, the server self-bootstraps a venv at /tmp/zhenv
+#    and installs the `mcp` package there. /tmp is wiped on reboot, so the
+#    server will re-bootstrap automatically next time it's launched.
+
+# 4. Verify:
+claude mcp list
+# Should show: zenhub: ... - ✓ Connected
+```
+
+### How tools resolve the GitHub repo
+
+`zh` detects the GitHub repo from `git config --get remote.origin.url` in its working directory. The MCP server therefore resolves the repo as follows, in priority order:
+
+1. Explicit `repo_path` argument on the tool call (absolute path of a git checkout)
+2. `ZH_DEFAULT_REPO_PATH` environment variable
+3. The MCP server's own working directory at launch
+
+For multi-project use, the typical pattern is to pass `repo_path` explicitly on each tool call — one MCP server instance can drive multiple ZenHub workspaces, as long as each call points to a different git checkout.
+
+### Environment overrides
+
+| Variable | Purpose |
+|---|---|
+| `ZH_DEFAULT_REPO_PATH` | Default git checkout directory to run `zh` from when `repo_path` arg is omitted. |
+| `ZH_BIN_PATH` | Path to the `zh` bash script (default: peer to `mcp_server.py`). Useful if you want to test against an alternate `zh` build. |
+
+### Requirements
+
+- Python 3.10+ available on PATH (the server probes common locations: PATH default, Homebrew, pyenv shims, system Python).
+- All the same requirements as `zh` itself (authenticated `gh` CLI, `ZH_TOKEN` configured, `jq`, `curl`).
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
