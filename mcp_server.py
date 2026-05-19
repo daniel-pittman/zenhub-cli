@@ -181,14 +181,16 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
 
 def _parse_board(plain: str) -> dict:
     """Parse `zh board` plain output into {pipeline_name: count}."""
-    # Lines look like: "  Product Backlog            44 ███..."
+    # Lines look like: "  Product Backlog            44 ██████████████…"
+    # Bar can be any combination of block/space chars AND may end in `…` when
+    # truncated to terminal width. Match name + count; ignore everything after.
     out = {}
     for line in plain.splitlines():
-        m = re.match(r"^\s+(\S.*?)\s+(\d+)\s*[█\s]*$", line)
+        m = re.match(r"^\s+(\S.*?)\s+(\d+)(?:\s|$)", line)
         if m:
             name = m.group(1).strip()
             count = int(m.group(2))
-            # Skip the "Board: ..." header line which can also match
+            # Skip the "Board: <Workspace Name> (NN open issues)" header line.
             if name.startswith("Board:") or "open issues" in name:
                 continue
             out[name] = count
