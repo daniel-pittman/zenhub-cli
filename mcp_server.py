@@ -53,7 +53,15 @@ from pathlib import Path
 
 _VENV_DIR = Path("/tmp/zhenv")
 _VENV_PY = _VENV_DIR / "bin" / "python3"
-_VENV_DEPS = ("mcp",)
+_VENV_DEPS = (
+    "mcp",
+    # similarity search: sentence-transformers brings in torch + transformers
+    # + huggingface_hub. The model weights themselves are cached under
+    # ~/.cache/huggingface/ so they survive reboots even when /tmp/zhenv
+    # is wiped.
+    "sentence-transformers",
+    "numpy",
+)
 _VENV_MIN_PY = (3, 10)  # mcp package requires >= 3.10
 
 
@@ -479,14 +487,128 @@ def list_types(repo_path: str = "") -> dict:
 
 
 # -----------------------------------------------------------------------------
+# SIMILARITY SEARCH TOOLS
+#
+# Sentence-embedding-backed search to surface tickets that look
+# semantically similar to a query string (or a proposed new title+body).
+# Catches paraphrased duplicates that keyword search misses.
+#
+# Cache lives at ~/.config/zh/index/<owner_repo>.pkl (durable across
+# reboots). Implementation is in similarity.py.
+# -----------------------------------------------------------------------------
+
+
+def _similarity_repo(repo_path: str) -> tuple[str | None, str | None]:
+    """Resolve which `owner/repo` similarity search should target.
+
+    Returns (repo, error_message). Exactly one will be non-None.
+    """
+    try:
+        # Lazy import: keeps the bootstrap path cheap if the tool is
+        # never invoked (sentence-transformers brings in torch).
+        from similarity import repo_from_cwd
+
+        return repo_from_cwd(_resolve_cwd(repo_path)), None
+    except Exception as e:
+        return None, str(e)
+
+
+@mcp.tool()
+def zh_similar(query: str, top_k: int = 5, threshold: float = 0.5,
+               repo_path: str = "") -> dict:
+    """Find issues semantically similar to a query string.
+
+    Uses sentence-transformer embeddings (all-MiniLM-L6-v2) over the
+    titles + body previews of every open issue in the repo. Catches
+    paraphrased duplicates that keyword search misses.
+
+    The cache auto-refreshes on a 5-minute TTL via GitHub's
+    `?since=<ISO8601>` filter — only changed issues get re-embedded.
+    First call after a wipe (or first call ever) triggers a full pull
+    and may take 30-60s depending on backlog size.
+
+    Args:
+        query: text to compare against existing issues. Free-form.
+        top_k: max results to return (default 5).
+        threshold: minimum cosine similarity (0.0-1.0) to include
+            (default 0.5 — moderate matches and above).
+        repo_path: Optional absolute path of a git checkout. Used to
+            derive `owner/repo` for the search.
+
+    Returns:
+        dict with: ok, repo, matches (list of {number, repo, title,
+        body_preview, state, similarity}), stderr.
+    """
+    repo, err = _similarity_repo(repo_path)
+    if err:
+        return {"ok": False, "matches": [], "stderr": err}
+    try:
+        from similarity import find_similar
+
+        results = find_similar(
+            query, repo, top_k=top_k, threshold=threshold, auto_sync=True
+        )
+        return {
+            "ok": True,
+            "repo": repo,
+            "matches": [m.to_dict() for m in results],
+            "stderr": "",
+        }
+    except Exception as e:
+        return {"ok": False, "repo": repo, "matches": [], "stderr": str(e)}
+
+
+@mcp.tool()
+def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
+    """Refresh the similarity-search cache for this repo.
+
+    Most callers don't need this — `zh_similar` auto-syncs on a
+    5-minute TTL. Use this to force a refresh after a known external
+    change burst, or pass `full=True` to rebuild from scratch (useful
+    if the cache looks corrupted).
+
+    Args:
+        full: if True, drop the existing cache and pull every open
+            issue from scratch. Otherwise do a delta sync from the
+            cache's last indexed_at timestamp.
+        repo_path: Optional absolute path of a git checkout to derive
+            owner/repo from.
+
+    Returns:
+        dict with: ok, repo, mode ('full'/'delta'/'skipped'),
+        added, updated, removed, indexed_at, total_entries, stderr.
+    """
+    repo, err = _similarity_repo(repo_path)
+    if err:
+        return {"ok": False, "stderr": err}
+    try:
+        from similarity import reindex
+
+        result = reindex(repo, full=full)
+        result["stderr"] = ""
+        return result
+    except Exception as e:
+        return {"ok": False, "repo": repo, "stderr": str(e)}
+
+
+# -----------------------------------------------------------------------------
 # WRITE TOOLS — ISSUE LIFECYCLE
 # -----------------------------------------------------------------------------
 
 @mcp.tool()
 def create_issue(title: str, body: str, type: str = "Task",
                  pipeline: str = "Product Backlog",
-                 labels: str = "", repo_path: str = "") -> dict:
+                 labels: str = "", repo_path: str = "",
+                 confirm_create: bool = False,
+                 skip_duplicate_check: bool = False) -> dict:
     """Create a new ZenHub issue.
+
+    Runs a pre-flight similarity check against existing open issues
+    (via the sentence-embedding index — see `zh_similar`). When a
+    near-duplicate is detected (cosine similarity above the hard
+    threshold), the create is BLOCKED and the candidate matches are
+    returned — pass `confirm_create=True` to override and create
+    anyway. Soft matches are surfaced as a warning but don't block.
 
     Args:
         title: Issue title (required, non-empty).
@@ -496,25 +618,75 @@ def create_issue(title: str, body: str, type: str = "Task",
         pipeline: Target pipeline. Defaults to "Product Backlog".
         labels: Comma-separated label names (optional).
         repo_path: Optional absolute path of a git checkout to run zh from.
+        confirm_create: pass True to bypass the duplicate-check block.
+            Use ONLY after reviewing the returned matches and confirming
+            the new ticket is genuinely distinct.
+        skip_duplicate_check: pass True to skip the pre-flight entirely
+            (e.g. when migrating issues in bulk or when the similarity
+            index is known to be unavailable). Prefer `confirm_create`
+            for one-off overrides.
 
     Returns:
-        dict with: ok, number (new issue number), url, raw, stderr.
+        On block: dict with ok=False, blocked=True, duplicate_check (the
+            candidate matches and recommendation), and a clear message
+            explaining how to override.
+        On success: dict with ok=True, number (new issue number), url,
+            raw, stderr, duplicate_check (informational — may include
+            soft matches).
     """
     if not title.strip():
         return {"ok": False, "stderr": "title must be non-empty"}
     if not body.strip():
         return {"ok": False, "stderr": "body must be non-empty"}
 
+    # Pre-flight similarity check
+    dup_info = None
+    if not skip_duplicate_check:
+        repo, err = _similarity_repo(repo_path)
+        if err:
+            # Can't derive repo → log but don't fail the create.
+            dup_info = {"ok": False, "stderr": err, "matches": []}
+        else:
+            try:
+                from similarity import check_duplicate
+
+                dup_info = check_duplicate(title, body, repo)
+            except Exception as e:
+                # Embedding failure shouldn't block create — log only.
+                dup_info = {
+                    "ok": False,
+                    "stderr": f"duplicate check failed: {e}",
+                    "matches": [],
+                }
+
+        if (dup_info and dup_info.get("recommendation") == "block"
+                and not confirm_create):
+            return {
+                "ok": False,
+                "blocked": True,
+                "stderr": (
+                    "Refused: a similar open issue already exists "
+                    "(cosine similarity >= "
+                    f"{dup_info.get('hard_threshold')}). "
+                    "Review duplicate_check.matches; if the new ticket is "
+                    "genuinely distinct, retry with confirm_create=True."
+                ),
+                "duplicate_check": dup_info,
+            }
+
     args = ["create", title, "-t", type, "-p", pipeline, "-b", body]
     if labels:
         args.extend(["-l", labels])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    return {
+    out = {
         "ok": r["ok"],
         "number": _parse_new_issue_number(r["stdout_plain"]) if r["ok"] else None,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
+    if dup_info is not None:
+        out["duplicate_check"] = dup_info
+    return out
 
 
 @mcp.tool()

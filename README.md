@@ -14,6 +14,7 @@ A powerful command-line interface for ZenHub. Manage issues, pipelines, sprints,
 - 🔗 **ZenHub URLs** - Clickable links to issues in the ZenHub board
 - 📁 **Multi-repo workspaces** - Works with workspaces containing multiple repositories
 - 🤖 **AI-friendly** - Designed for use with AI assistants like Claude
+- 🔍 **Duplicate detection** *(MCP only)* - Sentence-embedding similarity search catches paraphrased duplicates before creating issues
 
 ## Requirements
 
@@ -490,8 +491,33 @@ Roughly 20 tools covering the same surface as `zh`:
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
+| Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
+
+### Similarity search (duplicate detection)
+
+The MCP server includes a sentence-embedding-backed similarity index that finds existing issues semantically similar to a query — catching paraphrased duplicates that keyword search misses (e.g. *"Theme: fix ColorScheme surface==primary collision"* and *"WarningDialog WCAG 1.31:1 dark mode"* score 0.6 cosine on the same underlying bug despite sharing zero keywords).
+
+**Two tools + a `create_issue` pre-flight:**
+
+- **`zh_similar(query, top_k=5, threshold=0.5)`** — ad-hoc similarity search against open issues. Returns matches with cosine scores.
+- **`zh_reindex(full=False)`** — manually refresh the cache. Most callers don't need this; `zh_similar` auto-syncs on a 5-minute TTL.
+- **`create_issue` pre-flight** — before creating an issue, the tool runs a similarity check on `title + body`. If any match exceeds the hard threshold (0.70 cosine), the create is **blocked** and the candidate matches are returned. Pass `confirm_create=True` to override after reviewing. Soft matches (0.55-0.70) are surfaced as warnings but don't block.
+
+**How it works:**
+
+1. **Model**: [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) — 384-dim embeddings, ~80MB model, runs locally on CPU. Cached at `~/.cache/huggingface/` (persists across reboots).
+2. **Cache**: pickled per-repo index at `~/.config/zh/index/<owner_repo>.pkl` (durable). Holds title + body preview + embedding for every open issue.
+3. **Sync**: every query auto-checks the cache age. If > 5 min stale, calls `gh api repos/{owner}/{repo}/issues?since=<ISO8601>` to pull only changed issues and re-embeds those. After 7 days untouched, the cache rebuilds from scratch instead of trusting the delta.
+4. **First run**: cold start downloads the model (~30s once) and pulls every open issue (~30-60s for a 100-issue backlog). After that, queries are millisecond-level.
+
+**Tuning thresholds**: edit `similarity.py`'s `DUPLICATE_HARD_THRESHOLD` and `DUPLICATE_SOFT_THRESHOLD` constants. Calibration on the original test backlog:
+- 0.75+ : identical title with different body → almost certainly a duplicate
+- 0.60–0.70 : semantically related but distinct work → surface, don't block
+- < 0.55 : just a topic neighbor → ignore
+
+**Disabling**: pass `skip_duplicate_check=True` to `create_issue` to bypass the pre-flight entirely (useful for bulk migrations).
 
 ### Installation
 
@@ -533,6 +559,7 @@ For multi-project use, the typical pattern is to pass `repo_path` explicitly on 
 
 - Python 3.10+ available on PATH (the server probes common locations: PATH default, Homebrew, pyenv shims, system Python).
 - All the same requirements as `zh` itself (authenticated `gh` CLI, `ZH_TOKEN` configured, `jq`, `curl`).
+- For the similarity-search tools: ~500MB of disk space the first time it runs — `sentence-transformers` installs `torch` + `transformers` into the venv (~400MB) and the embedding model itself caches under `~/.cache/huggingface/` (~80MB).
 
 ## Contributing
 
