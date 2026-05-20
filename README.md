@@ -15,6 +15,7 @@ A powerful command-line interface for ZenHub. Manage issues, pipelines, sprints,
 - 📁 **Multi-repo workspaces** - Works with workspaces containing multiple repositories
 - 🤖 **AI-friendly** - Designed for use with AI assistants like Claude
 - 🔍 **Duplicate detection** *(MCP only)* - Sentence-embedding similarity search catches paraphrased duplicates before creating issues
+- 🤖 **Bundled Claude Code agent** - Drop-in `agents/zenhub.md` adds intelligent behavior layer on top of the tools (propose-first for destructive ops, batch audit trails, proactive duplicate detection)
 
 ## Requirements
 
@@ -560,6 +561,45 @@ For multi-project use, the typical pattern is to pass `repo_path` explicitly on 
 - Python 3.10+ available on PATH (the server probes common locations: PATH default, Homebrew, pyenv shims, system Python).
 - All the same requirements as `zh` itself (authenticated `gh` CLI, `ZH_TOKEN` configured, `jq`, `curl`).
 - For the similarity-search tools: ~500MB of disk space the first time it runs — `sentence-transformers` installs `torch` + `transformers` into the venv (~400MB) and the embedding model itself caches under `~/.cache/huggingface/` (~80MB).
+
+### Optional: install the bundled `zenhub` agent for delegated use
+
+The MCP server exposes the tools; the bundled **agent** (`agents/zenhub.md` in this repo) is the *behavioral layer* that makes a Claude Code session use those tools intelligently — proactive duplicate detection before drafting, propose-first protocol for destructive ops, batch audit-trail discipline, project-conventions discovery, and the three-option blocked-response framing for `create_issue` near-duplicates.
+
+The agent is a single Markdown file with frontmatter. To install:
+
+```bash
+# 1. Copy the agent definition into user-scope agents.
+mkdir -p ~/.claude/agents
+cp agents/zenhub.md ~/.claude/agents/zenhub.md
+
+# 2. Customize the "Project-specific conventions" section near the
+#    bottom for your project(s) — filing rules, announcement channel,
+#    active epics, sprint conventions. The file ships with a checklist
+#    of what to capture per project.
+
+# 3. (No restart needed.) In any Claude Code session on this machine
+#    you can now delegate to it:
+#
+#    "Use the zenhub agent to file a ticket about <X>"
+#    "Have the zenhub agent survey the board"
+#    "Ask the zenhub agent to propose next sprint's tickets"
+```
+
+The agent description tells Claude Code's orchestrator when to delegate to it automatically (e.g. when the user mentions ZenHub ticket operations). You don't have to invoke it by name.
+
+What the agent enforces on top of the raw tools:
+
+| Behavior | Without agent | With agent |
+|---|---|---|
+| **Duplicate check** | Only fires if you call `zh_similar` manually or if `create_issue` pre-flight catches it | Always runs `zh_similar` *before* drafting; surfaces matches; presents 3-option decision on blocked responses |
+| **Destructive ops** | Fired immediately when invoked | Propose-first protocol with what / why / new-state / undo |
+| **Batch ops (>5 writes)** | No audit trail unless you build one | Audit-trail YAML required; per-batch announce + spot-check pauses |
+| **Project conventions** | Re-discovered each session | Read from project memory or `CLAUDE.md` before any write op |
+| **`Closes #N` hazard** | Silent (commit message lands and 10 unrelated tickets auto-close) | Hard rule against this pattern; alternate notations enforced |
+| **Filing destination** | Has to be specified per ticket | Defaults from project conventions |
+
+The agent file is genuinely portable — strip the example "Project-specific conventions" section and you have a clean template that works for any ZenHub-using project.
 
 ## Contributing
 
