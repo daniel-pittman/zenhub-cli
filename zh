@@ -333,9 +333,22 @@ COMMANDS:
                              remove <epic#> <issue#> [...]     Remove issues from epic
                              close <epic#>                     Close epic
                              reopen <epic#>                    Reopen epic
-                           Example: zh epic create "Friends backend" -l backend,auth
+                           Example: zh epic create "Auth Service" -l backend,auth
                            Example: zh epic update 12345 -t "Renamed" -d "New body"
                            Example: zh epic add 12345 369 370
+
+    subissue <subcommand>   Manage sub-issues (Issue → Sub-issue hierarchy tier)
+                           Subcommands:
+                             add <parent#> <child#> [...]      Link issues as sub-issues
+                             remove <parent#> <child#> [...]   Unlink sub-issues
+                             list <parent#>                    List sub-issues of a parent
+                             reorder <child#> <position>       Reorder sub-issue among siblings
+                                                                Position: top | bottom |
+                                                                          after <sib#> | before <sib#>
+                           Example: zh subissue add 42 100 101
+                           Example: zh subissue list 42
+                           Example: zh subissue reorder 100 after 101
+                           (aliases: sub, child, children)
 
     help                    Show this help message
 
@@ -672,6 +685,13 @@ Example: zh issue 42"
                     title
                 }
             }
+            parentIssue {
+                number
+                title
+            }
+            zenhubChildIssues(first: 1) {
+                totalCount
+            }
             createdAt
             updatedAt
         }
@@ -691,7 +711,7 @@ Example: zh issue 42"
         error "Issue #${issue_num} not found"
     fi
 
-    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues
+    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues parent_num parent_title child_count
     title=$(echo "$issue" | jq -r '.title')
     state=$(echo "$issue" | jq -r '.state')
     pipeline=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
@@ -702,6 +722,9 @@ Example: zh issue 42"
     zh_url=$(build_zenhub_url "$workspace_id" "$owner_repo" "$issue_num")
     blocking_issues=$(echo "$issue" | jq -r '[.blockingIssues.nodes[] | "#\(.number)"] | join(", ")')
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
+    parent_num=$(echo "$issue" | jq -r '.parentIssue.number // empty')
+    parent_title=$(echo "$issue" | jq -r '.parentIssue.title // ""')
+    child_count=$(echo "$issue" | jq -r '.zenhubChildIssues.totalCount // 0')
 
     echo ""
     echo -e "${BOLD}#${issue_num}${NC} ${title}"
@@ -716,6 +739,12 @@ Example: zh issue 42"
     fi
     if [[ -n "$blocked_issues" ]]; then
         echo -e "  ${YELLOW}Blocking:${NC}  ${blocked_issues}"
+    fi
+    if [[ -n "$parent_num" ]]; then
+        echo -e "  ${CYAN}Parent:${NC}    #${parent_num} ${parent_title}"
+    fi
+    if [[ "$child_count" -gt 0 ]]; then
+        echo -e "  ${CYAN}Sub-issues:${NC} ${child_count} (see 'zh subissue list ${issue_num}')"
     fi
     echo -e "  ${CYAN}ZenHub:${NC}    ${zh_url}"
     echo -e "  ${CYAN}GitHub:${NC}    ${gh_url}"
@@ -3224,6 +3253,541 @@ just want to mark it done."
     success "Deleted epic #${epic_num#\#}"
 }
 
+# =============================================================================
+# Sub-issue Commands
+# =============================================================================
+#
+# ZenHub native sub-issues (the 3rd tier below Epic → Issue → Sub-issue). A
+# sub-issue is an Issue whose parentIssue points to another Issue. ZenHub
+# exposes this via three GraphQL mutations:
+#
+#   addSubIssues       — link one or more child issues under a parent
+#   removeSubIssues    — unlink one or more children (parent inferred)
+#   reprioritizeSubIssue — reorder a single child relative to siblings
+#
+# The Issue type also exposes parentIssue (singular) and zenhubChildIssues
+# (connection) so the hierarchy is queryable both directions.
+#
+# Note: ZenHub also has the separate `githubChildIssues` / `githubParentIssue`
+# fields for GitHub-native sub-issues (a parallel concept on GitHub's side).
+# `zh subissue` deliberately wraps only the ZenHub-native side — that's the
+# tier the rest of `zh` works with, and mixing the two would invite confusion.
+
+# Resolve a single issue number to its ZenHub issue ID. Thin wrapper around
+# zh_resolve_issue_ids that returns the first element rather than a JSON
+# array, since most sub-issue ops only need one parent at a time.
+zh_resolve_issue_id() {
+    local repo_id="$1"
+    local issue_num="$2"
+
+    local ids_json
+    ids_json=$(zh_resolve_issue_ids "$repo_id" "$issue_num")
+
+    echo "$ids_json" | jq -r '.[0]'
+}
+
+cmd_subissue_add() {
+    local parent_num="${1:-}"
+    shift || true
+
+    if [[ -z "$parent_num" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh subissue add <parent#> <child#> [<child#> ...]
+Example: zh subissue add 42 100 101"
+    fi
+
+    local child_nums=("$@")
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    info "Adding ${#child_nums[@]} sub-issue(s) to parent #${parent_num#\#}..."
+
+    # Resolve parent and children separately. The parent ID goes into parentId
+    # (scalar); the child IDs go into childIssueIds (list).
+    local parent_id
+    parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
+
+    local child_ids_json
+    child_ids_json=$(zh_resolve_issue_ids "$repo_id" "${child_nums[@]}")
+
+    local mutation_vars
+    mutation_vars=$(jq -n \
+        --arg parent_id "$parent_id" \
+        --argjson child_ids "$child_ids_json" \
+        '{input: {parentId: $parent_id, childIssueIds: $child_ids}}')
+
+    local mutation='
+    mutation($input: AddSubIssuesInput!) {
+        addSubIssues(input: $input) {
+            successCount
+            failedIssues
+            githubErrors
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local success_count failed_count
+    success_count=$(echo "$response" | jq -r '.data.addSubIssues.successCount // 0')
+    failed_count=$(echo "$response" | jq -r '.data.addSubIssues.failedIssues | length // 0')
+
+    # Build a "#100, #101" style summary
+    local summary
+    summary=$(printf '#%s, ' "${child_nums[@]/#\#/}")
+    summary="${summary%, }"
+
+    echo ""
+    if [[ "$success_count" -gt 0 ]]; then
+        success "Added ${success_count} sub-issue(s) to #${parent_num#\#}: ${summary}"
+    fi
+    if [[ "$failed_count" -gt 0 ]]; then
+        local failed_json
+        failed_json=$(echo "$response" | jq -c '.data.addSubIssues.failedIssues')
+        warn "${failed_count} failed: ${failed_json}"
+    fi
+    if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
+        # Some ZenHub mutations silently no-op when the child already has the
+        # same parent. Surface that rather than claiming false success.
+        warn "No sub-issues added — already linked or no-op"
+    fi
+}
+
+cmd_subissue_remove() {
+    local parent_num="${1:-}"
+    shift || true
+
+    if [[ -z "$parent_num" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh subissue remove <parent#> <child#> [<child#> ...]
+Example: zh subissue remove 42 100
+
+Note: the parent argument is used for messaging / pre-check; the underlying
+mutation unlinks each child from whatever parent it currently has."
+    fi
+
+    local child_nums=("$@")
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Resolve parent (used only for the friendlier message — the API doesn't
+    # actually need it for removal, since each child has exactly one parent).
+    local parent_id
+    parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
+
+    info "Removing ${#child_nums[@]} sub-issue(s) from parent #${parent_num#\#}..."
+
+    local child_ids_json
+    child_ids_json=$(zh_resolve_issue_ids "$repo_id" "${child_nums[@]}")
+
+    local mutation_vars
+    mutation_vars=$(jq -n --argjson child_ids "$child_ids_json" \
+        '{input: {childIssueIds: $child_ids}}')
+
+    local mutation='
+    mutation($input: RemoveSubIssuesInput!) {
+        removeSubIssues(input: $input) {
+            successCount
+            failedIssues
+            githubErrors
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local success_count failed_count
+    success_count=$(echo "$response" | jq -r '.data.removeSubIssues.successCount // 0')
+    failed_count=$(echo "$response" | jq -r '.data.removeSubIssues.failedIssues | length // 0')
+
+    local summary
+    summary=$(printf '#%s, ' "${child_nums[@]/#\#/}")
+    summary="${summary%, }"
+
+    echo ""
+    if [[ "$success_count" -gt 0 ]]; then
+        success "Removed ${success_count} sub-issue(s) from #${parent_num#\#}: ${summary}"
+    fi
+    if [[ "$failed_count" -gt 0 ]]; then
+        local failed_json
+        failed_json=$(echo "$response" | jq -c '.data.removeSubIssues.failedIssues')
+        warn "${failed_count} failed: ${failed_json}"
+    fi
+    if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
+        warn "No sub-issues removed — child(ren) were not linked to a parent"
+    fi
+}
+
+cmd_subissue_list() {
+    local parent_num="${1:-}"
+
+    if [[ -z "$parent_num" ]]; then
+        error "Usage: zh subissue list <parent#>
+Example: zh subissue list 42"
+    fi
+
+    parent_num="${parent_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Fetch the parent issue + its child connection. Matches the format
+    # cmd_epic_show uses for child issues.
+    local query='
+    query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            number
+            title
+            state
+            zenhubChildIssues(first: 100) {
+                totalCount
+                nodes {
+                    number
+                    title
+                    state
+                    assignees {
+                        nodes { login }
+                    }
+                    pipelineIssue(workspaceId: $workspaceId) {
+                        pipeline { name }
+                    }
+                    repository {
+                        ownerName
+                        name
+                    }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$parent_num" \
+        --arg workspace_id "$workspace_id" \
+        '{repoId: $repo_id, issueNumber: $issue_num, workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local issue
+    issue=$(echo "$response" | jq '.data.issueByInfo')
+
+    if [[ "$issue" == "null" ]]; then
+        error "Issue #${parent_num} not found in this repository"
+    fi
+
+    local parent_title child_count
+    parent_title=$(echo "$issue" | jq -r '.title')
+    child_count=$(echo "$issue" | jq -r '.zenhubChildIssues.totalCount // 0')
+
+    echo ""
+    echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
+    echo ""
+    echo -e "  ${CYAN}Children:${NC} ${child_count}"
+    echo ""
+
+    if [[ "$child_count" -eq 0 ]]; then
+        echo "  No sub-issues"
+        echo ""
+        return
+    fi
+
+    echo "$issue" | jq -r '.zenhubChildIssues.nodes[] |
+        "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
+        while IFS=$'\t' read -r num istate pipeline assignees ititle; do
+            local marker="  "
+            local color="$NC"
+            if [[ "$istate" == "CLOSED" ]]; then
+                marker="✓ "
+                color="$YELLOW"
+            fi
+            printf "  ${BOLD}#%-5s${NC} │ %-20s │ %-15s │ ${color}%s%s${NC}\n" \
+                "$num" "${pipeline:0:20}" "${assignees:0:15}" "$marker" "$ititle"
+        done
+
+    echo ""
+}
+
+cmd_subissue_reorder() {
+    local child_num="${1:-}"
+    local position="${2:-}"
+    local sibling_num="${3:-}"
+
+    if [[ -z "$child_num" ]] || [[ -z "$position" ]]; then
+        error "Usage: zh subissue reorder <child#> top
+       zh subissue reorder <child#> bottom
+       zh subissue reorder <child#> after <sibling#>
+       zh subissue reorder <child#> before <sibling#>
+
+Examples:
+  zh subissue reorder 100 top              # Move to top of sibling list
+  zh subissue reorder 100 bottom           # Move to bottom
+  zh subissue reorder 100 after 101        # Place after sibling #101
+  zh subissue reorder 100 before 102       # Place before sibling #102
+
+Note: ZenHub's reprioritizeSubIssue mutation uses sibling-anchored positioning
+(after/before another child), not integer positions. 'top' and 'bottom' are
+resolved to the first/last sibling on the client side."
+    fi
+
+    # Argument-only validation up-front, before any network round-trips:
+    # 'after' and 'before' require a third positional. Doing this check here
+    # rather than inside the case below saves a wasted API call.
+    case "$position" in
+        top|first|bottom|last)
+            ;;
+        after|before)
+            if [[ -z "$sibling_num" ]]; then
+                error "'${position}' requires a sibling issue number.
+Example: zh subissue reorder ${child_num} ${position} 101"
+            fi
+            ;;
+        *)
+            error "Invalid position: ${position}
+Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
+            ;;
+    esac
+
+    child_num="${child_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Resolve the child issue and find its parent. We need both: the API
+    # requires both parentId and childIssueId on every reprioritize call.
+    local lookup_query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+            parentIssue {
+                id
+                number
+                zenhubChildIssues(first: 100) {
+                    nodes {
+                        id
+                        number
+                    }
+                }
+            }
+        }
+    }'
+
+    local lookup_vars
+    lookup_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$child_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local lookup_response
+    lookup_response=$(zh_graphql "$lookup_query" "$lookup_vars")
+
+    local child_id child_title parent_id parent_num
+    child_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.id // empty')
+    child_title=$(echo "$lookup_response" | jq -r '.data.issueByInfo.title // ""')
+    parent_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.parentIssue.id // empty')
+    parent_num=$(echo "$lookup_response" | jq -r '.data.issueByInfo.parentIssue.number // empty')
+
+    if [[ -z "$child_id" ]]; then
+        error "Issue #${child_num} not found"
+    fi
+    if [[ -z "$parent_id" ]]; then
+        error "Issue #${child_num} has no parent — cannot reorder a non-sub-issue.
+Use 'zh subissue add <parent#> ${child_num}' first."
+    fi
+
+    # Resolve the position keyword to an afterId or beforeId. ZenHub treats
+    # `afterId: null` and `beforeId: null` specially:
+    #   - afterId only set → place right after that sibling
+    #   - beforeId only set → place right before that sibling
+    #   - both null         → place at the top (no anchor)
+    #   - top → beforeId = first sibling's id
+    #   - bottom → afterId = last sibling's id
+    local after_id="null"
+    local before_id="null"
+    local position_desc=""
+
+    case "$position" in
+        top|first)
+            local first_sib_id
+            first_sib_id=$(echo "$lookup_response" | \
+                jq -r --arg cid "$child_id" \
+                '[.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select(.id != $cid)][0].id // empty')
+            if [[ -z "$first_sib_id" ]]; then
+                # Already only-child or nothing to anchor against. Leave both
+                # null — the API treats that as "move to top".
+                position_desc="top (only child)"
+            else
+                before_id="\"${first_sib_id}\""
+                position_desc="top"
+            fi
+            ;;
+        bottom|last)
+            local last_sib_id
+            last_sib_id=$(echo "$lookup_response" | \
+                jq -r --arg cid "$child_id" \
+                '[.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select(.id != $cid)][-1].id // empty')
+            if [[ -z "$last_sib_id" ]]; then
+                position_desc="bottom (only child)"
+            else
+                after_id="\"${last_sib_id}\""
+                position_desc="bottom"
+            fi
+            ;;
+        after)
+            if [[ -z "$sibling_num" ]]; then
+                error "'after' requires a sibling issue number.
+Example: zh subissue reorder ${child_num} after 101"
+            fi
+            sibling_num="${sibling_num#\#}"
+            local sib_id
+            sib_id=$(echo "$lookup_response" | \
+                jq -r --arg n "$sibling_num" \
+                '.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id' | head -n 1)
+            if [[ -z "$sib_id" ]]; then
+                error "Sibling #${sibling_num} is not a child of parent #${parent_num}"
+            fi
+            after_id="\"${sib_id}\""
+            position_desc="after #${sibling_num}"
+            ;;
+        before)
+            if [[ -z "$sibling_num" ]]; then
+                error "'before' requires a sibling issue number.
+Example: zh subissue reorder ${child_num} before 102"
+            fi
+            sibling_num="${sibling_num#\#}"
+            local sib_id
+            sib_id=$(echo "$lookup_response" | \
+                jq -r --arg n "$sibling_num" \
+                '.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id' | head -n 1)
+            if [[ -z "$sib_id" ]]; then
+                error "Sibling #${sibling_num} is not a child of parent #${parent_num}"
+            fi
+            before_id="\"${sib_id}\""
+            position_desc="before #${sibling_num}"
+            ;;
+        *)
+            error "Invalid position: ${position}
+Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
+            ;;
+    esac
+
+    info "Reordering sub-issue #${child_num} to ${position_desc} under parent #${parent_num}..."
+
+    # Build the input. We have to construct the JSON manually because the
+    # after/before IDs may be null vs a string, which jq's --arg can't model.
+    local input_json
+    input_json=$(jq -n \
+        --arg parent_id "$parent_id" \
+        --arg child_id "$child_id" \
+        --argjson after_id "$after_id" \
+        --argjson before_id "$before_id" \
+        '{parentId: $parent_id, childIssueId: $child_id, afterId: $after_id, beforeId: $before_id}')
+
+    local mutation_vars
+    mutation_vars=$(jq -n --argjson input "$input_json" '{input: $input}')
+
+    local mutation='
+    mutation($input: ReprioritizeSubIssueInput!) {
+        reprioritizeSubIssue(input: $input) {
+            success
+            githubErrors
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local ok
+    ok=$(echo "$response" | jq -r '.data.reprioritizeSubIssue.success // false')
+
+    if [[ "$ok" != "true" ]]; then
+        local gh_errors
+        gh_errors=$(echo "$response" | jq -c '.data.reprioritizeSubIssue.githubErrors // null')
+        error "Failed to reorder sub-issue #${child_num} (githubErrors: ${gh_errors})"
+    fi
+
+    echo ""
+    success "Reordered sub-issue #${child_num}: ${child_title}"
+    echo -e "  Now at ${CYAN}${position_desc}${NC} under parent ${GREEN}#${parent_num}${NC}"
+}
+
+cmd_subissue() {
+    load_config
+
+    local sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+        add)
+            cmd_subissue_add "$@"
+            ;;
+        remove|rm)
+            cmd_subissue_remove "$@"
+            ;;
+        list|ls)
+            cmd_subissue_list "$@"
+            ;;
+        reorder|order|pos)
+            cmd_subissue_reorder "$@"
+            ;;
+        ""|help|-h|--help)
+            cat << 'EOF'
+zh subissue - Manage ZenHub sub-issues (Issue → Sub-issue hierarchy tier)
+
+USAGE:
+    zh subissue <subcommand> [args]
+
+SUBCOMMANDS:
+    add <parent#> <child#> [...]      Link one or more issues as sub-issues
+                                      of a parent (single API call)
+    remove <parent#> <child#> [...]   Unlink one or more sub-issues from a parent
+                                      (aliases: rm)
+    list <parent#>                    List sub-issues of a parent
+                                      (aliases: ls)
+    reorder <child#> <position>       Reorder a sub-issue among its siblings
+                                      Position: top | bottom |
+                                                after <sibling#> |
+                                                before <sibling#>
+                                      (aliases: order, pos)
+
+EXAMPLES:
+    zh subissue add 42 100 101 102          # Link three sub-issues under #42
+    zh subissue remove 42 100               # Unlink #100 from #42
+    zh subissue list 42                     # Show sub-issues of #42
+    zh subissue reorder 100 top             # Move #100 to top of siblings
+    zh subissue reorder 100 after 101       # Place #100 right after #101
+
+NOTES:
+    Sub-issues form a 3rd hierarchy tier below Epic → Issue → Sub-issue. A
+    sub-issue is a regular Issue whose parentIssue points to another Issue.
+    Use 'zh issue <N>' to see whether an issue has a parent or children.
+
+    Sub-issue reordering uses sibling-anchored positioning (after/before
+    another child), not integer positions like 'zh reorder'. This matches
+    ZenHub's reprioritizeSubIssue mutation semantics.
+EOF
+            ;;
+        *)
+            error "Unknown subissue subcommand: ${sub}
+
+Run 'zh subissue help' for usage information."
+            ;;
+    esac
+}
+
 cmd_epic() {
     load_config
 
@@ -3387,6 +3951,9 @@ main() {
             ;;
         epic|epics)
             cmd_epic "$@"
+            ;;
+        subissue|subissues|sub|child|children)
+            cmd_subissue "$@"
             ;;
         *)
             error "Unknown command: $command

@@ -136,6 +136,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
 | `epic <subcommand>` | `epics` | Manage ZenHub native epics (see [Epics](#epics)) |
+| `subissue <subcommand>` | `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -346,6 +347,59 @@ zh epic delete 12345
 | `reopen <epic#>` | Mark an epic OPEN |
 | `delete <epic#>` | Permanently delete an epic (no undo) |
 
+### Sub-issues
+
+ZenHub supports a 3rd hierarchy tier below Epic → Issue: **sub-issues**. A sub-issue is a regular Issue whose `parentIssue` field points to another Issue. Use this tier when an issue is too big for one ticket but doesn't justify being promoted to a full Epic (e.g., a "Refactor X" parent with one sub-issue per file group).
+
+`zh subissue` exposes the operations as subcommands. Sub-issue numbers are just regular issue numbers — there's nothing special about them in the API surface; only the parent/child relationship is.
+
+```bash
+# Link one or more issues as sub-issues of a parent (single API call)
+zh subissue add 42 100 101 102
+
+# List a parent's sub-issues (same format as 'zh epic show' children)
+zh subissue list 42
+
+# Unlink sub-issues — does NOT close them, just removes the parent relationship
+zh subissue remove 42 100
+
+# Reorder a sub-issue among its siblings. Note: sibling-anchored positions,
+# NOT integer positions like 'zh reorder' uses.
+zh subissue reorder 100 top
+zh subissue reorder 100 bottom
+zh subissue reorder 100 after 101
+zh subissue reorder 100 before 102
+```
+
+`zh issue <N>` opportunistically surfaces parent/child info when present:
+
+```
+$ zh issue 100
+
+#100 Refactor user-validation helpers
+
+  State:     OPEN
+  Pipeline:  In Progress
+  ...
+  Parent:    #42 Auth Service refactor pass
+  Sub-issues: 3 (see 'zh subissue list 100')
+  ZenHub:    https://app.zenhub.com/workspaces/.../issues/gh/acme/widget-service/100
+  GitHub:    https://github.com/acme/widget-service/issues/100
+```
+
+**Sub-issue subcommands:**
+
+| Subcommand | Description |
+|------------|-------------|
+| `add <parent#> <child#>...` | Link one or more issues as sub-issues of a parent (single API call) |
+| `remove <parent#> <child#>...` | Unlink one or more sub-issues from a parent. Aliases: `rm` |
+| `list <parent#>` | List a parent's sub-issues. Aliases: `ls` |
+| `reorder <child#> <position>` | Reorder a sub-issue among its siblings. Position: `top`, `bottom`, `after <sibling#>`, `before <sibling#>`. Aliases: `order`, `pos` |
+
+**Why sibling-anchored positions and not integers?** ZenHub's `reprioritizeSubIssue` mutation takes `afterId` / `beforeId` cursors (the IDs of sibling issues), not integer positions. The CLI mirrors that semantic directly so its behavior is predictable when called twice in a row — integer positions would silently compute against a moving list.
+
+**Sub-issues vs Epics:** epics are workspace-scoped and visible in the workspace's Epics view; sub-issues are issue-scoped and only visible from their parent. Choose epics for cross-team / multi-sprint groupings; choose sub-issues for tight "one parent ticket, a few worker tickets" relationships.
+
 ### Discovery Commands
 
 ```bash
@@ -484,14 +538,15 @@ A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. I
 
 ### What it exposes
 
-Roughly 20 tools covering the same surface as `zh`:
+Roughly 25 tools covering the same surface as `zh`:
 
 | Category | Tools |
 |---|---|
-| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `list_users`, `list_labels`, `list_types` |
+| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `list_users`, `list_labels`, `list_types` |
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
+| Sub-issue management | `subissue_add_children`, `subissue_remove_children`, `subissue_reorder` |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
