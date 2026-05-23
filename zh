@@ -5,7 +5,7 @@
 # A command-line interface for ZenHub API operations.
 # Wraps the ZenHub GraphQL API to manage issues, pipelines, and workspaces.
 #
-# Repository: https://github.com/daniel-pittman/zenhub-cli
+# Repository: https://github.com/acme-user/zenhub-cli
 # License: MIT
 #
 
@@ -237,11 +237,11 @@ USAGE:
 
 COMMANDS:
     issue <number>          View issue details
-                           Example: zh issue 679
+                           Example: zh issue 42
 
     mine [user]             List issues assigned to you (or specified user)
                            Example: zh mine
-                           Example: zh mine daniel-pittman
+                           Example: zh mine acme-user
 
     board [--all]           Show board overview (issue count per pipeline)
                            Excludes closed issues by default
@@ -255,16 +255,16 @@ COMMANDS:
                            Example: zh pipelines
 
     move <issue> <pipeline> Move an issue to a pipeline
-                           Example: zh move 679 "In Progress"
-                           Example: zh move #679 done
+                           Example: zh move 42 "In Progress"
+                           Example: zh move #42 done
 
     reorder <issue> <pos>   Reorder an issue within its pipeline
-                           Example: zh reorder 679 top
-                           Example: zh reorder 679 bottom
+                           Example: zh reorder 42 top
+                           Example: zh reorder 42 bottom
 
     estimate <issue> <pts>  Set story point estimate
-                           Example: zh estimate 679 3
-                           Example: zh estimate 679 clear
+                           Example: zh estimate 42 3
+                           Example: zh estimate 42 clear
 
     assign <issue> <user>   Assign a user to an issue
                            Example: zh assign 42 johndoe
@@ -310,9 +310,9 @@ COMMANDS:
                            (123 is no longer blocked by 456)
 
     priority <issue> [lvl]  Set or view issue priority
-                           Example: zh priority 679 high
-                           Example: zh priority 679 clear
-                           Example: zh priority 679  (view only)
+                           Example: zh priority 42 high
+                           Example: zh priority 42 clear
+                           Example: zh priority 42  (view only)
 
     types                   List available issue types
 
@@ -333,9 +333,9 @@ COMMANDS:
                              remove <epic#> <issue#> [...]     Remove issues from epic
                              close <epic#>                     Close epic
                              reopen <epic#>                    Reopen epic
-                           Example: zh epic create "Friends backend" -l backend,friends
-                           Example: zh epic update 17733 -t "Renamed" -d "New body"
-                           Example: zh epic add 17733 369 370
+                           Example: zh epic create "Friends backend" -l backend,auth
+                           Example: zh epic update 12345 -t "Renamed" -d "New body"
+                           Example: zh epic add 12345 369 370
 
     help                    Show this help message
 
@@ -361,25 +361,25 @@ ALIASES:
     workspaces: ws
 
 EXAMPLES:
-    zh issue 679                    # View issue details
+    zh issue 42                    # View issue details
     zh mine                         # See your assigned issues
-    zh mine daniel-pittman          # See issues assigned to user
+    zh mine acme-user          # See issues assigned to user
     zh users                        # List all assignable users
     zh board                        # Overview of all pipelines
     zh pipeline "TO DO"             # List issues in TO DO
-    zh move 679 "In Review"         # Move issue to pipeline
-    zh reorder 679 top              # Prioritize to top
-    zh estimate 679 5               # Set to 5 points
-    zh assign 679 daniel-pittman    # Assign to user
+    zh move 42 "In Review"         # Move issue to pipeline
+    zh reorder 42 top              # Prioritize to top
+    zh estimate 42 5               # Set to 5 points
+    zh assign 42 acme-user    # Assign to user
     zh create "Fix bug" -t Bug -e 2 # Create new bug with estimate
     zh types                        # List issue types
     zh labels                       # List available labels
     zh block 123 456                # 123 blocked by 456
-    zh priority 679 high            # Set high priority
+    zh priority 42 high            # Set high priority
     cat desc.md | zh create "Title" --stdin  # Body from stdin
     zh epic list                    # List all epics
-    zh epic show 17733              # Show epic + child issues
-    zh epic add 17733 369 370       # Add issues to epic
+    zh epic show 12345              # Show epic + child issues
+    zh epic add 12345 369 370       # Add issues to epic
 EOF
 }
 
@@ -483,7 +483,7 @@ cmd_move() {
 
     if [[ -z "$issue_num" ]] || [[ -z "$pipeline_name" ]]; then
         error "Usage: zh move <issue_number> <pipeline_name>
-Example: zh move 679 \"In Review\""
+Example: zh move 42 \"In Review\""
     fi
 
     # Strip # prefix if present
@@ -614,7 +614,7 @@ cmd_issue() {
 
     if [[ -z "$issue_num" ]]; then
         error "Usage: zh issue <issue_number>
-Example: zh issue 679"
+Example: zh issue 42"
     fi
 
     # Strip # prefix if present
@@ -1131,10 +1131,10 @@ cmd_reorder() {
        zh reorder <issue_number> bottom
 
 Examples:
-  zh reorder 679 0      # Move to top of pipeline
-  zh reorder 679 top    # Move to top
-  zh reorder 679 5      # Move to position 5
-  zh reorder 679 bottom # Move to bottom"
+  zh reorder 42 0      # Move to top of pipeline
+  zh reorder 42 top    # Move to top
+  zh reorder 42 5      # Move to position 5
+  zh reorder 42 bottom # Move to bottom"
     fi
 
     # Strip # prefix if present
@@ -1244,9 +1244,9 @@ cmd_estimate() {
 
     if [[ -z "$issue_num" ]] || [[ -z "$points" ]]; then
         error "Usage: zh estimate <issue_number> <points>
-Example: zh estimate 679 3
-         zh estimate 679 0.5
-         zh estimate 679 clear  # Remove estimate"
+Example: zh estimate 42 3
+         zh estimate 42 0.5
+         zh estimate 42 clear  # Remove estimate"
     fi
 
     # Strip # prefix if present
@@ -1339,8 +1339,8 @@ cmd_assign() {
 
     if [[ -z "$issue_num" ]] || [[ -z "$username" ]]; then
         error "Usage: zh assign <issue_number> <github_username>
-Example: zh assign 679 daniel-pittman
-         zh assign 679 @daniel-pittman"
+Example: zh assign 42 acme-user
+         zh assign 42 @acme-user"
     fi
 
     # Strip # prefix if present
@@ -1889,7 +1889,7 @@ Options:
 
 Examples:
   zh create \"Fix login bug\" -t Bug -l \"priority:high\"
-  zh create \"Add dark mode\" -t Feature -a daniel-pittman -e 5
+  zh create \"Add dark mode\" -t Feature -a acme-user -e 5
   zh create \"Research OAuth options\" -t Spike -p \"TO DO\""
     fi
 
@@ -2359,9 +2359,9 @@ cmd_priority() {
         error "Usage: zh priority <issue_number> [high|clear]
 
 Examples:
-  zh priority 679 high   # Set high priority
-  zh priority 679 clear  # Remove priority
-  zh priority 679        # Show current priority"
+  zh priority 42 high   # Set high priority
+  zh priority 42 clear  # Remove priority
+  zh priority 42        # Show current priority"
     fi
 
     # Strip # prefix if present
@@ -2506,7 +2506,7 @@ zh_epic_decode_id() {
     local gid="$1"
     local decoded
     decoded=$(printf '%s' "$gid" | base64 -d 2>/dev/null || true)
-    # decoded looks like: gid://raptor/ZenhubEpic/177339
+    # decoded looks like: gid://raptor/ZenhubEpic/123459
     echo "${decoded##*/}"
 }
 
@@ -2631,7 +2631,7 @@ cmd_epic_show() {
 
     if [[ -z "$epic_num" ]]; then
         error "Usage: zh epic show <epic#>
-Example: zh epic show 17733"
+Example: zh epic show 12345"
     fi
 
     epic_num="${epic_num#\#}"
@@ -2771,7 +2771,7 @@ cmd_epic_create() {
 
     if [[ -z "$title" ]]; then
         error "Usage: zh epic create \"<title>\" [-d <description>] [-l label1,label2]
-Example: zh epic create \"Friends Backend\" -d \"Build friends API\" -l backend,friends"
+Example: zh epic create \"Auth Service\" -d \"Build authentication API\" -l backend,auth"
     fi
 
     local owner_repo
@@ -2926,7 +2926,7 @@ cmd_epic_add() {
 
     if [[ -z "$epic_num" ]] || [[ $# -eq 0 ]]; then
         error "Usage: zh epic add <epic#> <issue#> [<issue#> ...]
-Example: zh epic add 17733 369 370"
+Example: zh epic add 12345 369 370"
     fi
 
     local issue_nums=("$@")
@@ -2982,7 +2982,7 @@ cmd_epic_remove() {
 
     if [[ -z "$epic_num" ]] || [[ $# -eq 0 ]]; then
         error "Usage: zh epic remove <epic#> <issue#> [<issue#> ...]
-Example: zh epic remove 17733 369"
+Example: zh epic remove 12345 369"
     fi
 
     local issue_nums=("$@")
@@ -3073,7 +3073,7 @@ cmd_epic_close() {
     local epic_num="${1:-}"
     if [[ -z "$epic_num" ]]; then
         error "Usage: zh epic close <epic#>
-Example: zh epic close 17733"
+Example: zh epic close 12345"
     fi
     cmd_epic_set_state "$epic_num" "CLOSED" "Closed"
 }
@@ -3082,7 +3082,7 @@ cmd_epic_reopen() {
     local epic_num="${1:-}"
     if [[ -z "$epic_num" ]]; then
         error "Usage: zh epic reopen <epic#>
-Example: zh epic reopen 17733"
+Example: zh epic reopen 12345"
     fi
     cmd_epic_set_state "$epic_num" "OPEN" "Reopened"
 }
@@ -3125,9 +3125,9 @@ cmd_epic_update() {
 
     if [[ -z "$epic_num" ]]; then
         error "Usage: zh epic update <epic#> [-t \"New Title\"] [-d \"New description\"]
-Example: zh epic update 17733 -t \"Renamed Epic\"
-Example: zh epic update 17733 -d \"Updated body text\"
-Example: zh epic update 17733 -t \"New Title\" -d \"New body\"
+Example: zh epic update 12345 -t \"Renamed Epic\"
+Example: zh epic update 12345 -d \"Updated body text\"
+Example: zh epic update 12345 -t \"New Title\" -d \"New body\"
 
 At least one of -t (title) or -d (description) must be provided."
     fi
@@ -3196,7 +3196,7 @@ cmd_epic_delete() {
     local epic_num="${1:-}"
     if [[ -z "$epic_num" ]]; then
         error "Usage: zh epic delete <epic#>
-Example: zh epic delete 17733
+Example: zh epic delete 12345
 
 DANGER: This permanently deletes the epic. Use 'zh epic close' instead if you
 just want to mark it done."
@@ -3283,13 +3283,13 @@ SUBCOMMANDS:
 
 EXAMPLES:
     zh epic list
-    zh epic show 17733
-    zh epic create "Friends Backend" -d "Build friends API" -l backend,friends
-    zh epic update 17733 -t "Renamed" -d "New body"
-    zh epic add 17733 369 370
-    zh epic remove 17733 369
-    zh epic close 17733
-    zh epic reopen 17733
+    zh epic show 12345
+    zh epic create "Auth Service" -d "Build authentication API" -l backend,auth
+    zh epic update 12345 -t "Renamed" -d "New body"
+    zh epic add 12345 369 370
+    zh epic remove 12345 369
+    zh epic close 12345
+    zh epic reopen 12345
 
 NOTES:
     Epic numbers are the trailing numeric portion of ZenHub's internal IDs

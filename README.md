@@ -154,7 +154,7 @@ zh issue 42
 zh mine
 
 # See issues assigned to a specific user
-zh mine daniel-pittman
+zh mine acme-user
 
 # Board overview (open issues only by default)
 zh board
@@ -309,27 +309,27 @@ The epic numbers shown by `zh epic list` are stable, ZenHub-assigned numeric IDs
 zh epic list
 
 # Show an epic and its child issues
-zh epic show 17733
+zh epic show 12345
 
 # Create a new epic (optionally with description + comma-separated labels)
-zh epic create "Friends Backend" -d "Build friends API endpoints" -l backend,friends
+zh epic create "Auth Service" -d "Build authentication API endpoints" -l backend,auth
 
 # Edit an existing epic's title and/or body (at least one of -t / -d required)
-zh epic update 17733 -t "Friends Backend (v2)"
-zh epic update 17733 -d "Updated body text"
-zh epic update 17733 -t "Renamed" -d "New body"
+zh epic update 12345 -t "Auth Service (v2)"
+zh epic update 12345 -d "Updated body text"
+zh epic update 12345 -t "Renamed" -d "New body"
 
 # Add or remove issues from an epic (one OR MORE issue numbers per call)
-zh epic add 17733 369 370 412
-zh epic remove 17733 369
+zh epic add 12345 369 370 412
+zh epic remove 12345 369
 
 # Toggle epic state
-zh epic close 17733
-zh epic reopen 17733
+zh epic close 12345
+zh epic reopen 12345
 
 # DANGER: permanently delete an epic (no undo). Prefer `close` unless cleanup
 # is intended.
-zh epic delete 17733
+zh epic delete 12345
 ```
 
 **Epic subcommands:**
@@ -371,11 +371,11 @@ By default, `zh mine` and `zh pipeline` show clickable ZenHub URLs for each issu
 ```bash
 $ zh mine
 
-Issues assigned to daniel-pittman (3):
+Issues assigned to acme-user (3):
 
-  #98 │ msu-denver/sustainability-hub │ Product Backlog
+  #98 │ acme/widget-service │ Product Backlog
     Fix login bug
-    → https://app.zenhub.com/workspaces/.../issues/gh/msu-denver/sustainability-hub/98
+    → https://app.zenhub.com/workspaces/.../issues/gh/acme/widget-service/98
 ```
 
 Use `--no-urls` for compact output:
@@ -498,7 +498,7 @@ Roughly 20 tools covering the same surface as `zh`:
 
 ### Similarity search (duplicate detection)
 
-The MCP server includes a sentence-embedding-backed similarity index that finds existing issues semantically similar to a query — catching paraphrased duplicates that keyword search misses (e.g. *"Theme: fix ColorScheme surface==primary collision"* and *"WarningDialog WCAG 1.31:1 dark mode"* score 0.6 cosine on the same underlying bug despite sharing zero keywords).
+The MCP server includes a sentence-embedding-backed similarity index that finds existing issues semantically similar to a query — catching paraphrased duplicates that keyword search misses (e.g. *"Auth token refresh race condition under load"* and *"Users randomly logged out around 5pm"* score 0.6 cosine on the same underlying bug despite sharing zero keywords).
 
 **Two tools + a `create_issue` pre-flight:**
 
@@ -565,6 +565,8 @@ For multi-project use, the typical pattern is to pass `repo_path` explicitly on 
 ### Optional: install the bundled `zenhub` agent for delegated use
 
 The MCP server exposes the tools; the bundled **agent** (`agents/zenhub.md` in this repo) is the *behavioral layer* that makes a Claude Code session use those tools intelligently — proactive duplicate detection before drafting, propose-first protocol for destructive ops, batch audit-trail discipline, project-conventions discovery, and the three-option blocked-response framing for `create_issue` near-duplicates.
+
+The bundled `agents/zenhub.md` is a deliberately-generic template — it ships with placeholder examples (`acme/widget-service`, epic `12345`, etc.) and no project-specific filing rules. After copying it to `~/.claude/agents/zenhub.md`, personalize your local copy with your project conventions, sprint patterns, and any non-generic context. **Anything you contribute back to this repo via PR should be genericized first** — local paths, real ticket titles, workspace IDs, and project names belong only in your personal `~/.claude/agents/` copy.
 
 The agent is a single Markdown file with frontmatter. To install:
 

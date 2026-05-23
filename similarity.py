@@ -3,9 +3,9 @@ ZenHub similarity search — finds existing issues that look semantically
 similar to a query string (or a proposed new title+body).
 
 Built to support the librarian-style "is this a duplicate?" check that
-catches paraphrased duplicates which keyword search misses (e.g. "Theme:
-fix ColorScheme surface==primary collision" vs "WarningDialog WCAG
-1.31:1 dark mode" — same underlying bug, no shared keywords).
+catches paraphrased duplicates which keyword search misses (e.g. "Auth
+token refresh race condition under load" vs "Users randomly logged
+out around 5pm" — same underlying bug, no shared keywords).
 
 Architecture:
   - Sentence embeddings via sentence-transformers (all-MiniLM-L6-v2,
