@@ -1711,3 +1711,82 @@ class TestMcpEarlyReturnShapes:
     def test_sprint_remove_issues_empty_name(self):
         r = mcp_server.sprint_remove_issues("", [42])
         _full_shape(r, SPRINT_REMOVE_KEYS)
+
+
+# =============================================================================
+# Bash dispatcher integration — round-5 #9
+# =============================================================================
+
+class TestBashDispatcher:
+    """Pin that `zh -w foo` (and similar `-r/-w` invocations with no
+    subcommand) don't trip `set -u` on bash 3.2's empty-array
+    expansion. Run zh as a subprocess so we exercise the actual
+    `set -- "${args[@]}"` line in main().
+
+    Round-5 #9: pre-fix, `zh -w foo` errored with
+    `args[@]: unbound variable` on bash 3.2 (Apple's stock
+    /bin/bash). CI runs Ubuntu's bash 5 which doesn't reproduce.
+    """
+
+    import os
+    import subprocess as _subprocess
+    from pathlib import Path as _Path
+    _REPO_ROOT = _Path(__file__).resolve().parent.parent
+    _ZH_SCRIPT = _REPO_ROOT / "zh"
+
+    def _run_zh(self, *args, env_extra=None):
+        """Run `bash zh ...` (force bash, don't trust shebang on the
+        test machine) and return CompletedProcess. Routes stderr +
+        stdout together so we can inspect output without parsing.
+
+        We force `bash` so the test works even on systems where
+        /usr/bin/env bash resolves to bash 4+; the round-5 #9 bug
+        only reproduces on bash 3.2 anyway, so this is the
+        compatibility-floor check.
+        """
+        import os
+        import subprocess
+        env = os.environ.copy()
+        if env_extra:
+            env.update(env_extra)
+        # Empty ZH_TOKEN avoids the config-load error path firing
+        # before main() even gets to dispatch — but the dispatcher
+        # parses global flags BEFORE invoking the subcommand body,
+        # so the bug shape is reachable regardless of token state.
+        return subprocess.run(
+            ["bash", str(self._ZH_SCRIPT), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=10,
+        )
+
+    def test_no_subcommand_falls_through_to_help(self):
+        """SPEC: `zh -w foo` with no subcommand falls through to the
+        help dispatcher. The exit may be 0 (help) or non-zero (error
+        for missing subcommand), but the output must NOT contain
+        `args[@]: unbound variable`.
+        """
+        result = self._run_zh("-w", "foo")
+        combined = (result.stdout or "") + (result.stderr or "")
+        assert "unbound variable" not in combined, (
+            f"bash 3.2 set -u tripped on empty args array: "
+            f"stdout={result.stdout!r}, stderr={result.stderr!r}"
+        )
+        # Either help output OR a clean "no command" error; not a
+        # crash. Both have "zh" somewhere in the output.
+        assert "zh" in combined.lower(), (
+            f"no recognizable zh output; combined={combined!r}"
+        )
+
+    def test_dash_r_no_subcommand_falls_through(self):
+        """Same SPEC for `-r owner/repo` alone."""
+        result = self._run_zh("-r", "acme/widgets")
+        combined = (result.stdout or "") + (result.stderr or "")
+        assert "unbound variable" not in combined
+
+    def test_dash_w_dash_r_no_subcommand_falls_through(self):
+        """Same SPEC when both flags are present and no subcommand."""
+        result = self._run_zh("-r", "acme/widgets", "-w", "Backend")
+        combined = (result.stdout or "") + (result.stderr or "")
+        assert "unbound variable" not in combined

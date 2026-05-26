@@ -4922,9 +4922,14 @@ zh_subissue_fetch_all() {
             first_page=false
         fi
 
-        # Append this page's nodes to all_nodes.
+        # Append this page's nodes to all_nodes. `select(. != null)`
+        # strips null page entries — same defensive normalization the
+        # other walkers (zh_workspaces_fetch_all, zh_sprints_fetch_all,
+        # zh_sprint_issues_fetch_all) apply, and the Python
+        # list_sub_issues walker enforces. Round-5 #8 closes the
+        # last walker that missed this filter.
         local page_nodes
-        page_nodes=$(echo "$issue_json" | jq -c '.zenhubChildIssues.nodes // []')
+        page_nodes=$(echo "$issue_json" | jq -c '[(.zenhubChildIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
@@ -5620,7 +5625,13 @@ main() {
     done
     # Export so subshells / piped invocations also see them
     export ZH_REPO_OVERRIDE ZH_WORKSPACE_NAME
-    set -- "${args[@]}"
+    # Conditional expansion for bash 3.2 portability — `set --
+    # "${args[@]}"` on an empty array under `set -u` (which we
+    # set at the top of the script) errors with "args[@]: unbound
+    # variable" on bash 3.2. The fix lets `zh -w foo` with no
+    # subcommand fall through cleanly to the help dispatcher.
+    # Round-5 #9.
+    set -- ${args[@]+"${args[@]}"}
 
     local command="${1:-help}"
     shift || true

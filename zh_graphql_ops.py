@@ -1344,6 +1344,22 @@ def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
     Pagination: walks every page of `sprintIssues` so sprints with >100
     issues are reported fully (review finding #4).
 
+    Raises:
+        ZhApiError — propagated from the underlying walkers when:
+          * `data.workspace = null` during sprint-name resolution
+            (deleted / ACL-revoked workspace); `_find_sprint_id` calls
+            `list_sprints` which raises in that case.
+          * `data.node = null` during the issues-page walk (sprint
+            deleted between phases / ACL change mid-walk);
+            `_walk_sprint_issues` raises in that case.
+
+        Round-5 #4: this is the canonical SPEC for direct callers
+        (tests, internal helpers). The MCP wrapper `sprint_show` in
+        mcp_server.py catches ZhApiError and converts to a structured
+        result dict so MCP callers see a uniform shape. The same SPEC
+        applies to `add_issues_to_sprint` / `remove_issues_from_sprint`
+        via `_find_sprint_id → list_sprints`.
+
     Returns:
         dict with:
             ok: bool
