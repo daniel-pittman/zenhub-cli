@@ -1005,6 +1005,91 @@ class TestRemoveIssuesFromSprint:
         assert out["pagination_warning"] is not None
         assert out["inspected_full"] is False
 
+    def test_partial_walk_forces_outcome_not_ok(self):
+        """Round-4 #2 SPEC pin: when the walker only saw part of the
+        sprint, inputs the walker never reached cannot be classified
+        as `succeeded`. Outcome is downgraded to `partial`/`fail`,
+        `ok=False`, regardless of what the partial walk happened to
+        show. Tested across two scenarios so future regression cannot
+        accidentally re-introduce silent success.
+        """
+        # Scenario A: the partial walk happens to confirm one removal,
+        # but didn't reach the other input. Pre-fix logic would have
+        # marked both as `succeeded` (input minus partial-set =
+        # everything not seen), so we'd see ok=True. SPEC: ok=False,
+        # outcome=partial.
+        ctx = make_ctx()
+        with patch_ctx_query(ctx, [
+            sprints_page([sprint_node("sprint-7", "Sprint 7")]),
+            issue_by_info_response(100),
+            issue_by_info_response(101),
+            remove_issues_from_sprints_response(empty_sprints=True),
+            # Walker page returns a sibling-repo issue (filtered out
+            # by repos_match), then stuck cursor. So
+            # still_attached_numbers is empty, but coverage is partial.
+            sprint_issues_page(
+                [sprint_issue_wrapper(999, owner="acme", repo="gadgets")],
+                has_next=True, end_cursor=None,
+            ),
+        ]):
+            out = zh_graphql_ops.remove_issues_from_sprint(
+                ctx, "Sprint 7", [100, 101],
+            )
+        assert out["inspected_full"] is False
+        assert out["ok"] is False, (
+            "SPEC: partial coverage must NOT report ok=True even "
+            "when still_attached is empty. Verified inputs in "
+            "`succeeded`; un-verified ones are coverage-incomplete."
+        )
+        assert out["outcome"] in {"partial", "fail"}
+        assert "coverage incomplete" in (out["response_anomaly"] or "").lower()
+
+        # Scenario B: walker confirms an input is still attached.
+        # Pre-fix logic would emit ok=False/outcome=partial anyway,
+        # but make sure that's preserved AND coverage-incomplete still
+        # surfaces.
+        ctx2 = make_ctx()
+        with patch_ctx_query(ctx2, [
+            sprints_page([sprint_node("sprint-7", "Sprint 7")]),
+            issue_by_info_response(100),
+            issue_by_info_response(101),
+            remove_issues_from_sprints_response(empty_sprints=True),
+            # Walker sees #100 still attached, then bails on stuck
+            # cursor. #101 is un-verified.
+            sprint_issues_page(
+                [sprint_issue_wrapper(100)],
+                has_next=True, end_cursor=None,
+            ),
+        ]):
+            out2 = zh_graphql_ops.remove_issues_from_sprint(
+                ctx2, "Sprint 7", [100, 101],
+            )
+        assert out2["inspected_full"] is False
+        assert out2["ok"] is False
+        assert out2["outcome"] in {"partial", "fail"}
+        assert "coverage incomplete" in (out2["response_anomaly"] or "").lower()
+
+    def test_partial_walk_response_anomaly_includes_reverify_pointer(self):
+        """SPEC: the coverage-incomplete branch's response_anomaly
+        must point the caller at a re-verification command, otherwise
+        the caller has no actionable next step beyond the warning.
+        Pin against an LLM caller hand-rolling a `zh sprint show ...`
+        because the field doesn't say so."""
+        ctx = make_ctx()
+        with patch_ctx_query(ctx, [
+            sprints_page([sprint_node("sprint-7", "Sprint 7")]),
+            issue_by_info_response(100),
+            remove_issues_from_sprints_response(empty_sprints=True),
+            sprint_issues_page(
+                [sprint_issue_wrapper(100)],
+                has_next=True, end_cursor=None,
+            ),
+        ]):
+            out = zh_graphql_ops.remove_issues_from_sprint(
+                ctx, "Sprint 7", [100],
+            )
+        assert "zh sprint show" in (out["response_anomaly"] or "")
+
 
 # =============================================================================
 # zh_api foundation: _GH_URL_RE

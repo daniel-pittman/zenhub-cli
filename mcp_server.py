@@ -1779,7 +1779,17 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
       - `pagination_warning`: str | None — surfaced when the follow-
         up walk bailed defensively (stuck cursor / iteration cap).
       - `response_anomaly`: str | None — surfaced when the mutation
-        response omitted or returned an empty `sprints` array.
+        response omitted or returned an empty `sprints` array, OR
+        when the post-state walk only covered part of the sprint
+        (in which case `response_anomaly` is extended with a
+        coverage note pointing at a re-verification command).
+
+    Coverage semantics: when `inspected_full=False` the outcome is
+    DOWNGRADED to `partial` (or `fail` when zero positives confirmed)
+    regardless of what the partial walk happened to show, because
+    inputs the walker never reached cannot be classified as
+    `succeeded`. `succeeded` still lists what the partial walk did
+    confirm absent from the post-state.
     """
     if not issue_numbers:
         return {

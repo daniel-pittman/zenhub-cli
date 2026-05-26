@@ -1606,10 +1606,32 @@ def remove_issues_from_sprint(
                 follow-up walk if the walker bailed defensively
                 (stuck cursor or iteration cap).
             response_anomaly: str | None — set if the mutation
-                response omitted the target sprint or returned an
-                empty `sprints` array; we recovered via a follow-up
-                walk and surface the anomaly so callers can log /
-                investigate.
+                response omitted the target sprint, returned an empty
+                `sprints` array, OR the post-state walk could only
+                reach part of the sprint (see below). Always paired
+                with enough text to act on.
+
+    Coverage semantics
+    ------------------
+
+    When `inspected_full` is False (walker bailed mid-walk on stuck
+    cursor / iteration cap), `still_attached_numbers` is by
+    construction a strict subset of what's actually attached. Inputs
+    the walker never reached would naively land in `succeeded` even
+    though their removal was never confirmed. This function
+    deliberately DOWNGRADES the outcome in that case:
+
+      - `outcome = "partial"` when at least one input was confirmed
+        removed by the partial walk.
+      - `outcome = "fail"` when none were confirmed.
+      - `ok = (outcome == "ok")` — so partial coverage always reports
+        `ok=False`.
+
+    `succeeded` still lists the input numbers that the partial walk
+    DID confirm absent from the post-state, so callers have
+    actionable per-issue information. `response_anomaly` is
+    extended with a coverage note pointing the caller at a
+    re-verification command (`zh sprint show '<name>'`).
     """
     if not issue_numbers:
         raise ZhApiError("issue_numbers must be non-empty")
@@ -1814,7 +1836,41 @@ def remove_issues_from_sprint(
 
     succeeded = [n for n in issue_numbers if n not in still_attached_numbers]
     failed = [n for n in issue_numbers if n in still_attached_numbers]
-    outcome = _classify_outcome(len(succeeded), len(failed))
+
+    # Coverage gate: when `inspected_full` is False (walker bailed on
+    # stuck cursor / iteration cap mid-walk), the partial walk's
+    # `still_attached_numbers` is — by construction — a strict subset
+    # of what's actually attached. Inputs that the walker didn't reach
+    # would currently land in `succeeded` even though we never
+    # confirmed their removal. That's the load-bearing bug from
+    # round-4 finding #2.
+    #
+    # Decision: downgrade `outcome` to "partial" (or "fail" when zero
+    # positives) and set `ok=False`, regardless of what the partial
+    # observations happened to show. Keep `succeeded` populated with
+    # what we DID confirm so the caller has actionable per-issue
+    # information; surface `response_anomaly` describing the coverage
+    # gap so callers know to re-verify before retrying. See the
+    # result-dict docstring above for the full contract.
+    if not inspected_full:
+        # Build (or extend) the anomaly note so callers can act on it
+        # without separately inspecting `pagination_warning`.
+        coverage_note = (
+            f"Post-state coverage incomplete (inspected_full=False, "
+            f"walker bailed: {pagination_warning or 'unknown reason'}); "
+            f"verified {len(succeeded)} of {len(issue_numbers)} input(s) "
+            f"as removed, the remainder may or may not have landed. "
+            f"Re-verify with `zh sprint show '{actual_sprint_name or sprint_name}'`."
+        )
+        if response_anomaly:
+            response_anomaly = f"{response_anomaly} {coverage_note}"
+        else:
+            response_anomaly = coverage_note
+        # outcome: "partial" when we confirmed at least one removal,
+        # "fail" when we confirmed none.
+        outcome = "partial" if succeeded else "fail"
+    else:
+        outcome = _classify_outcome(len(succeeded), len(failed))
 
     return {
         "ok": outcome == "ok",

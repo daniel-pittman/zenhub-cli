@@ -2887,7 +2887,25 @@ cmd_sprints() {
 #
 #   { nodes: [ { issue: {...} }, ... ] }
 zh_sprint_issues_fetch_all() {
+    # Arguments:
+    #   $1 — sprint_id
+    #   $2 — soft_null flag (optional). Default "" calls `error` on a
+    #        null-node response, which exits the process with a clear
+    #        message. Passing "1" makes the walker SOFT-FAIL on null
+    #        node: it stops walking and returns an empty-nodes JSON
+    #        document with `null_node: true` so callers downstream of
+    #        a mutation can present a "mutation may have landed; post-
+    #        state could not be confirmed" message instead of
+    #        crashing mid-recovery. (Round-4 finding #1.)
     local sprint_id="$1"
+    local soft_null="${2:-}"
+
+    # Pagination-warning sentinel, similar to soft-null. Empty by
+    # default; set when the walk bails on stuck cursor / iteration
+    # cap so callers can downgrade their success messaging the same
+    # way the Python `inspected_full=False` branch does.
+    # (Round-4 finding #3.)
+    local pagination_bailed=""
 
     local query='
     query($sprintId: ID!, $after: String) {
@@ -2916,11 +2934,13 @@ zh_sprint_issues_fetch_all() {
     local last_cursor=""
     local iterations=0
     local all_nodes="[]"
+    local null_node="false"
 
     while :; do
         iterations=$((iterations + 1))
         if [[ "$iterations" -gt 200 ]]; then
             warn "Sprint-issues pagination iteration cap (200) reached"
+            pagination_bailed="iteration_cap"
             break
         fi
 
@@ -2936,9 +2956,18 @@ zh_sprint_issues_fetch_all() {
         # ACL-revoked, or otherwise inaccessible. Pre-fix the walker
         # silently emitted an empty result, which downstream callers
         # treated as "real empty sprint" — masking the failure.
+        #
+        # When called from cmd_sprint_remove (mutation has already
+        # fired), we soft-fail: emit a sentinel JSON the caller uses
+        # to print a "post-state could not be confirmed" message
+        # rather than crashing the whole process. (Round-4 #1.)
         local node_kind
         node_kind=$(echo "$response" | jq -r '.data.node | type')
         if [[ "$node_kind" == "null" ]]; then
+            if [[ "$soft_null" == "1" ]]; then
+                null_node="true"
+                break
+            fi
             error "Sprint '${sprint_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
         fi
 
@@ -2955,13 +2984,23 @@ zh_sprint_issues_fetch_all() {
         fi
         if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
             warn "Sprint-issues pagination cursor not advancing — bailing"
+            pagination_bailed="stuck_cursor"
             break
         fi
         last_cursor="$end_cursor"
         cursor=$(jq -n --arg c "$end_cursor" '$c')
     done
 
-    jq -n --argjson nodes "$all_nodes" '{nodes: $nodes}'
+    # Output: a JSON object the caller can downcast into nodes + a
+    # `pagination_bailed` reason and `null_node` flag. The default
+    # caller (`cmd_sprint`, read-only) ignores the extra fields. The
+    # mutation caller (`cmd_sprint_remove`) inspects them to decide
+    # whether to claim a confirmed success.
+    jq -n \
+        --argjson nodes "$all_nodes" \
+        --arg pagination_bailed "$pagination_bailed" \
+        --argjson null_node "$null_node" \
+        '{nodes: $nodes, pagination_bailed: $pagination_bailed, null_node: $null_node}'
 }
 
 cmd_sprint() {
@@ -3442,8 +3481,35 @@ Examples:
     # numbers in a multi-repo workspace and we must not mis-classify
     # our removal as failed because some other repo's same-numbered
     # issue is still in the sprint.
+    #
+    # We pass soft_null=1 because the mutation has already fired by
+    # this point. If the post-state walk hits a null node (sprint
+    # deleted / ACL-revoked between mutation and walk — rare but
+    # possible), we want a structured "could not confirm" message
+    # rather than `error`-exiting and leaving the user with no
+    # indication the mutation may have already taken effect.
+    # (Round-4 #1.)
     local post_state
-    post_state=$(zh_sprint_issues_fetch_all "$sprint_id")
+    post_state=$(zh_sprint_issues_fetch_all "$sprint_id" "1")
+
+    # Pull out the soft-fail sentinels the walker may have set.
+    local null_node pagination_bailed
+    null_node=$(echo "$post_state" | jq -r '.null_node // false')
+    pagination_bailed=$(echo "$post_state" | jq -r '.pagination_bailed // ""')
+
+    if [[ "$null_node" == "true" ]]; then
+        # Mutation already fired; post-state can't be confirmed. Tell
+        # the user clearly and exit with a distinct non-zero code so
+        # scripted callers notice. Recovery: a separate
+        # `zh sprint show '<name>'` call (which will itself error on
+        # the null sprint, but at least the user knows what happened).
+        echo ""
+        warn "Mutation landed (removeIssuesFromSprints succeeded), but post-state could not be confirmed:"
+        warn "  Sprint '${sprint_actual_name}' resolved to null in the post-state walk"
+        warn "  (sprint was deleted / ACL-revoked / otherwise inaccessible between mutation and walk)"
+        warn "Re-verify with 'zh sprints --all' to see the current state."
+        exit 2
+    fi
 
     local owner_lc repo_lc
     owner_lc="${owner_repo%%/*}"
@@ -3482,12 +3548,30 @@ Examples:
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
+        if [[ -n "$pagination_bailed" ]]; then
+            # Coverage-incomplete: the walk bailed mid-flight, so any
+            # input not in the still-attached set was either removed
+            # OR un-verified. Downgrade the message so the user
+            # doesn't read a clean "Removed" as a confirmed outcome.
+            # Mirrors the Python `inspected_full=False` SPEC.
+            # (Round-4 #3.)
+            warn "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}' (post-state coverage incomplete — re-verify): ${succeeded//,/, }"
+            warn "  Walker bailed: ${pagination_bailed}. Some inputs may not have been confirmed."
+            warn "  Re-verify with 'zh sprint show \"${sprint_actual_name}\"'."
+        else
+            success "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
+        fi
     fi
     if [[ "$failed_count" -gt 0 ]]; then
         warn "${failed_count} still in sprint (API rejected the removal): ${failed//,/, }"
     fi
 
+    # Exit non-zero on any partial/fail/coverage-incomplete state so
+    # scripted callers see the problem. exit 2 for coverage-
+    # incomplete to differentiate from "real failure" (exit 1).
+    if [[ -n "$pagination_bailed" ]]; then
+        exit 2
+    fi
     if [[ "$failed_count" -gt 0 ]] || [[ "$success_count" -eq 0 ]]; then
         exit 1
     fi
