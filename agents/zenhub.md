@@ -48,6 +48,8 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh labels` — list available labels
 - `zh epic list` — list all epics in workspace
 - `zh epic show <epic#>` — show epic detail + child issues
+- `zh subissue list <parent#>` — list sub-issues (children) of a parent issue
+- `zh issue <N>` — also shows `Parent: #<N>` and `Sub-issues: <count>` when present, giving cheap 3-tier hierarchy visibility
 
 ### Write operations (issue lifecycle)
 - `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>` — create issue
@@ -73,6 +75,13 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh epic close <epic#>` / `zh epic reopen <epic#>` — toggle state
 - `zh epic delete <epic#>` — permanently delete (DANGER — propose-first ALWAYS)
 
+### Write operations (sub-issues — 3rd hierarchy tier)
+Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue is a regular Issue whose `parentIssue` points to another Issue. Use this when an issue is too large for a single ticket but doesn't justify its own epic.
+- `zh subissue add <parent#> <child#> [<child#> ...]` — link one or more issues as sub-issues of a parent (single API call)
+- `zh subissue remove <parent#> <child#> [...]` — unlink sub-issues from a parent (aliases: `rm`)
+- `zh subissue list <parent#>` — list a parent's sub-issues with the same format `zh epic show` uses (aliases: `ls`)
+- `zh subissue reorder <child#> <top|bottom|after <sib#>|before <sib#>>` — reorder a sub-issue among its siblings. **Different positioning model from `zh reorder`**: ZenHub's `reprioritizeSubIssue` mutation uses sibling-anchored positioning, not integer positions. (aliases: `order`, `pos`)
+
 ### Aliases worth knowing
 - `zh issue` → `i`, `show`
 - `zh mine` → `my`
@@ -82,6 +91,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh reorder` → `order`, `pos`
 - `zh estimate` → `est`, `points`
 - `zh epic list` → `zh epic ls`; `show` → `view`; `create` → `new`; `remove` → `rm`; `reopen` → `open`; `update` → `edit`, `modify`
+- `zh subissue` → `subissues`, `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 
@@ -215,9 +225,11 @@ zh pipeline "Sprint Backlog"      # what's queued for the team
 zh pipeline "In Progress"         # what's actively being worked
 zh mine                           # what's assigned to current user
 zh epic list                      # all epics + state
+zh issue <N>                      # also surfaces parent/child issue counts
+zh subissue list <parent#>        # drill into a parent's sub-issues
 ```
 
-Report the digest, not the raw output. Surface: total open, pipeline distribution, anything that looks stuck (assigned & old without movement, blocked items, anything in In Progress with no recent commits).
+Report the digest, not the raw output. Surface: total open, pipeline distribution, anything that looks stuck (assigned & old without movement, blocked items, anything in In Progress with no recent commits). For 3-tier-using projects, also surface: epics with parent-issues that have unstarted sub-issues, and any orphan sub-issues whose parent has been closed.
 
 ### Sprint planning
 
@@ -230,6 +242,7 @@ When asked to propose a next sprint:
    - Assignee (already taken or open)
    - Dependencies (`zh issue N` shows blockers)
    - Epic membership (sprint coherence)
+   - Parent / sub-issue relationships (`zh issue N` shows them). For a parent with sub-issues, decide whether to pull just the parent (the team will fan out), pull all sub-issues, or split across sprints. For an orphan sub-issue, surface its parent's status so the team can decide whether to defer until the parent is groomed.
 4. Propose: which tickets to pull into the sprint, in what order, with rationale (size, dependency, who owns)
 5. Surface anything in Sprint Backlog that's been there too long without progress (stale = >2 sprints)
 6. If the project uses ZH sprints (with dates), propose sprint duration + start/end and which tickets to assign
@@ -260,6 +273,18 @@ For routine operations:
 - **Restructure** (move children between epics): propose-first. Restructuring epic boundaries affects how the team views grouped work.
 - **Close**: propose-first. Closing an epic doesn't close its children, but it does change board visibility.
 - **Delete**: NEVER without explicit confirmation. The `zh epic delete` operation is irreversible.
+
+### Sub-issue management (3rd tier)
+
+Sub-issues sit below regular issues (Epic → Issue → Sub-issue). Use this tier when a single Issue is too big for one ticket but doesn't justify being promoted to an Epic. Common patterns: a "Refactor X" parent with one sub-issue per file group; a "Wire up new dashboard widget" parent with sub-issues for backend, API, frontend, and tests.
+
+- **Add children**: `zh subissue add <parent#> <child#> [<child#> ...]` — batch in single call. Single-ticket adds can fire directly; bulk adds (>3) propose-first because they restructure the hierarchy.
+- **List**: `zh subissue list <parent#>` — see the children.
+- **Remove** (unlink): `zh subissue remove <parent#> <child#> [...]`. The child still exists as a standalone issue — this just unlinks the parent relationship. Propose-first if removing more than one at a time.
+- **Reorder**: `zh subissue reorder <child#> <top|bottom|after <sib#>|before <sib#>>`. **Different from `zh reorder`** — ZenHub's `reprioritizeSubIssue` API takes sibling-anchored positions, not integers. Free to fire directly for single reorders.
+- **Inspect**: `zh issue <N>` opportunistically shows parent + sub-issue count. Use it as the first stop for "where does this issue sit in the hierarchy?"
+
+When recommending sub-issue use over epics: epics are workspace-scoped and visible in the workspace epic list; sub-issues are issue-scoped and only visible from their parent. Choose epics for cross-team / multi-sprint groupings, sub-issues for tight "one parent ticket, several worker tickets" relationships.
 
 ### Batch operations (wave pattern)
 
@@ -330,8 +355,8 @@ When the orchestrator delegates a `zh` enhancement (or when the agent surfaces a
 
 ### Current known extension candidates
 
-- **Sub-issue support.** ZenHub's GraphQL exposes `parentIssue: Issue`, `zenhubChildIssues: IssueConnection`, `githubParentIssue`, and `githubChildIssues` on the Issue type, plus mutations `addSubIssues` / `removeSubIssues` / `reprioritizeSubIssue` and inputs `AddSubIssuesInput` / `RemoveSubIssuesInput` / `ReprioritizeSubIssueInput`. `zh` currently does NOT wrap any of these — this is the obvious next extension when a third hierarchy tier (Epic → parent-issue → sub-issue) is needed.
 - **Sprint commands.** If a project uses ZH sprints with dates and `zh sprint *` commands aren't yet present, the GraphQL has `addIssuesToSprint`, etc. — pattern is the same.
+- **GitHub-native sub-issues.** `zh subissue` covers ZenHub-native sub-issues (the `zenhubChildIssues` / `parentIssue` side). ZenHub also exposes `githubChildIssues` / `githubParentIssue` for GitHub's parallel sub-issue concept — wrapping those would be a separate command family if a project needs that side too.
 
 The agent should NOT spontaneously add features. Only when the orchestrator delegates a specific need. But the agent CAN flag in its responses when a `zh` extension would unblock the current task and propose adding it.
 

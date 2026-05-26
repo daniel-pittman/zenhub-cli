@@ -49,6 +49,13 @@ zh epic close <epic#>              # Close epic
 zh epic reopen <epic#>             # Reopen epic
 zh epic delete <epic#>             # DANGER: permanently delete an epic
 
+# Sub-issues (3rd hierarchy tier: Epic -> Issue -> Sub-issue)
+zh subissue add <parent#> <child#> [...]      # Link issues as sub-issues
+zh subissue remove <parent#> <child#> [...]   # Unlink sub-issues
+zh subissue list <parent#>                    # List sub-issues of a parent
+zh subissue reorder <child#> top|bottom|after <sib#>|before <sib#>
+                                              # Reorder among siblings (sibling-anchored, not integer positions)
+
 # Discovery
 zh types                # List issue types
 zh labels               # List labels
