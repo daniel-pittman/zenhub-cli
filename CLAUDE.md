@@ -56,6 +56,13 @@ zh subissue list <parent#>                    # List sub-issues of a parent
 zh subissue reorder <child#> top|bottom|after <sib#>|before <sib#>
                                               # Reorder among siblings (sibling-anchored, not integer positions)
 
+# Sprints (read-only)
+zh sprints [--all]                            # List sprints (● marks active; --all includes closed)
+zh sprint <name>                              # Sprint detail + issues
+zh sprint current                             # Active sprint
+zh sprint                                     # Defaults to current
+zh sprint <name> --no-urls                    # Compact output
+
 # Discovery
 zh types                # List issue types
 zh labels               # List labels

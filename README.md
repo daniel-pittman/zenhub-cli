@@ -139,6 +139,8 @@ ZH_REST_TOKEN=your_rest_token_here
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
 | `epic <subcommand>` | `epics` | Manage ZenHub native epics (see [Epics](#epics)) |
 | `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
+| `sprints [--all]` | `sp` | List sprints in workspace (see [Sprints](#sprints)) |
+| `sprint <name>` | | View sprint details and issues |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -404,6 +406,54 @@ $ zh issue 100
 
 > **Multi-repo workspaces:** `zh subissue` commands resolve issue numbers via the *current git checkout's* GitHub repo. In a ZenHub workspace that spans multiple GitHub repos, a parent in repo A with sub-issues in repo B can't be managed from a single working directory — each `zh subissue` invocation has to be run from a checkout of the repo whose issue numbers are being passed. The 3-tier framing (Epic → Issue → Sub-issue) often invites cross-repo grouping; plan parent/child placement with that limitation in mind, or do the cross-repo plumbing via the ZenHub web UI. Epic operations have the same scope limitation; sub-issues just feel it more often because the hierarchy is tighter.
 
+### Sprints
+
+ZenHub workspaces can have sprints with start/end dates, member assignments, and progress tracking (completed vs total points, closed issue count). `zh` exposes a read-only window into them — useful for "what's in the active sprint?" check-ins, retrospectives, and feeding sprint planning conversations.
+
+```bash
+# List open sprints (● marks the active sprint)
+zh sprints
+
+# Include closed sprints
+zh sprints --all
+
+# View active sprint details and issues
+zh sprint current
+zh sprint            # (also defaults to current)
+zh sprint active     # alias for current
+
+# View a specific sprint by name (case-insensitive)
+zh sprint "Sprint 5"
+
+# Compact output (no per-issue URLs)
+zh sprint current --no-urls
+```
+
+Sample output:
+
+```
+Sprint: Sprint 7
+
+  State:     OPEN
+  Period:    2026-05-12 → 2026-05-26
+  Points:    8/13 completed
+  Closed:    3 issues
+
+Issues (5):
+
+  #100 │ acme/widgets │ 3 pts │ alice │ In Progress
+    Add token rotation
+    → https://github.com/acme/widgets/issues/100
+
+  #101 │ acme/widgets │ 5 pts │ bob │ In Review
+    ✓ Wire up refresh-token endpoint
+    → https://github.com/acme/widgets/issues/101
+```
+
+Sprint membership mutations (adding / removing issues from sprints) are not yet exposed by `zh`; track via the ZenHub web UI or request them as a feature.
+
+> Sprint functionality is inspired by the design proposed in [#2](https://github.com/daniel-pittman/zenhub-cli/pull/2) by [@jeremiahrose](https://github.com/jeremiahrose); v1.6.0 ships the read-only surface against the current GraphQL patterns. Credit and `Co-Authored-By` trailers preserved in the commit history.
+
 ### Discovery Commands
 
 ```bash
@@ -538,15 +588,15 @@ The issue must exist in a repository that's part of your ZenHub workspace.
 
 ## MCP Server (for Claude Code / AI agents)
 
-A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. Most tools wrap `zh` over stdio for the human-facing read/write surface, while the sub-issue family calls ZenHub's GraphQL API directly from Python (since v1.6.0) — sourcing structured data straight from the API rather than parsing terminal output. Any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
+A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. Most tools wrap `zh` over stdio for the human-facing read/write surface, while the sub-issue and sprint families call ZenHub's GraphQL API directly from Python (since v1.6.0) — sourcing structured data straight from the API rather than parsing terminal output. Any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
 
 ### What it exposes
 
-Roughly 30 tools covering the same surface as `zh`:
+Roughly 35 tools covering the same surface as `zh`:
 
 | Category | Tools |
 |---|---|
-| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `list_users`, `list_labels`, `list_types` |
+| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `sprint_list`, `sprint_show`, `sprint_current`, `list_users`, `list_labels`, `list_types` |
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
@@ -555,7 +605,7 @@ Roughly 30 tools covering the same surface as `zh`:
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
 
-> **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) talks to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
+> **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) and the sprint family (`sprint_list`, `sprint_show`, `sprint_current`) talk to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
 
 ### Similarity search (duplicate detection)
 

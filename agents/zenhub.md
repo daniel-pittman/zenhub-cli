@@ -50,6 +50,8 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh epic show <epic#>` — show epic detail + child issues
 - `zh subissue list <parent#>` — list sub-issues (children) of a parent issue
 - `zh issue <N>` — also shows `Parent: #<N>` and `Sub-issues: <count>` when present, giving cheap 3-tier hierarchy visibility
+- `zh sprints [--all]` — list sprints in the workspace (● marks the active sprint). `--all` includes closed sprints.
+- `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
 
 ### Write operations (issue lifecycle)
 - `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>` — create issue

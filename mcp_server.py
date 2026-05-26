@@ -1407,6 +1407,158 @@ def subissue_reorder(child_number: int, position: str,
         "stderr": result.get("error") or "",
     }
 
+
+# =============================================================================
+# Sprint tools (v1.6.0)
+#
+# Sprint functionality inspired by the design proposed in PR #2 by
+# @jeremiahrose; ported here against the new direct-GraphQL pattern.
+# =============================================================================
+
+
+@mcp.tool()
+def sprint_list(repo_path: str = "", include_closed: bool = False) -> dict:
+    """List sprints in the workspace.
+
+    Args:
+        repo_path: Optional absolute path of a git checkout to derive
+            owner/repo from.
+        include_closed: include CLOSED sprints in the listing. Defaults
+            to OPEN-only.
+
+    Returns:
+        dict with:
+            ok: bool
+            workspace_name: str
+            active_sprint_id: str | None
+            sprints: list[dict] — each with
+                id: str
+                name: str
+                state: "OPEN" | "CLOSED"
+                start_at: ISO8601 datetime string | None
+                end_at: ISO8601 datetime string | None
+                completed_points: float
+                total_points: float
+                closed_issues_count: int
+                is_active: bool
+            stderr: str
+    """
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "workspace_name": "", "active_sprint_id": None,
+                "sprints": []}
+    from zh_graphql_ops import list_sprints  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = list_sprints(ctx, include_closed=include_closed)
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "workspace_name": "",
+            "active_sprint_id": None,
+            "sprints": [],
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "workspace_name": result.get("workspace_name", ""),
+        "active_sprint_id": result.get("active_sprint_id"),
+        "sprints": result.get("sprints", []),
+        "stderr": "",
+    }
+
+
+@mcp.tool()
+def sprint_show(sprint_name: str, repo_path: str = "") -> dict:
+    """Get full detail + issues for a sprint named `sprint_name`.
+
+    `sprint_name` accepts "current" or "active" as aliases for the
+    workspace's active sprint. Exact matches are case-insensitive.
+
+    Args:
+        sprint_name: Sprint name (or "current"/"active").
+        repo_path: Optional absolute path of a git checkout.
+
+    Returns:
+        dict with:
+            ok: bool
+            sprint_id: str | None
+            sprint_name: str
+            state: "OPEN" | "CLOSED" | None
+            start_at: ISO8601 string | None
+            end_at: ISO8601 string | None
+            completed_points: float
+            total_points: float
+            closed_issues_count: int
+            description: str | None
+            issue_count: int
+            issues: list[dict] — each with
+                number: int
+                title: str
+                state: "OPEN" | "CLOSED"
+                html_url: str
+                estimate: number | None
+                assignees: list[str]
+                pipeline: str | None
+                repository: {"owner": str, "name": str}
+            stderr: str
+    """
+    if not sprint_name or not str(sprint_name).strip():
+        return {"ok": False, "stderr": "sprint_name must be non-empty"}
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "sprint_id": None, "sprint_name": sprint_name,
+                "state": None, "start_at": None, "end_at": None,
+                "completed_points": 0, "total_points": 0,
+                "closed_issues_count": 0, "description": None,
+                "issue_count": 0, "issues": []}
+    from zh_graphql_ops import get_sprint_detail  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = get_sprint_detail(ctx, sprint_name)
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "state": None,
+            "start_at": None,
+            "end_at": None,
+            "completed_points": 0,
+            "total_points": 0,
+            "closed_issues_count": 0,
+            "description": None,
+            "issue_count": 0,
+            "issues": [],
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "sprint_id": result.get("sprint_id"),
+        "sprint_name": result.get("sprint_name", sprint_name),
+        "state": result.get("state"),
+        "start_at": result.get("start_at"),
+        "end_at": result.get("end_at"),
+        "completed_points": result.get("completed_points", 0),
+        "total_points": result.get("total_points", 0),
+        "closed_issues_count": result.get("closed_issues_count", 0),
+        "description": result.get("description"),
+        "issue_count": result.get("issue_count", 0),
+        "issues": result.get("issues", []),
+        "stderr": result.get("error") or "",
+    }
+
+
+@mcp.tool()
+def sprint_current(repo_path: str = "") -> dict:
+    """Get full detail + issues for the workspace's active sprint.
+
+    Convenience wrapper for `sprint_show("current")`. Returns the same
+    shape; `ok=False` with a clear `stderr` if no active sprint exists.
+    """
+    return sprint_show("current", repo_path=repo_path)
+
+
 # =============================================================================
 # Entry point
 # =============================================================================

@@ -833,3 +833,265 @@ def reorder_sub_issue(
         "error": None,
     }
 
+
+# =============================================================================
+# Sprints
+# =============================================================================
+
+_SPRINTS_QUERY_OPEN = """
+query($workspaceId: ID!) {
+  workspace(id: $workspaceId) {
+    id
+    name
+    activeSprint { id name }
+    sprints(first: 50, filters: { state: { eq: OPEN } }) {
+      nodes {
+        id
+        name
+        state
+        startAt
+        endAt
+        completedPoints
+        totalPoints
+        closedIssuesCount
+      }
+    }
+  }
+}
+"""
+
+_SPRINTS_QUERY_ALL = """
+query($workspaceId: ID!) {
+  workspace(id: $workspaceId) {
+    id
+    name
+    activeSprint { id name }
+    sprints(first: 50) {
+      nodes {
+        id
+        name
+        state
+        startAt
+        endAt
+        completedPoints
+        totalPoints
+        closedIssuesCount
+      }
+    }
+  }
+}
+"""
+
+
+def _serialize_sprint(node: dict, *, active_id: str | None) -> dict:
+    return {
+        "id": node.get("id"),
+        "name": node.get("name") or "",
+        "state": node.get("state") or "",
+        "start_at": node.get("startAt") or None,
+        "end_at": node.get("endAt") or None,
+        "completed_points": node.get("completedPoints") or 0,
+        "total_points": node.get("totalPoints") or 0,
+        "closed_issues_count": node.get("closedIssuesCount") or 0,
+        "is_active": bool(active_id) and node.get("id") == active_id,
+    }
+
+
+def list_sprints(ctx: RepoContext, *, include_closed: bool = False) -> dict:
+    """List sprints in the workspace.
+
+    Args:
+        include_closed: when True, returns OPEN + CLOSED sprints. Defaults
+            to OPEN only.
+
+    Returns:
+        dict with:
+            ok: bool
+            workspace_name: str
+            active_sprint_id: str | None
+            sprints: list[dict] — each {id, name, state, start_at, end_at,
+                completed_points, total_points, closed_issues_count,
+                is_active}
+    """
+    query = _SPRINTS_QUERY_ALL if include_closed else _SPRINTS_QUERY_OPEN
+    resp = ctx.query(query, {"workspaceId": ctx.workspace_id})
+    check_graphql_errors(resp, context="list_sprints")
+    ws = (resp.get("data") or {}).get("workspace") or {}
+    active = ws.get("activeSprint") or {}
+    active_id = active.get("id")
+    nodes = ((ws.get("sprints") or {}).get("nodes")) or []
+    return {
+        "ok": True,
+        "workspace_name": ws.get("name") or "",
+        "active_sprint_id": active_id,
+        "sprints": [_serialize_sprint(n, active_id=active_id) for n in nodes],
+    }
+
+
+_SPRINT_DETAIL_QUERY = """
+query($sprintId: ID!) {
+  node(id: $sprintId) {
+    ... on Sprint {
+      id
+      name
+      description
+      state
+      startAt
+      endAt
+      completedPoints
+      totalPoints
+      closedIssuesCount
+      sprintIssues(first: 100) {
+        nodes {
+          issue {
+            number
+            title
+            state
+            htmlUrl
+            estimate { value }
+            assignees { nodes { login } }
+            repository { ownerName name }
+            pipelineIssues {
+              nodes { pipeline { name } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _find_sprint_id(
+    ctx: RepoContext, sprint_name: str
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve a sprint_id by name (case-insensitive) or "current"/"active".
+
+    Returns (sprint_id, sprint_name, error). Exactly one of sprint_id /
+    error is non-None.
+    """
+    listing = list_sprints(ctx, include_closed=True)
+    sprints = listing.get("sprints") or []
+    active_id = listing.get("active_sprint_id")
+    want = (sprint_name or "").strip()
+    if want.lower() in {"current", "active"}:
+        if not active_id:
+            return None, None, "No active sprint in this workspace"
+        for s in sprints:
+            if s.get("id") == active_id:
+                return active_id, s.get("name"), None
+        # Active sprint may not appear in our 50 nodes (very unlikely);
+        # fall back to active id with empty name.
+        return active_id, "", None
+    want_lc = want.lower()
+    for s in sprints:
+        if (s.get("name") or "").lower() == want_lc:
+            return s.get("id"), s.get("name"), None
+    available = ", ".join(s.get("name") or "?" for s in sprints) or "(none)"
+    return (
+        None,
+        None,
+        f"Sprint {sprint_name!r} not found. Available: {available}",
+    )
+
+
+def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
+    """Get detail + issues for a sprint named `sprint_name`.
+
+    `sprint_name` accepts the special strings "current" or "active" to
+    target the workspace's active sprint.
+
+    Returns:
+        dict with:
+            ok: bool
+            sprint_id: str | None
+            sprint_name: str
+            state: str | None
+            start_at: str | None
+            end_at: str | None
+            completed_points: float
+            total_points: float
+            closed_issues_count: int
+            description: str | None
+            issue_count: int
+            issues: list[dict] — each {number, title, state, html_url,
+                estimate, assignees, pipeline, repository}
+            error: str | None
+    """
+    sprint_id, actual_name, err = _find_sprint_id(ctx, sprint_name)
+    if err or not sprint_id:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "state": None,
+            "start_at": None,
+            "end_at": None,
+            "completed_points": 0,
+            "total_points": 0,
+            "closed_issues_count": 0,
+            "description": None,
+            "issue_count": 0,
+            "issues": [],
+            "error": err,
+        }
+
+    resp = ctx.query(_SPRINT_DETAIL_QUERY, {"sprintId": sprint_id})
+    check_graphql_errors(resp, context="get_sprint_detail")
+    node = (resp.get("data") or {}).get("node") or {}
+
+    issues_raw = (
+        ((node.get("sprintIssues") or {}).get("nodes")) or []
+    )
+    issues: list[dict] = []
+    for wrapper in issues_raw:
+        issue = (wrapper or {}).get("issue") or {}
+        assignees = [
+            a.get("login")
+            for a in ((issue.get("assignees") or {}).get("nodes") or [])
+            if a.get("login")
+        ]
+        pipeline_nodes = (
+            ((issue.get("pipelineIssues") or {}).get("nodes")) or []
+        )
+        pipeline_name = None
+        if pipeline_nodes:
+            pl = pipeline_nodes[0].get("pipeline") or {}
+            pipeline_name = pl.get("name") or None
+        rep = issue.get("repository") or {}
+        est = issue.get("estimate") or {}
+        issues.append({
+            "number": issue.get("number"),
+            "title": issue.get("title") or "",
+            "state": issue.get("state") or "UNKNOWN",
+            "html_url": issue.get("htmlUrl") or "",
+            "estimate": est.get("value"),
+            "assignees": assignees,
+            "pipeline": pipeline_name,
+            "repository": {
+                "owner": rep.get("ownerName") or "",
+                "name": rep.get("name") or "",
+            },
+        })
+
+    return {
+        "ok": True,
+        "sprint_id": sprint_id,
+        "sprint_name": node.get("name") or actual_name or sprint_name,
+        "state": node.get("state") or None,
+        "start_at": node.get("startAt") or None,
+        "end_at": node.get("endAt") or None,
+        "completed_points": node.get("completedPoints") or 0,
+        "total_points": node.get("totalPoints") or 0,
+        "closed_issues_count": node.get("closedIssuesCount") or 0,
+        "description": node.get("description") or None,
+        "issue_count": len(issues),
+        "issues": issues,
+        "error": None,
+    }
+
+
+def get_current_sprint(ctx: RepoContext) -> dict:
+    """Convenience wrapper: detail of the workspace's active sprint."""
+    return get_sprint_detail(ctx, "current")
