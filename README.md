@@ -99,11 +99,34 @@ mkdir -p ~/.config/zh
 cat > ~/.config/zh/config << 'EOF'
 ZH_TOKEN=your_graphql_token_here
 ZH_REST_TOKEN=your_rest_token_here
+# Optional: default repo + workspace (override with -r / -w on any call)
+# ZH_REPO=owner/repo
+# ZH_WORKSPACE="My Workspace"
 EOF
 
 # Secure the file (tokens are sensitive!)
 chmod 600 ~/.config/zh/config
 ```
+
+### Repo + workspace targeting
+
+`zh` infers the GitHub owner/repo from `git remote get-url origin` and picks the first ZenHub workspace the repo is connected to. Override either with global flags or config:
+
+```bash
+# One-off override on a single invocation
+zh -r owner/repo board
+zh -w "Backend Team" sprints
+zh -r owner/repo -w "Backend Team" sprint current
+
+# Per-shell or persistent defaults
+export ZH_REPO="acme/widgets"
+export ZH_WORKSPACE="Backend Team"
+# or write them into ~/.config/zh/config
+```
+
+Precedence (highest first): `-r` / `-w` flag → `ZH_REPO` / `ZH_WORKSPACE` env or config → git-remote + first-workspace fallback.
+
+`zh workspaces` shows every workspace the repo is connected to and marks which one the rest of the CLI would currently target.
 
 ### Alternative: Project-level Config
 
@@ -141,6 +164,8 @@ ZH_REST_TOKEN=your_rest_token_here
 | `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
 | `sprints [--all]` | `sp` | List sprints in workspace (see [Sprints](#sprints)) |
 | `sprint <name>` | | View sprint details and issues |
+| `sprint add <name> <issue#> [...]` | `sa` (top-level) | Add one or more issues to a sprint |
+| `sprint remove <name> <issue#> [...]` | `sr` (top-level), `rm` | Remove one or more issues from a sprint |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -450,9 +475,27 @@ Issues (5):
     → https://github.com/acme/widgets/issues/101
 ```
 
-Sprint membership mutations (adding / removing issues from sprints) are not yet exposed by `zh`; track via the ZenHub web UI or request them as a feature.
+Sprint membership mutations:
 
-> Sprint functionality is inspired by the design proposed in [#2](https://github.com/daniel-pittman/zenhub-cli/pull/2) by [@jeremiahrose](https://github.com/jeremiahrose); v1.6.0 ships the read-only surface against the current GraphQL patterns. Credit and `Co-Authored-By` trailers preserved in the commit history.
+```bash
+# Add one or more issues to a sprint
+zh sprint add "Sprint 5" 42 43 44
+zh sprint add current 42                # Active sprint
+zh sa active 42                         # Top-level alias
+
+# Remove one or more issues from a sprint
+zh sprint remove "Sprint 5" 42
+zh sprint rm current 42 43              # `rm` is an alias for `remove`
+zh sr current 42                        # Top-level alias
+
+# Move an issue between sprints
+zh sprint remove "Sprint 4" 42
+zh sprint add "Sprint 5" 42
+```
+
+The mutations report per-issue success / failure. An issue can fail to link for several reasons the API doesn't differentiate (already in the sprint, archived, otherwise ineligible) — `zh` surfaces the count and the affected issue numbers so you can investigate.
+
+> Sprint functionality is inspired by the design proposed in [#2](https://github.com/daniel-pittman/zenhub-cli/pull/2) by [@jeremiahrose](https://github.com/jeremiahrose). The sprint queries (list / show / current) and mutations (add / remove) are credited to that design via `Co-Authored-By` trailers on the commits.
 
 ### Discovery Commands
 
@@ -601,11 +644,12 @@ Roughly 35 tools covering the same surface as `zh`:
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
 | Sub-issue management | `subissue_add_children`, `subissue_remove_children`, `subissue_reorder` |
+| Sprint membership | `sprint_add_issues`, `sprint_remove_issues` |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
 
-> **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) and the sprint family (`sprint_list`, `sprint_show`, `sprint_current`) talk to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
+> **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) and the sprint family (`sprint_list`, `sprint_show`, `sprint_current`, `sprint_add_issues`, `sprint_remove_issues`) talk to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
 
 ### Similarity search (duplicate detection)
 

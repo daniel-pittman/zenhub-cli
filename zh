@@ -423,6 +423,18 @@ COMMANDS:
                            Example: zh sprint current
                            Example: zh sprint              # (defaults to current)
 
+    sprint add <name> <issue#> [<issue#> ...]
+                           Add one or more issues to a sprint
+                           Example: zh sprint add "Sprint 5" 42 43
+                           Example: zh sprint add current 42
+                           (top-level alias: sa)
+
+    sprint remove <name> <issue#> [<issue#> ...]
+                           Remove one or more issues from a sprint
+                           Example: zh sprint remove "Sprint 5" 42
+                           Example: zh sprint rm current 42 43
+                           (top-level alias: sr)
+
     help                    Show this help message
 
 CONFIGURATION:
@@ -474,6 +486,9 @@ EXAMPLES:
     zh sprints                      # List open sprints
     zh sprint current               # View active sprint + issues
     zh sprint "Sprint 5"            # View specific sprint
+    zh sprint add current 42 43    # Add issues to active sprint
+    zh sprint remove "Sprint 5" 42 # Remove issue from sprint
+    zh sa current 42                # Top-level alias for sprint add
 EOF
 }
 
@@ -3019,6 +3034,287 @@ cmd_sprint_current() {
     cmd_sprint "current" "$@"
 }
 
+# Internal: resolve a sprint name (or current/active) to its GraphQL id.
+# Emits "<id>\t<name>" on stdout on success; calls `error` on failure
+# (which exits non-zero). Walks every page of sprints so a workspace
+# with >50 sprints can still resolve older names.
+zh_resolve_sprint_id() {
+    local workspace_id="$1"
+    local sprint_name="$2"
+
+    local sprints_json
+    sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
+
+    local sprint_id sprint_actual_name
+    if [[ "$sprint_name" == "current" || "$sprint_name" == "active" ]]; then
+        sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
+        if [[ -z "$sprint_id" ]]; then
+            error "No active sprint found"
+        fi
+        sprint_actual_name=$(echo "$sprints_json" | jq -r --arg id "$sprint_id" \
+            '.nodes[] | select(.id == $id) | .name' | head -1)
+    else
+        sprint_id=$(echo "$sprints_json" | jq -r --arg name "$sprint_name" \
+            '.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+        sprint_actual_name=$(echo "$sprints_json" | jq -r --arg name "$sprint_name" \
+            '.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .name' | head -1)
+
+        if [[ -z "$sprint_id" ]]; then
+            echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            echo "" >&2
+            echo "Available sprints:" >&2
+            echo "$sprints_json" | jq -r '.nodes[] | "  - \(.name) (\(.state))"' >&2
+            exit 1
+        fi
+    fi
+
+    printf '%s\t%s\n' "$sprint_id" "$sprint_actual_name"
+}
+
+# Resolve every issue number (in the cwd's repo) to its GraphQL id.
+# Emits one line per issue on stdout: "<id>\t<number>\t<title>".
+# Errors out (non-zero exit) listing every not-found number rather than
+# stopping at the first one — same accumulator pattern as
+# cmd_subissue_remove's pre-flight.
+zh_resolve_issue_ids_for_sprint() {
+    local repo_id="$1"
+    shift
+    local nums=("$@")
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+        }
+    }'
+
+    local results=""
+    local missing=""
+    local num stripped issue_response issue_id issue_title
+    for num in "${nums[@]}"; do
+        stripped="${num#\#}"
+        if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${num}"
+        fi
+
+        local variables
+        variables=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
+            '{repoId: $repo_id, issueNumber: $n}')
+
+        issue_response=$(zh_graphql "$query" "$variables")
+        issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+        issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title // ""')
+
+        if [[ -z "$issue_id" ]]; then
+            missing="${missing} #${stripped}"
+        else
+            # Tab-separated to keep the title intact even if it has
+            # spaces.
+            results+="${issue_id}	${stripped}	${issue_title}"$'\n'
+        fi
+    done
+
+    if [[ -n "$missing" ]]; then
+        error "Issue(s) not found in this repository:${missing}"
+    fi
+
+    printf '%s' "$results"
+}
+
+cmd_sprint_add() {
+    load_config
+
+    local sprint_name="${1:-}"
+    shift || true
+
+    if [[ -z "$sprint_name" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh sprint add <sprint_name> <issue#> [<issue#> ...]
+
+Add one or more issues to a sprint.
+
+Examples:
+  zh sprint add \"Sprint 5\" 42
+  zh sprint add current 42 43 44       # Add to active sprint
+  zh sprint add active 42              # 'active' is an alias for current"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Resolving sprint '${sprint_name}'..."
+    local sprint_resolved sprint_id sprint_actual_name
+    sprint_resolved=$(zh_resolve_sprint_id "$workspace_id" "$sprint_name")
+    sprint_id=$(echo "$sprint_resolved" | cut -f1)
+    sprint_actual_name=$(echo "$sprint_resolved" | cut -f2)
+
+    info "Resolving ${#} issue(s)..."
+    local issues_resolved
+    issues_resolved=$(zh_resolve_issue_ids_for_sprint "$repo_id" "$@")
+
+    # Build JSON array of issue ids from the tab-separated result.
+    local issue_ids_json
+    issue_ids_json=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 1 {print $1}' | jq -R . | jq -s .)
+
+    # Fire the mutation. Ask for sprintIssues back so we can detect
+    # partial failures (the API doesn't return failedIssues for this
+    # mutation — anything not in the response inferred-failed).
+    local mutation='
+    mutation($input: AddIssuesToSprintsInput!) {
+        addIssuesToSprints(input: $input) {
+            sprintIssues {
+                issue { number }
+                sprint { id }
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg sprint_id "$sprint_id" --argjson issue_ids "$issue_ids_json" \
+        '{input: {sprintIds: [$sprint_id], issueIds: $issue_ids}}')
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    # Detect which input numbers came back as links.
+    local returned_nums_csv
+    returned_nums_csv=$(echo "$response" | jq -r --arg sid "$sprint_id" \
+        '[.data.addIssuesToSprints.sprintIssues[] | select(.sprint.id == $sid) | .issue.number] | map(tostring) | join(",")')
+
+    local input_nums_csv
+    input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
+
+    # Split inputs into succeeded / failed by membership.
+    local succeeded failed
+    succeeded=$(jq -nr --arg inputs "$input_nums_csv" --arg returned "$returned_nums_csv" \
+        '($inputs | split(",")) as $in | ($returned | split(",")) as $out |
+         [$in[] | select(. as $n | $out | any(. == $n))] | join(",")')
+    failed=$(jq -nr --arg inputs "$input_nums_csv" --arg returned "$returned_nums_csv" \
+        '($inputs | split(",")) as $in | ($returned | split(",")) as $out |
+         [$in[] | select(. as $n | $out | all(. != $n))] | join(",")')
+
+    local total_input
+    total_input=$(echo "$input_nums_csv" | awk -F',' '{print NF}')
+    local success_count
+    success_count=$(echo "$succeeded" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+    local failed_count
+    failed_count=$(echo "$failed" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+
+    echo ""
+    if [[ "$success_count" -gt 0 ]]; then
+        success "Added ${success_count}/${total_input} issue(s) to sprint '${sprint_actual_name}': ${succeeded//,/, }"
+    fi
+    if [[ "$failed_count" -gt 0 ]]; then
+        warn "${failed_count} not linked (already in sprint, archived, or rejected by API): ${failed//,/, }"
+    fi
+
+    # Exit non-zero on partial / fail so scripted callers notice.
+    if [[ "$failed_count" -gt 0 ]] || [[ "$success_count" -eq 0 ]]; then
+        exit 1
+    fi
+}
+
+cmd_sprint_remove() {
+    load_config
+
+    local sprint_name="${1:-}"
+    shift || true
+
+    if [[ -z "$sprint_name" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh sprint remove <sprint_name> <issue#> [<issue#> ...]
+
+Remove one or more issues from a sprint.
+
+Examples:
+  zh sprint remove \"Sprint 5\" 42
+  zh sprint remove current 42 43       # Remove from active sprint
+  zh sprint rm active 42               # 'rm' is an alias for remove"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Resolving sprint '${sprint_name}'..."
+    local sprint_resolved sprint_id sprint_actual_name
+    sprint_resolved=$(zh_resolve_sprint_id "$workspace_id" "$sprint_name")
+    sprint_id=$(echo "$sprint_resolved" | cut -f1)
+    sprint_actual_name=$(echo "$sprint_resolved" | cut -f2)
+
+    info "Resolving ${#} issue(s)..."
+    local issues_resolved
+    issues_resolved=$(zh_resolve_issue_ids_for_sprint "$repo_id" "$@")
+
+    local issue_ids_json
+    issue_ids_json=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 1 {print $1}' | jq -R . | jq -s .)
+
+    # The mutation returns the sprint's post-state. Anything STILL
+    # attached after the call is inferred-failed. We ask for the full
+    # post-state via a paginated walk, since the response cap of 100
+    # would otherwise mis-classify removed-but-on-page-2 issues as
+    # still-attached.
+    local mutation='
+    mutation($input: RemoveIssuesFromSprintsInput!) {
+        removeIssuesFromSprints(input: $input) {
+            sprints { id }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg sprint_id "$sprint_id" --argjson issue_ids "$issue_ids_json" \
+        '{input: {sprintIds: [$sprint_id], issueIds: $issue_ids}}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    # Post-state walk to determine which inputs are still in the sprint.
+    local post_state
+    post_state=$(zh_sprint_issues_fetch_all "$sprint_id")
+
+    local still_attached_nums_csv
+    still_attached_nums_csv=$(echo "$post_state" | jq -r '[.nodes[].issue.number] | map(tostring) | join(",")')
+
+    local input_nums_csv
+    input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
+
+    local succeeded failed
+    succeeded=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
+        '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
+         [$in[] | select(. as $n | $att | all(. != $n))] | join(",")')
+    failed=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
+        '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
+         [$in[] | select(. as $n | $att | any(. == $n))] | join(",")')
+
+    local total_input
+    total_input=$(echo "$input_nums_csv" | awk -F',' '{print NF}')
+    local success_count
+    success_count=$(echo "$succeeded" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+    local failed_count
+    failed_count=$(echo "$failed" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+
+    echo ""
+    if [[ "$success_count" -gt 0 ]]; then
+        success "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
+    fi
+    if [[ "$failed_count" -gt 0 ]]; then
+        warn "${failed_count} still in sprint (API rejected the removal): ${failed//,/, }"
+    fi
+
+    if [[ "$failed_count" -gt 0 ]] || [[ "$success_count" -eq 0 ]]; then
+        exit 1
+    fi
+}
+
 # Encode a numeric epic ID into its GraphQL global-ID form.
 zh_epic_encode_id() {
     local epic_num="$1"
@@ -5015,11 +5311,25 @@ main() {
                     current|active)
                         cmd_sprint_current "$@"
                         ;;
+                    add)
+                        cmd_sprint_add "$@"
+                        ;;
+                    remove|rm)
+                        cmd_sprint_remove "$@"
+                        ;;
                     *)
                         cmd_sprint "$first" "$@"
                         ;;
                 esac
             fi
+            ;;
+        sa)
+            # Top-level alias for `zh sprint add` (per @jeremiahrose's PR #2)
+            cmd_sprint_add "$@"
+            ;;
+        sr)
+            # Top-level alias for `zh sprint remove`
+            cmd_sprint_remove "$@"
             ;;
         *)
             error "Unknown command: $command

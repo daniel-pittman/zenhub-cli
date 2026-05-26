@@ -359,3 +359,242 @@ def test_get_sprint_detail_walks_issues_pagination():
     assert out["issue_count"] == 101
     assert out["issues"][-1]["title"] == "The hundred-and-first"
     assert out["pagination_warning"] is None
+
+
+# =============================================================================
+# Sprint mutations (Bucket A): add_issues_to_sprint / remove_issues_from_sprint
+# =============================================================================
+
+def _issue_by_info_resp(number: int, *, owner: str = "acme",
+                        repo_name: str = "widgets") -> dict:
+    """Single-issue lookup stub (used by mutation pre-flight)."""
+    return {
+        "data": {
+            "issueByInfo": {
+                "id": f"issue-gid-{number}",
+                "number": number,
+                "title": f"Issue {number}",
+                "state": "OPEN",
+                "repository": {"ownerName": owner, "name": repo_name},
+                "parentIssue": None,
+            }
+        }
+    }
+
+
+def _add_resp(linked_numbers: list[int], *, sprint_id: str = "sprint-7") -> dict:
+    """`addIssuesToSprints` response wrapper.
+
+    Builds one SprintIssue link per `linked_numbers` entry. Issues NOT
+    in this list are inferred-failed by the production code.
+    """
+    return {
+        "data": {
+            "addIssuesToSprints": {
+                "sprintIssues": [
+                    {
+                        "id": f"link-{n}-{sprint_id}",
+                        "issue": {
+                            "number": n,
+                            "repository": {
+                                "ownerName": "acme", "name": "widgets",
+                            },
+                        },
+                        "sprint": {"id": sprint_id},
+                    }
+                    for n in linked_numbers
+                ]
+            }
+        }
+    }
+
+
+def _remove_resp(still_attached_numbers: list[int],
+                 *, sprint_id: str = "sprint-7") -> dict:
+    """`removeIssuesFromSprints` response wrapper.
+
+    `still_attached_numbers` is what remains in the sprint AFTER the
+    mutation. The production code treats anything in this set that we
+    asked to remove as inferred-failed.
+    """
+    return {
+        "data": {
+            "removeIssuesFromSprints": {
+                "sprints": [
+                    {
+                        "id": sprint_id,
+                        "sprintIssues": {
+                            "nodes": [
+                                {
+                                    "issue": {
+                                        "number": n,
+                                        "repository": {
+                                            "ownerName": "acme",
+                                            "name": "widgets",
+                                        },
+                                    }
+                                }
+                                for n in still_attached_numbers
+                            ],
+                        },
+                    }
+                ]
+            }
+        }
+    }
+
+
+# --- add_issues_to_sprint -------------------------------------------------
+
+def test_add_issues_to_sprint_happy_path():
+    """All inputs come back as links → outcome=ok, succeeded=inputs, failed=[]."""
+    ctx = _ctx()
+    responses = [
+        # 1. _find_sprint_id calls list_sprints
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        # 2-3. Pre-flight issueByInfo lookups
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        # 4. Mutation response: both linked
+        _add_resp([100, 101]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 7", [100, 101])
+    assert out["ok"] is True
+    assert out["outcome"] == "ok"
+    assert sorted(out["succeeded"]) == [100, 101]
+    assert out["failed"] == []
+    assert out["success_count"] == 2
+    assert out["failed_count"] == 0
+
+
+def test_add_issues_to_sprint_partial_failure():
+    """API only confirmed one of three — the other two are inferred-failed."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        _issue_by_info_resp(102),
+        _add_resp([101]),  # only #101 came back as linked
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(
+            ctx, "Sprint 7", [100, 101, 102]
+        )
+    assert out["ok"] is False
+    assert out["outcome"] == "partial"
+    assert out["succeeded"] == [101]
+    # 100 and 102 absent from the response — inferred-failed.
+    assert sorted(out["failed"]) == [100, 102]
+    assert out["success_count"] == 1
+    assert out["failed_count"] == 2
+
+
+def test_add_issues_to_sprint_noop_when_all_already_linked():
+    """Empty response (no new links created) → outcome=noop, ok=False.
+
+    Common case: every input was already in the sprint. API silently
+    accepts the mutation but creates no new links.
+    """
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _add_resp([]),  # zero new links
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 7", [100])
+    # Zero successes + zero failures is `noop`; classifier maps zero-
+    # success-with-input-list-of-1 to "fail" because everything was
+    # inferred-failed. Both noop and fail are non-ok — assert that.
+    assert out["ok"] is False
+    assert out["outcome"] in {"noop", "fail"}
+
+
+def test_add_issues_to_sprint_sprint_not_found():
+    """Sprint name lookup miss surfaces a clean error, no mutation fired."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 99", [100])
+    assert out["ok"] is False
+    assert "not found" in (out["error"] or "").lower()
+
+
+def test_add_issues_to_sprint_missing_issue_short_circuits():
+    """Pre-flight: an unknown issue number is reported before firing."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        # 9999 returns no issue
+        {"data": {"issueByInfo": None}},
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(
+            ctx, "Sprint 7", [100, 9999]
+        )
+    assert out["ok"] is False
+    assert out["outcome"] == "fail"
+    assert out["failed"] == [9999]
+
+
+def test_add_issues_to_sprint_validates_inputs():
+    ctx = _ctx()
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 7", [])
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 7", [100, -5])
+
+
+# --- remove_issues_from_sprint --------------------------------------------
+
+def test_remove_issues_from_sprint_happy_path():
+    """All inputs absent from post-state → outcome=ok."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        # Post-state has neither 100 nor 101 — both were removed.
+        _remove_resp([200, 201]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100, 101]
+        )
+    assert out["ok"] is True
+    assert out["outcome"] == "ok"
+    assert sorted(out["succeeded"]) == [100, 101]
+    assert out["failed"] == []
+
+
+def test_remove_issues_from_sprint_partial_failure():
+    """One input still in the sprint post-mutation → inferred-failed."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        # 100 is gone, 101 stuck.
+        _remove_resp([101, 999]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100, 101]
+        )
+    assert out["ok"] is False
+    assert out["outcome"] == "partial"
+    assert out["succeeded"] == [100]
+    assert out["failed"] == [101]
+
+
+def test_remove_issues_from_sprint_validates_inputs():
+    ctx = _ctx()
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.remove_issues_from_sprint(ctx, "Sprint 7", [])
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.remove_issues_from_sprint(ctx, "Sprint 7", [-1])

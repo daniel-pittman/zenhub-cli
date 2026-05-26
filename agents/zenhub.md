@@ -84,6 +84,20 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh subissue list <parent#>` — list a parent's sub-issues with the same format `zh epic show` uses (aliases: `ls`)
 - `zh subissue reorder <child#> <top|bottom|after <sib#>|before <sib#>>` — reorder a sub-issue among its siblings. **Different positioning model from `zh reorder`**: ZenHub's `reprioritizeSubIssue` mutation uses sibling-anchored positioning, not integer positions. (aliases: `order`, `pos`)
 
+### Write operations (sprint membership)
+- `zh sprint add <name|current|active> <issue#> [<issue#> ...]` — add one or more issues to a sprint (single API call). Top-level alias: `zh sa <name> <issue#> [...]`.
+- `zh sprint remove <name|current|active> <issue#> [<issue#> ...]` — remove issues from a sprint. Top-level alias: `zh sr <name> <issue#> [...]`. `remove` aliases: `rm`.
+
+The sprint mutations report per-issue success / failure. The ZenHub API doesn't distinguish reasons (already-in-sprint, archived, ineligible) so `zh` surfaces counts and affected numbers; if anything fails, investigate via `zh sprint <name>` and the issue's history.
+
+### Repository / workspace targeting (global flags)
+- `-r owner/repo` (alias `--repo`) before any subcommand: target a specific GitHub repo instead of the one `git remote get-url origin` resolves.
+- `-w "Workspace Name"` (alias `--workspace`): target a specific workspace by name. Case-insensitive match.
+- Persistent defaults: `ZH_REPO` and `ZH_WORKSPACE` in `~/.config/zh/config` or env.
+- Precedence: flag > env / config > git-remote + first-workspace fallback.
+
+Use `-w` when a repo is connected to multiple workspaces — the historical default of "first workspace returned" is a coin flip.
+
 ### Aliases worth knowing
 - `zh issue` → `i`, `show`
 - `zh mine` → `my`
@@ -94,6 +108,7 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh estimate` → `est`, `points`
 - `zh epic list` → `zh epic ls`; `show` → `view`; `create` → `new`; `remove` → `rm`; `reopen` → `open`; `update` → `edit`, `modify`
 - `zh subissue` → `subissues`, `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
+- `zh sprints` → `sp`; `zh sprint add` → top-level `sa`; `zh sprint remove` → top-level `sr` (and `rm` as inner alias)
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 

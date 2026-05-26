@@ -1593,6 +1593,129 @@ def sprint_current(repo_path: str = "") -> dict:
     return sprint_show("current", repo_path=repo_path)
 
 
+@mcp.tool()
+def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
+                      repo_path: str = "") -> dict:
+    """Add one or more issues to a sprint.
+
+    Partial-failure handling mirrors the sub-issue family: the API's
+    `addIssuesToSprints` returns the list of SprintIssue links it
+    actually created. Issues absent from that list are inferred-failed
+    (the GraphQL surface doesn't say WHY a link didn't form — usually
+    the issue was already in the sprint, archived, or otherwise
+    ineligible). `succeeded` / `failed` are split from the response,
+    never from the raw input.
+
+    Args:
+        sprint_name: Sprint name to target. `current` / `active` are
+            aliases for the workspace's active sprint.
+        issue_numbers: List of issue numbers in the cwd's repo.
+        repo_path: Optional git checkout for repo + workspace context.
+
+    Returns:
+        dict with:
+            ok: bool — true iff outcome == "ok"
+            sprint_id: str | None
+            sprint_name: str
+            outcome: "ok" | "partial" | "fail" | "noop"
+            success_count: int
+            failed_count: int
+            succeeded: list[int] — API confirmed these were linked
+            failed: list[int] — API did not return links for these
+            stderr: str
+    """
+    if not issue_numbers:
+        return {"ok": False, "stderr": "issue_numbers must be non-empty"}
+    if not sprint_name or not str(sprint_name).strip():
+        return {"ok": False, "stderr": "sprint_name must be non-empty"}
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "sprint_id": None, "sprint_name": sprint_name,
+                "outcome": "fail", "success_count": 0, "failed_count": 0,
+                "succeeded": [], "failed": []}
+    from zh_graphql_ops import add_issues_to_sprint  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = add_issues_to_sprint(ctx, sprint_name, list(issue_numbers))
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "sprint_id": result.get("sprint_id"),
+        "sprint_name": result.get("sprint_name", sprint_name),
+        "outcome": result.get("outcome", "fail"),
+        "success_count": result.get("success_count", 0),
+        "failed_count": result.get("failed_count", 0),
+        "succeeded": result.get("succeeded", []),
+        "failed": result.get("failed", []),
+        "stderr": result.get("error") or "",
+    }
+
+
+@mcp.tool()
+def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
+                         repo_path: str = "") -> dict:
+    """Remove one or more issues from a sprint.
+
+    Partial-failure handling: the API returns the sprint's post-
+    mutation state. We compare the input numbers against the sprint's
+    post-state `sprintIssues`; anything STILL attached after the
+    mutation is inferred-failed. For sprints with >100 issues we
+    follow up with a paginated read to make sure post-page-2 entries
+    aren't mistaken for failures.
+
+    Args / returns: same shape as `sprint_add_issues`.
+    """
+    if not issue_numbers:
+        return {"ok": False, "stderr": "issue_numbers must be non-empty"}
+    if not sprint_name or not str(sprint_name).strip():
+        return {"ok": False, "stderr": "sprint_name must be non-empty"}
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "sprint_id": None, "sprint_name": sprint_name,
+                "outcome": "fail", "success_count": 0, "failed_count": 0,
+                "succeeded": [], "failed": []}
+    from zh_graphql_ops import remove_issues_from_sprint  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = remove_issues_from_sprint(
+            ctx, sprint_name, list(issue_numbers)
+        )
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "sprint_id": result.get("sprint_id"),
+        "sprint_name": result.get("sprint_name", sprint_name),
+        "outcome": result.get("outcome", "fail"),
+        "success_count": result.get("success_count", 0),
+        "failed_count": result.get("failed_count", 0),
+        "succeeded": result.get("succeeded", []),
+        "failed": result.get("failed", []),
+        "stderr": result.get("error") or "",
+    }
+
+
 # =============================================================================
 # Entry point
 # =============================================================================

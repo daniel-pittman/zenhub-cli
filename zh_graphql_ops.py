@@ -1304,3 +1304,310 @@ def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
 def get_current_sprint(ctx: RepoContext) -> dict:
     """Convenience wrapper: detail of the workspace's active sprint."""
     return get_sprint_detail(ctx, "current")
+
+
+# =============================================================================
+# Sprint membership mutations: addIssuesToSprints / removeIssuesFromSprints
+#
+# Both mutations accept arrays of issue and sprint ids. Unlike
+# addSubIssues, the payloads do NOT include a `failedIssues` array —
+# they return the resulting SprintIssue links (add) or the resulting
+# Sprint state (remove). To detect partial failures we compare the
+# requested input against what the API tells us came back:
+#
+#   - add: a SprintIssue with `issue.number == N` and `sprint.id == S`
+#     in the response means N was added to S. Inputs missing from the
+#     response are inferred-failed (the GraphQL endpoint accepts the
+#     request without telling us WHY a specific issue didn't link).
+#
+#   - remove: the response is the post-mutation sprint state. Anything
+#     STILL in `sprint.sprintIssues` that we asked to remove is
+#     inferred-failed.
+# =============================================================================
+
+_ADD_ISSUES_TO_SPRINTS_MUTATION = """
+mutation($input: AddIssuesToSprintsInput!) {
+  addIssuesToSprints(input: $input) {
+    sprintIssues {
+      id
+      issue {
+        number
+        repository { ownerName name }
+      }
+      sprint { id }
+    }
+  }
+}
+"""
+
+_REMOVE_ISSUES_FROM_SPRINTS_MUTATION = """
+mutation($input: RemoveIssuesFromSprintsInput!) {
+  removeIssuesFromSprints(input: $input) {
+    sprints {
+      id
+      sprintIssues(first: 100) {
+        nodes {
+          issue {
+            number
+            repository { ownerName name }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _resolve_issue_ids_in_repo(
+    ctx: RepoContext, issue_numbers: list[int]
+) -> tuple[dict[int, str], list[int]]:
+    """Look up GraphQL ids for issue numbers in the ctx's repo.
+
+    Returns `({number: gid}, not_found_numbers)`. Pre-flight validation
+    so we can fail cleanly on typos before firing a mutation.
+    """
+    out: dict[int, str] = {}
+    missing: list[int] = []
+    for n in issue_numbers:
+        info = get_issue_by_info(ctx, n)
+        if not info or not info.get("id"):
+            missing.append(n)
+        else:
+            out[n] = info["id"]
+    return out, missing
+
+
+def add_issues_to_sprint(
+    ctx: RepoContext, sprint_name: str, issue_numbers: list[int]
+) -> dict:
+    """Add one or more issues to a sprint.
+
+    Identifies partial failures by comparing the API's returned
+    `sprintIssues` against the input set. Issues that don't appear in
+    the response are inferred-failed — the API doesn't tell us WHY
+    (e.g. issue already in the sprint, archived, etc.), only that the
+    new link didn't materialize.
+
+    Args:
+        ctx: RepoContext.
+        sprint_name: target sprint by name. `current` / `active` are
+            aliases for the workspace's active sprint.
+        issue_numbers: list of positive ints (issue numbers in the
+            ctx's repo).
+
+    Returns:
+        dict with:
+            ok: bool — true iff outcome == "ok"
+            sprint_id: str | None
+            sprint_name: str
+            outcome: "ok" | "partial" | "fail" | "noop"
+            success_count: int
+            failed_count: int
+            succeeded: list[int] — input numbers the API actually linked
+            failed: list[int] — input numbers absent from the API's response
+            error: str | None
+    """
+    if not issue_numbers:
+        raise ZhApiError("issue_numbers must be non-empty")
+    for n in issue_numbers:
+        if not isinstance(n, int) or n <= 0:
+            raise ZhApiError(
+                f"every issue number must be a positive int (got {n!r})"
+            )
+
+    sprint_id, actual_sprint_name, err = _find_sprint_id(ctx, sprint_name)
+    if err or not sprint_id:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "error": err,
+        }
+
+    issue_ids, missing = _resolve_issue_ids_in_repo(ctx, issue_numbers)
+    if missing:
+        return {
+            "ok": False,
+            "sprint_id": sprint_id,
+            "sprint_name": actual_sprint_name or sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": len(missing),
+            "succeeded": [],
+            "failed": missing,
+            "error": (
+                "Some issue numbers were not found in this repository: "
+                + ", ".join(f"#{n}" for n in missing)
+            ),
+        }
+
+    resp = ctx.query(
+        _ADD_ISSUES_TO_SPRINTS_MUTATION,
+        {
+            "input": {
+                "issueIds": list(issue_ids.values()),
+                "sprintIds": [sprint_id],
+            }
+        },
+    )
+    check_graphql_errors(resp, context="addIssuesToSprints")
+    payload = (resp.get("data") or {}).get("addIssuesToSprints") or {}
+    returned_links = payload.get("sprintIssues") or []
+
+    # The API returns one SprintIssue per (issue, sprint) link that was
+    # created. Filter to links for THIS sprint and pull out the issue
+    # number from each. Cross-reference against our input to identify
+    # successes and inferred-failures.
+    succeeded_numbers: set[int] = set()
+    for link in returned_links:
+        sprint = (link or {}).get("sprint") or {}
+        if sprint.get("id") != sprint_id:
+            continue
+        issue = (link or {}).get("issue") or {}
+        num = issue.get("number")
+        if isinstance(num, int):
+            succeeded_numbers.add(num)
+
+    succeeded = [n for n in issue_numbers if n in succeeded_numbers]
+    failed = [n for n in issue_numbers if n not in succeeded_numbers]
+    outcome = _classify_outcome(len(succeeded), len(failed))
+
+    return {
+        "ok": outcome == "ok",
+        "sprint_id": sprint_id,
+        "sprint_name": actual_sprint_name or sprint_name,
+        "outcome": outcome,
+        "success_count": len(succeeded),
+        "failed_count": len(failed),
+        "succeeded": succeeded,
+        "failed": failed,
+        "error": None,
+    }
+
+
+def remove_issues_from_sprint(
+    ctx: RepoContext, sprint_name: str, issue_numbers: list[int]
+) -> dict:
+    """Remove one or more issues from a sprint.
+
+    Identifies partial failures by walking the sprint's post-mutation
+    `sprintIssues` (in the response) and checking which input numbers
+    are STILL there. Anything still attached is inferred-failed.
+
+    Note on completeness: the response's `sprint.sprintIssues` is
+    capped at 100. For sprints with >100 issues we follow up with a
+    paginated read of the sprint to determine the full post-state.
+
+    Args mirror add_issues_to_sprint. Returns the same shape.
+    """
+    if not issue_numbers:
+        raise ZhApiError("issue_numbers must be non-empty")
+    for n in issue_numbers:
+        if not isinstance(n, int) or n <= 0:
+            raise ZhApiError(
+                f"every issue number must be a positive int (got {n!r})"
+            )
+
+    sprint_id, actual_sprint_name, err = _find_sprint_id(ctx, sprint_name)
+    if err or not sprint_id:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "error": err,
+        }
+
+    issue_ids, missing = _resolve_issue_ids_in_repo(ctx, issue_numbers)
+    if missing:
+        return {
+            "ok": False,
+            "sprint_id": sprint_id,
+            "sprint_name": actual_sprint_name or sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": len(missing),
+            "succeeded": [],
+            "failed": missing,
+            "error": (
+                "Some issue numbers were not found in this repository: "
+                + ", ".join(f"#{n}" for n in missing)
+            ),
+        }
+
+    resp = ctx.query(
+        _REMOVE_ISSUES_FROM_SPRINTS_MUTATION,
+        {
+            "input": {
+                "issueIds": list(issue_ids.values()),
+                "sprintIds": [sprint_id],
+            }
+        },
+    )
+    check_graphql_errors(resp, context="removeIssuesFromSprints")
+    payload = (resp.get("data") or {}).get("removeIssuesFromSprints") or {}
+    sprints_after = payload.get("sprints") or []
+
+    # Locate the target sprint's post-state.
+    target_sprint = next(
+        (s for s in sprints_after if (s or {}).get("id") == sprint_id),
+        None,
+    )
+
+    # Decide which input numbers are still attached. Start from the
+    # mutation response (up to 100 issues); if there were more we
+    # follow up with a paginated walk so we don't classify removed
+    # issues as still-attached just because they're on page 2.
+    still_attached_numbers: set[int] = set()
+    inspected_full = False
+    if target_sprint is not None:
+        nodes = ((target_sprint.get("sprintIssues") or {}).get("nodes")) or []
+        for n_link in nodes:
+            issue = (n_link or {}).get("issue") or {}
+            num = issue.get("number")
+            if isinstance(num, int):
+                still_attached_numbers.add(num)
+        # If the response was truncated, walk for the full state.
+        # (Conservative: walk whenever the response was full, since we
+        # can't tell from the mutation payload alone whether there's
+        # more.)
+        if len(nodes) >= 100:
+            walked, _ = _walk_sprint_issues(ctx, sprint_id)
+            still_attached_numbers = {
+                w.get("number") for w in walked
+                if isinstance(w.get("number"), int)
+            }
+            inspected_full = True
+
+    # An input was successfully removed iff it's not in the still-
+    # attached set AFTER the mutation. To avoid false-positives when
+    # the mutation response was incomplete and we couldn't follow up,
+    # we'd want a follow-up read — but the conservative path (above)
+    # already handles that. `inspected_full` is recorded for caller
+    # transparency.
+    _ = inspected_full
+    succeeded = [n for n in issue_numbers if n not in still_attached_numbers]
+    failed = [n for n in issue_numbers if n in still_attached_numbers]
+    outcome = _classify_outcome(len(succeeded), len(failed))
+
+    return {
+        "ok": outcome == "ok",
+        "sprint_id": sprint_id,
+        "sprint_name": actual_sprint_name or sprint_name,
+        "outcome": outcome,
+        "success_count": len(succeeded),
+        "failed_count": len(failed),
+        "succeeded": succeeded,
+        "failed": failed,
+        "error": None,
+    }
