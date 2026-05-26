@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/daniel-pittman/zenhub-cli)](https://github.com/daniel-pittman/zenhub-cli/releases)
+[![CI](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 A powerful command-line interface for ZenHub. Manage issues, pipelines, sprints, and more directly from your terminal.
 
@@ -540,7 +542,7 @@ A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. I
 
 ### What it exposes
 
-Roughly 25 tools covering the same surface as `zh`:
+Roughly 30 tools covering the same surface as `zh`:
 
 | Category | Tools |
 |---|---|
