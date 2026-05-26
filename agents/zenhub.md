@@ -95,11 +95,13 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 
-These are exposed by the MCP server (`mcp_server.py`) on top of the `zh` CLI. They wrap `sentence-transformers/all-MiniLM-L6-v2` embeddings over an auto-synced per-repo cache at `~/.config/zh/index/`. Available when the zenhub MCP server is registered with Claude Code — but **not** runnable from the `zh` shell wrapper directly.
+These are exposed by the MCP server (`mcp_server.py`) on top of the `zh` CLI. Available when the zenhub MCP server is registered with Claude Code — but **not** runnable from the `zh` shell wrapper directly.
 
-- **`zh_similar(query, top_k=5, threshold=0.5)`** — semantic search across open issues. Returns top matches with cosine similarity scores. Use this for "is there already a ticket for X?" lookups.
+- **`zh_similar(query, top_k=5, threshold=0.5)`** — semantic search across open issues using `sentence-transformers/all-MiniLM-L6-v2` embeddings over an auto-synced per-repo cache at `~/.config/zh/index/`. Returns top matches with cosine similarity scores. Use this for "is there already a ticket for X?" lookups.
 - **`zh_reindex(full=False)`** — manual cache refresh. Auto-sync runs on a 5-minute TTL on every `zh_similar` call, so this is rarely needed.
 - **Pre-flight duplicate check on `create_issue`** — every `create_issue` call (including yours) automatically runs `check_duplicate(title, body)` before invoking `zh create`. See Hard Rule #5 below for how to handle the response.
+
+> **MCP architecture note (v1.6.0):** the `subissue_*` and `sprint_*` MCP tools talk to ZenHub's GraphQL API directly from Python (via `zh_api.py` / `zh_graphql_ops.py`), returning untruncated structured data with no text-parsing layer. Earlier versions parsed `zh --machine` TSV output; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap the bash `zh` because human-facing rendering already gives them everything they need.
 
 ---
 

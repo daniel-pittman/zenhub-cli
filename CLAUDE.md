@@ -149,12 +149,20 @@ zh reopen 123
 
 ```
 zenhub-cli/
-├── zh              # Main executable (bash script)
-├── README.md       # User documentation
-├── CLAUDE.md       # This file (AI assistant guidance)
-├── LICENSE         # MIT license
-├── VERSION         # Current version number
-└── .gitignore      # Git ignore patterns
+├── zh                  # Main executable (bash script)
+├── mcp_server.py       # MCP server entry point (FastMCP + tool defs)
+├── zh_api.py           # GraphQL client + auth/repo/workspace resolution
+├── zh_graphql_ops.py   # ZenHub GraphQL ops (sub-issues + sprints)
+├── similarity.py       # Sentence-embedding duplicate detection
+├── tests/              # pytest suite (mocks the network)
+├── agents/zenhub.md    # Generic agent definition (copy to ~/.claude/agents/)
+├── README.md           # User documentation
+├── CLAUDE.md           # This file (AI assistant guidance)
+├── CONTRIBUTING.md     # Contribution workflow
+├── SECURITY.md         # Security posture
+├── LICENSE             # MIT license
+├── VERSION             # Current version number
+└── .github/workflows/  # CI + Claude review workflows
 ```
 
 ## Configuration

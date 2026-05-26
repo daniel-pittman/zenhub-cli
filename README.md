@@ -538,7 +538,7 @@ The issue must exist in a repository that's part of your ZenHub workspace.
 
 ## MCP Server (for Claude Code / AI agents)
 
-A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. It wraps `zh` over stdio so any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
+A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. Most tools wrap `zh` over stdio for the human-facing read/write surface, while the sub-issue family calls ZenHub's GraphQL API directly from Python (since v1.6.0) — sourcing structured data straight from the API rather than parsing terminal output. Any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
 
 ### What it exposes
 
@@ -554,6 +554,8 @@ Roughly 30 tools covering the same surface as `zh`:
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
+
+> **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) talks to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
 
 ### Similarity search (duplicate detection)
 

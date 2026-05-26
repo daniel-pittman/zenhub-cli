@@ -3410,18 +3410,13 @@ Example: zh subissue add 42 100 101"
         warn "No sub-issues added — already linked or no-op"
     fi
 
-    # Machine-readable summary line for MCP consumers. Always emitted; format
-    # is stable and parser-friendly. CSV values are space-free (see comment
-    # at the failed_nums_csv assignment above) so the parser's space-split
-    # tokenisation can't accidentally split a single CSV across tokens.
+    # v1.6.0 removed the `RESULT:add` machine-summary line. The sole
+    # consumer (the MCP server) now calls the GraphQL mutation directly
+    # and reads successCount / failedIssues from the JSON response.
     #
-    #   RESULT:add outcome=ok|partial|fail|noop success=N failed=N \
-    #       added=#a,#b failed_nums=#c
-    #
-    # "noop" is the (success=0, failed=0) case — the API neither added nor
-    # rejected anything, typically because every requested child was already
-    # linked to this parent. Treat as a non-success so the wrapper's `ok`
-    # doesn't claim a link was made. See round-3 review finding #2.
+    # We still classify the outcome here for the exit-code contract that
+    # scripted callers (humans + CI) rely on: any non-"ok" outcome exits
+    # non-zero so `set -e` flags it.
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -3432,11 +3427,6 @@ Example: zh subissue add 42 100 101"
     else
         outcome="ok"
     fi
-    echo "RESULT:add outcome=${outcome} success=${success_count} failed=${failed_count} added=${added_nums_csv} failed_nums=${failed_nums_csv}"
-
-    # Exit non-zero on partial, fail, or noop so MCP / scripted callers all
-    # notice. The wrapper additionally cross-checks outcome=="ok", but the
-    # exit code is the first signal a `set -e` caller sees.
     if [[ "$outcome" != "ok" ]]; then
         exit 1
     fi
@@ -3633,13 +3623,10 @@ This is unexpected after pre-flight validation succeeded; check the parent
 state with 'zh subissue list ${stripped_parent}'."
     fi
 
-    # Machine-readable summary for MCP consumers (stable format). CSV values
-    # are space-free (round-3 finding #1). "noop" surfaces the (0/0) case so
-    # MCP doesn't classify a no-op as a successful removal — see round-3
-    # finding #2.
-    #
-    #   RESULT:remove outcome=ok|partial|fail|noop success=N failed=N \
-    #       removed=#a,#b failed_nums=#c
+    # v1.6.0 removed the `RESULT:remove` machine-summary line. The sole
+    # consumer (the MCP server) now reads successCount / failedIssues
+    # directly from the GraphQL response. Exit-code contract preserved
+    # for scripted callers.
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -3650,9 +3637,6 @@ state with 'zh subissue list ${stripped_parent}'."
     else
         outcome="ok"
     fi
-    echo "RESULT:remove outcome=${outcome} success=${success_count} failed=${failed_count} removed=${removed_nums_csv} failed_nums=${failed_nums_csv}"
-
-    # Exit non-zero on partial, fail, or noop (same rationale as cmd_subissue_add).
     if [[ "$outcome" != "ok" ]]; then
         exit 1
     fi
@@ -3887,34 +3871,16 @@ zh_subissue_fetch_ids_only() {
 }
 
 cmd_subissue_list() {
-    # Two output modes:
+    # Human-formatted table listing of a parent's sub-issues.
     #
-    #   default — human-formatted table (the historical behaviour).
-    #   --machine — TSV stream of untruncated, separator-safe rows preceded by
-    #               a HEADER line and a single CHILD line per child. This is
-    #               what the MCP server consumes so it doesn't have to parse
-    #               the truncated visual rows. Stable contract; see the
-    #               format spec below.
-    local machine_mode=false
-    local parent_num=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --machine)
-                machine_mode=true
-                shift
-                ;;
-            *)
-                if [[ -z "$parent_num" ]]; then
-                    parent_num="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
+    # v1.6.0 removed the `--machine` TSV mode. The sole consumer was the
+    # MCP server, which now talks to ZenHub's GraphQL API directly from
+    # Python (see zh_graphql_ops.list_sub_issues). Bash stays focused on
+    # the human-facing rendering.
+    local parent_num="${1:-}"
 
     if [[ -z "$parent_num" ]]; then
-        error "Usage: zh subissue list [--machine] <parent#>
+        error "Usage: zh subissue list <parent#>
 Example: zh subissue list 42"
     fi
 
@@ -3945,54 +3911,6 @@ Example: zh subissue list 42"
     parent_title=$(echo "$children_json" | jq -r '.parentTitle')
     child_count=$(echo "$children_json" | jq -r '.totalCount // 0')
     fetched_count=$(echo "$children_json" | jq -r '.nodes | length')
-
-    # ---- Machine-mode output ----
-    #
-    # Format (TAB-separated, one record per line; no decoration):
-    #
-    #   HEADER<TAB>parent_number<TAB>parent_title<TAB>total_count<TAB>fetched_count
-    #   CHILD<TAB>number<TAB>state<TAB>pipeline<TAB>assignees_csv<TAB>title<TAB>owner<TAB>repo
-    #   ...
-    #
-    # Notes:
-    #   - Title and pipeline are NOT truncated.
-    #   - State is the literal "OPEN" or "CLOSED" from the API.
-    #   - assignees_csv is comma-separated logins; the literal "unassigned"
-    #     when empty.
-    #   - pipeline is "—" when unset.
-    #   - owner/repo are the repository the child issue lives in (matters in
-    #     multi-repo workspaces). When that doesn't match the cwd repo, the
-    #     child can't be operated on via this CLI from this checkout.
-    #   - U+2502 ("│") may appear in any text field; consumers MUST NOT
-    #     interpret it as a separator. The TAB-delimited layout is stable.
-    if [[ "$machine_mode" == "true" ]]; then
-        # Route the HEADER line through jq's @tsv too, not just the CHILD
-        # rows. A parent title containing a TAB or newline would otherwise
-        # shift the HEADER columns and the MCP parser would silently
-        # mis-attribute total_count / fetched_count (round-3 finding #4).
-        # @tsv escapes tabs/newlines/CRs/backslashes consistently in both
-        # streams so the parser can rely on the same rules everywhere.
-        echo "$children_json" | jq -r --arg parent_num "$parent_num" \
-            --argjson total "$child_count" --argjson fetched "$fetched_count" \
-            '["HEADER", $parent_num, (.parentTitle // ""), ($total|tostring), ($fetched|tostring)] | @tsv'
-
-        if [[ "$fetched_count" -gt 0 ]]; then
-            echo "$children_json" | jq -r '.nodes[] |
-                [
-                    "CHILD",
-                    (.number|tostring),
-                    .state,
-                    (.pipelineIssue.pipeline.name // "—"),
-                    ([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end),
-                    (.title // ""),
-                    (.repository.ownerName // ""),
-                    (.repository.name // "")
-                ] | @tsv'
-        fi
-        return
-    fi
-
-    # ---- Human-mode output (unchanged surface) ----
 
     echo ""
     echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
@@ -4192,15 +4110,8 @@ Use 'zh subissue add <parent#> ${child_num}' first."
                 # Only child — there is nothing to reorder against. Skip the
                 # mutation entirely rather than firing a vacuous reorder
                 # whose ✓ output would suggest something happened.
-                #
-                # Emit a RESULT:reorder noop line so the MCP wrapper can
-                # distinguish "skipped, nothing to do" from a successful
-                # reorder — without it the wrapper sees r["ok"]=true and
-                # an empty raw and reports a successful reorder. See
-                # round-3 review finding #3.
                 echo ""
                 warn "#${child_num} is the only sub-issue of #${parent_num} — nothing to reorder."
-                echo "RESULT:reorder outcome=noop child=#${child_num} parent=#${parent_num} position=top"
                 exit 1
             fi
             before_id="\"${first_sib_id}\""
@@ -4214,7 +4125,6 @@ Use 'zh subissue add <parent#> ${child_num}' first."
             if [[ -z "$last_sib_id" ]]; then
                 echo ""
                 warn "#${child_num} is the only sub-issue of #${parent_num} — nothing to reorder."
-                echo "RESULT:reorder outcome=noop child=#${child_num} parent=#${parent_num} position=bottom"
                 exit 1
             fi
             after_id="\"${last_sib_id}\""
@@ -4302,21 +4212,12 @@ be linked to this parent. Use 'zh subissue list ${parent_num}' to verify."
     if [[ "$ok" != "true" ]]; then
         local gh_errors
         gh_errors=$(echo "$response" | jq -c '.data.reprioritizeSubIssue.githubErrors // null')
-        # Emit a RESULT line before erroring out so MCP / scripted callers
-        # can distinguish API-rejection from other failure modes. The
-        # subsequent `error` call will exit non-zero anyway.
-        echo "RESULT:reorder outcome=fail child=#${child_num} parent=#${parent_num} position=${position_desc// /_}"
         error "Failed to reorder sub-issue #${child_num} (githubErrors: ${gh_errors})"
     fi
 
     echo ""
     success "Reordered sub-issue #${child_num}: ${child_title}"
     echo -e "  Now at ${CYAN}${position_desc}${NC} under parent ${GREEN}#${parent_num}${NC}"
-
-    # Machine-readable summary line for MCP consumers (round-3 finding #3).
-    # Stable format; `position` is space-collapsed because the RESULT-line
-    # parser tokenises on " ".
-    echo "RESULT:reorder outcome=ok child=#${child_num} parent=#${parent_num} position=${position_desc// /_}"
 }
 
 cmd_subissue() {
