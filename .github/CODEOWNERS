@@ -1,0 +1,29 @@
+# CODEOWNERS — require maintainer review for sensitive paths.
+#
+# Any change under .github/ (CI workflows, this file) or to the project's
+# core source / packaging files must be reviewed by a code owner before it
+# can merge, when branch protection has "Require review from Code Owners"
+# enabled.
+#
+# NOTE on forks: replace `@daniel-pittman` below with the new maintainer's
+# GitHub handle. For this rule to actually ENFORCE, that account must be a
+# DIRECT collaborator on the repository (or a member of a team with direct
+# access). Permissions inherited only through an organization do NOT satisfy
+# CODEOWNERS enforcement — GitHub silently treats the owner as invalid and the
+# rule does not block.
+
+# Workflow and CI configuration — the most security-sensitive paths.
+/.github/         @daniel-pittman
+
+# Core source — the bash CLI, the MCP server, the similarity engine.
+# Changes to any of these can affect runtime behaviour or surface secrets.
+/zh               @daniel-pittman
+/mcp_server.py    @daniel-pittman
+/similarity.py    @daniel-pittman
+
+# Release versioning. A `VERSION` bump corresponds 1:1 with a release tag.
+/VERSION          @daniel-pittman
+
+# Bundled agent definition — the open-source canonical that anyone copying
+# this repo will adopt. Personal-info-leakage discipline matters here.
+/agents/          @daniel-pittman
