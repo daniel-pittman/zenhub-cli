@@ -3364,11 +3364,27 @@ cmd_subissue_remove() {
         error "Usage: zh subissue remove <parent#> <child#> [<child#> ...]
 Example: zh subissue remove 42 100
 
-Note: the parent argument is used for messaging / pre-check; the underlying
-mutation unlinks each child from whatever parent it currently has."
+Each named child must currently be a sub-issue of <parent#>. The
+underlying removeSubIssues mutation only takes child IDs (it unlinks each
+from its actual parent), so we cross-check parents before firing to catch
+mis-typed parent numbers — otherwise 'remove 9999 100' would happily
+unlink #100 from its real parent while reporting 'removed from #9999'."
     fi
 
     local child_nums=("$@")
+    local stripped_parent="${parent_num#\#}"
+
+    # Argument-format validation BEFORE any network or git lookup, so typos
+    # surface immediately regardless of cwd.
+    if ! [[ "$stripped_parent" =~ ^[0-9]+$ ]]; then
+        error "Invalid parent issue number: ${parent_num}"
+    fi
+    for raw_num in "${child_nums[@]}"; do
+        local stripped="${raw_num#\#}"
+        if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${raw_num}"
+        fi
+    done
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -3376,21 +3392,66 @@ mutation unlinks each child from whatever parent it currently has."
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
-    # Verify the parent exists as a pre-flight sanity check. The API's
-    # removeSubIssues mutation doesn't actually need a parent ID (each child
-    # carries its own parent), but resolving the user-provided parent number
-    # here catches typos like `zh subissue remove 9999 100` before we try to
-    # unlink anything. Discard the resolved ID — it isn't used in the
-    # mutation payload.
-    zh_resolve_issue_id "$repo_id" "$parent_num" > /dev/null
+    # For each named child, fetch its current parent and confirm it matches
+    # the user-supplied parent number. We do this in one query per child
+    # rather than batching because (a) the schema doesn't expose a
+    # "issuesByInfo" multi-lookup, and (b) failing fast on the first mismatch
+    # is the right UX — the user typed the wrong number; finishing the loop
+    # to find more failures isn't useful.
+    local child_id_list="[]"
+    local mismatches=""
+    for raw_num in "${child_nums[@]}"; do
+        local stripped="${raw_num#\#}"
 
-    info "Removing ${#child_nums[@]} sub-issue(s) from parent #${parent_num#\#}..."
+        local lookup_query='
+        query($repoId: ID!, $issueNumber: Int!) {
+            issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+                id
+                parentIssue {
+                    number
+                }
+            }
+        }'
 
-    local child_ids_json
-    child_ids_json=$(zh_resolve_issue_ids "$repo_id" "${child_nums[@]}")
+        local lookup_vars
+        lookup_vars=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
+            '{repoId: $repo_id, issueNumber: $n}')
+
+        local lookup_response
+        lookup_response=$(zh_graphql "$lookup_query" "$lookup_vars")
+
+        local child_id actual_parent
+        child_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.id // empty')
+        actual_parent=$(echo "$lookup_response" | jq -r '.data.issueByInfo.parentIssue.number // empty')
+
+        if [[ -z "$child_id" ]]; then
+            error "Issue #${stripped} not found in this repository"
+        fi
+
+        if [[ -z "$actual_parent" ]]; then
+            mismatches+="  #${stripped}: has no parent (not a sub-issue)
+"
+        elif [[ "$actual_parent" != "$stripped_parent" ]]; then
+            mismatches+="  #${stripped}: actual parent is #${actual_parent}, not #${stripped_parent}
+"
+        else
+            child_id_list=$(echo "$child_id_list" | jq --arg id "$child_id" '. + [$id]')
+        fi
+    done
+
+    if [[ -n "$mismatches" ]]; then
+        # Trailing newline already in mismatches; trim it for the error frame.
+        error "Cannot remove — one or more children are not sub-issues of #${stripped_parent}:
+${mismatches%$'\n'}
+
+Use 'zh issue <N>' or 'zh subissue list ${stripped_parent}' to verify the
+parent relationship before retrying."
+    fi
+
+    info "Removing ${#child_nums[@]} sub-issue(s) from parent #${stripped_parent}..."
 
     local mutation_vars
-    mutation_vars=$(jq -n --argjson child_ids "$child_ids_json" \
+    mutation_vars=$(jq -n --argjson child_ids "$child_id_list" \
         '{input: {childIssueIds: $child_ids}}')
 
     local mutation='
@@ -3415,7 +3476,7 @@ mutation unlinks each child from whatever parent it currently has."
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Removed ${success_count} sub-issue(s) from #${parent_num#\#}: ${summary}"
+        success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${summary}"
     fi
     if [[ "$failed_count" -gt 0 ]]; then
         local failed_json
@@ -3423,7 +3484,13 @@ mutation unlinks each child from whatever parent it currently has."
         warn "${failed_count} failed: ${failed_json}"
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
-        warn "No sub-issues removed — child(ren) were not linked to a parent"
+        # We pre-validated every child belongs to this parent, so a zero
+        # successCount at this point would be an API-side oddity (e.g. a race
+        # where someone unlinked the child between our validation and the
+        # mutation). Surface it explicitly rather than claiming "no-op".
+        warn "No sub-issues removed — response showed successCount=0 with no failures.
+This is unexpected after pre-flight validation succeeded; check the parent
+state with 'zh subissue list ${stripped_parent}'."
     fi
 }
 
