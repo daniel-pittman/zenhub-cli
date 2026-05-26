@@ -193,9 +193,14 @@ def check_graphql_errors(response: dict, *, context: str = "") -> None:
 # =============================================================================
 
 _GH_URL_RE = re.compile(
+    # Repo names on GitHub can contain dots ("docs.github.io",
+    # "my.tool", "internal.docs"). Match anything that isn't a `/`,
+    # then strip an optional trailing `.git` and trailing `/`. A
+    # non-greedy `[^/]+?` ensures the optional `\.git` suffix is
+    # claimed at the end rather than absorbed into the name.
     r"(?:git@github\.com:|https?://github\.com/)"
     r"(?P<owner>[^/]+)/"
-    r"(?P<repo>[^/.]+?)(?:\.git)?/?$"
+    r"(?P<repo>[^/]+?)(?:\.git)?/?$"
 )
 
 
@@ -311,10 +316,11 @@ def get_zenhub_repo_id(
 
 
 _WORKSPACE_QUERY = """
-query($ghIds: [Int!]!) {
+query($ghIds: [Int!]!, $after: String) {
   repositoriesByGhId(ghIds: $ghIds) {
     id
-    workspacesConnection(first: 50) {
+    workspacesConnection(first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
       nodes {
         id
         name
@@ -323,6 +329,64 @@ query($ghIds: [Int!]!) {
   }
 }
 """
+
+# Hard cap on workspace-list pagination iterations. 50 pages × 50 nodes
+# = 2,500 workspaces — far past any plausible per-repo count, so a cap
+# this size only ever fires on a stuck cursor.
+_WORKSPACE_PAGINATION_CAP = 50
+
+
+def list_workspaces(
+    owner_repo: str,
+    *,
+    token: str | None = None,
+    gh_token: str | None = None,
+) -> list[dict]:
+    """Return every workspace this repo is connected to.
+
+    Walks `workspacesConnection` pagination until `hasNextPage=false`,
+    with the same stuck-cursor + iteration-cap defenses we use for
+    sub-issue listings. Enterprise repos connected to >50 workspaces
+    would silently truncate without this.
+    """
+    gh_id = get_gh_repo_id(owner_repo, gh_token=gh_token)
+    cursor: str | None = None
+    last_cursor: str | None = None
+    iterations = 0
+    out: list[dict] = []
+
+    while True:
+        iterations += 1
+        if iterations > _WORKSPACE_PAGINATION_CAP:
+            # Defensive bail; should never fire in practice.
+            break
+        resp = graphql_request(
+            _WORKSPACE_QUERY,
+            {"ghIds": [gh_id], "after": cursor},
+            token=token,
+        )
+        check_graphql_errors(resp, context="workspacesConnection")
+        repos = (resp.get("data") or {}).get("repositoriesByGhId") or []
+        if not repos:
+            raise ZhApiError(
+                f"No ZenHub repository found for GitHub {owner_repo}"
+            )
+        conn = repos[0].get("workspacesConnection") or {}
+        for n in conn.get("nodes") or []:
+            out.append(n)
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        end_cursor = page_info.get("endCursor")
+        # Stuck-cursor defense: server claims hasNextPage but returns no
+        # cursor, or the same cursor as last time. Either is bad enough
+        # to bail rather than spin.
+        if not end_cursor or end_cursor == last_cursor:
+            break
+        last_cursor = end_cursor
+        cursor = end_cursor
+
+    return out
 
 
 def get_workspace_id(
@@ -334,26 +398,17 @@ def get_workspace_id(
 ) -> str:
     """Resolve the ZenHub workspace ID for a repo.
 
-    If `workspace_name` is provided (case-insensitive match), the matching
-    workspace is returned; otherwise the first workspace is used (mirrors
-    bash behaviour).
+    If `workspace_name` is provided (case-insensitive match), the
+    matching workspace is returned; otherwise the first workspace wins
+    (mirrors bash behaviour).
+
+    Walks every page of `workspacesConnection` so a workspace beyond
+    position 50 still resolves.
 
     Raises ZhApiError if no workspace is found or the named workspace
     doesn't exist on this repo.
     """
-    gh_id = get_gh_repo_id(owner_repo, gh_token=gh_token)
-    resp = graphql_request(
-        _WORKSPACE_QUERY, {"ghIds": [gh_id]}, token=token
-    )
-    check_graphql_errors(resp, context="workspacesConnection")
-    repos = (resp.get("data") or {}).get("repositoriesByGhId") or []
-    if not repos:
-        raise ZhApiError(
-            f"No ZenHub repository found for GitHub {owner_repo}"
-        )
-    nodes = (
-        (repos[0].get("workspacesConnection") or {}).get("nodes") or []
-    )
+    nodes = list_workspaces(owner_repo, token=token, gh_token=gh_token)
     if not nodes:
         raise ZhApiError(f"No workspace found for {owner_repo}")
 

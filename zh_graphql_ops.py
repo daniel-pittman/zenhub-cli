@@ -93,6 +93,7 @@ query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!, $after: String) {
         endCursor
       }
       nodes {
+        id
         number
         title
         state
@@ -101,6 +102,9 @@ query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!, $after: String) {
         }
         pipelineIssue(workspaceId: $workspaceId) {
           pipeline { name }
+        }
+        pipelineIssues {
+          nodes { pipeline { name } }
         }
         repository {
           ownerName
@@ -125,10 +129,18 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
             total_count: int — API's zenhubChildIssues.totalCount
             fetched_count: int — what we actually walked
             children: list[dict] with
+                id: str — workspace-global GraphQL gid
                 number: int
                 title: str (untruncated)
                 state: "OPEN" | "CLOSED"
-                pipeline: str | None
+                pipeline: str | None — pipeline name for the child.
+                    Sourced from `pipelineIssue(workspaceId=ctx.workspace_id)`
+                    first; falls back to `pipelineIssues.nodes[0]` for
+                    children that live in a different workspace.
+                pipeline_workspace_scoped: bool — True if `pipeline` is
+                    from the ctx workspace (authoritative for sprint
+                    planning), False if from the fallback (informational
+                    only — child lives in another workspace).
                 assignees: list[str]
                 repository: {"owner": str, "name": str}
             pagination_warning: str | None — set if we bailed defensively
@@ -197,17 +209,43 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
                 for a in ((node.get("assignees") or {}).get("nodes") or [])
                 if a.get("login")
             ]
+            # Review finding #7: `pipelineIssue(workspaceId:...)` returns
+            # null when the child lives in a workspace OTHER than the
+            # one ctx.workspace_id targets (typical in cross-repo
+            # workspaces). Fall back to `pipelineIssues.nodes[0]` (no
+            # workspace arg) so cross-workspace children still surface
+            # *a* pipeline name — flagged via `pipeline_workspace_scoped`
+            # so callers know whether the value is for the current
+            # workspace or some other one.
             pipeline_name = None
+            pipeline_workspace_scoped = False
             pi = node.get("pipelineIssue") or None
             if pi:
                 pl = pi.get("pipeline") or {}
                 pipeline_name = pl.get("name") or None
+                if pipeline_name:
+                    pipeline_workspace_scoped = True
+            if not pipeline_name:
+                fallback_nodes = (
+                    (node.get("pipelineIssues") or {}).get("nodes") or []
+                )
+                if fallback_nodes:
+                    fp = (fallback_nodes[0] or {}).get("pipeline") or {}
+                    pipeline_name = fp.get("name") or None
+
             repo = node.get("repository") or {}
             children.append({
+                # `id` is the workspace-global GraphQL gid. Mutations
+                # (e.g. reprioritizeSubIssue's afterId/beforeId) take
+                # gids, so emitting it here eliminates a second
+                # round-trip via get_issue_by_info when anchoring.
+                # Review finding #2(a).
+                "id": node.get("id"),
                 "number": node.get("number"),
                 "title": node.get("title") or "",
                 "state": node.get("state") or "UNKNOWN",
                 "pipeline": pipeline_name,
+                "pipeline_workspace_scoped": pipeline_workspace_scoped,
                 "assignees": assignees,
                 "repository": {
                     "owner": repo.get("ownerName") or "",
@@ -220,10 +258,19 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
         end_cursor = page_info.get("endCursor")
         if not has_next:
             break
-        if end_cursor and end_cursor == last_cursor:
+        # Stuck-cursor defense. Three bad cases all collapse to "bail":
+        #   - end_cursor is None despite hasNextPage=true (server bug;
+        #     would loop forever with cursor=None re-requesting page 1)
+        #   - end_cursor is the empty string (same defect)
+        #   - end_cursor equals the cursor we just used (cursor isn't
+        #     advancing; server returning the same page)
+        # The first two cases used to be silently bypassed by the
+        # `if end_cursor and ...` short-circuit — they now trip the
+        # warning explicitly. Review finding #11.
+        if not end_cursor or end_cursor == last_cursor:
             pagination_warning = (
-                "Pagination cursor unchanged across requests — server "
-                "likely mis-reporting hasNextPage. Bailing."
+                "Pagination cursor not advancing across requests — "
+                "server likely mis-reporting hasNextPage. Bailing."
             )
             break
         last_cursor = end_cursor
@@ -403,11 +450,26 @@ def add_sub_issues(
     failed_numbers = {
         fi["number"] for fi in failed_serialized if fi.get("number") is not None
     }
-    succeeded = [n for n in child_numbers if n not in failed_numbers]
-    # If the API didn't fail anything but also didn't succeed on anything,
-    # we can't claim those were "succeeded" — keep both sides empty.
-    if success_count == 0:
+    inferred_succeeded = [n for n in child_numbers if n not in failed_numbers]
+    # Review finding #3: the API exposes a count but not an array of
+    # succeeded numbers. We INFER `succeeded` as "input minus failed",
+    # but that inference is only safe when the inferred set's length
+    # equals success_count. When it doesn't (success_count < inferred,
+    # e.g. successCount=1 with no failedIssues but 3 inputs), we don't
+    # know which inputs actually landed — return an empty `succeeded`
+    # set with a partial_success_warning rather than silently claiming
+    # all 3.
+    partial_success_warning: str | None = None
+    if success_count == len(inferred_succeeded):
+        succeeded = inferred_succeeded
+    else:
         succeeded = []
+        partial_success_warning = (
+            f"API returned successCount={success_count} but "
+            f"failedIssues={failed_count} for {len(child_numbers)} inputs; "
+            "cannot identify which inputs succeeded. Re-list the parent's "
+            "children to determine actual state."
+        )
 
     outcome = _classify_outcome(success_count, failed_count)
     return {
@@ -419,6 +481,7 @@ def add_sub_issues(
         "succeeded": succeeded,
         "failed": failed_serialized,
         "github_errors": github_errors,
+        "partial_success_warning": partial_success_warning,
         "error": None,
     }
 
@@ -572,9 +635,20 @@ def remove_sub_issues(
     failed_numbers = {
         fi["number"] for fi in failed_serialized if fi.get("number") is not None
     }
-    succeeded = [n for n in child_numbers if n not in failed_numbers]
-    if success_count == 0:
+    inferred_succeeded = [n for n in child_numbers if n not in failed_numbers]
+    # Same review-finding-#3 logic as add_sub_issues: only trust the
+    # inferred set when its length matches successCount.
+    partial_success_warning: str | None = None
+    if success_count == len(inferred_succeeded):
+        succeeded = inferred_succeeded
+    else:
         succeeded = []
+        partial_success_warning = (
+            f"API returned successCount={success_count} but "
+            f"failedIssues={failed_count} for {len(child_numbers)} inputs; "
+            "cannot identify which inputs succeeded. Re-list the parent's "
+            "children to determine actual state."
+        )
 
     outcome = _classify_outcome(success_count, failed_count)
     return {
@@ -586,6 +660,7 @@ def remove_sub_issues(
         "succeeded": succeeded,
         "failed": failed_serialized,
         "github_errors": github_errors,
+        "partial_success_warning": partial_success_warning,
         "error": None,
     }
 
@@ -648,6 +723,13 @@ def reorder_sub_issue(
         raise ZhApiError(
             f"child_number must be a positive int (got {child_number!r})"
         )
+    # Review finding #9: self-anchoring is meaningless (reorder relative
+    # to yourself is a no-op or an API rejection). Catch it before
+    # firing the mutation.
+    if pos in {"after", "before"} and sibling_number == child_number:
+        raise ZhApiError(
+            f"cannot anchor #{child_number} {pos} itself (self-anchor)"
+        )
     child_issue = get_issue_by_info(ctx, child_number)
     if not child_issue:
         return {
@@ -689,10 +771,14 @@ def reorder_sub_issue(
     before_id: str | None = None
     position_desc = pos
 
-    def _find_sibling_id(num: int) -> str | None:
-        # Cross-repo finding #5: filter by (number, owner, repo)
-        # case-insensitively to avoid colliding with same-number issues
-        # in a different repo of this workspace.
+    # Review finding #2(a)+(b): use the sibling's `id` (gid) from the
+    # listing directly. The id is workspace-global, so we don't need to
+    # filter by repository for top / bottom — and we'd be wrong to do
+    # so, since "the first sub-issue of this parent" is a well-defined
+    # concept across repos. For after / before the user supplied an
+    # issue NUMBER (ambiguous across repos), so we still filter by the
+    # cwd's repo to disambiguate.
+    def _find_sibling_id_by_number_in_repo(num: int) -> str | None:
         for s in siblings:
             if s.get("number") != num:
                 continue
@@ -701,26 +787,14 @@ def reorder_sub_issue(
                 {"ownerName": rep.get("owner"), "name": rep.get("name")},
                 ctx.owner_repo,
             ):
-                # We need the GraphQL id of the sibling; we don't have it
-                # from list_sub_issues. Fetch directly.
-                got = get_issue_by_info(ctx, num)
-                return (got or {}).get("id")
+                return s.get("id")
         return None
 
     if pos == "top":
-        # First sibling other than self
+        # First sibling whose id isn't ours (ids are workspace-global,
+        # so we don't need a repo filter here).
         other = next(
-            (
-                s for s in siblings
-                if s.get("number") != child_number
-                or not repos_match(
-                    {
-                        "ownerName": (s.get("repository") or {}).get("owner"),
-                        "name": (s.get("repository") or {}).get("name"),
-                    },
-                    ctx.owner_repo,
-                )
-            ),
+            (s for s in siblings if s.get("id") and s.get("id") != child_id),
             None,
         )
         if other is None:
@@ -735,21 +809,14 @@ def reorder_sub_issue(
                     f"#{parent_number} — nothing to reorder against"
                 ),
             }
-        before_id = _find_sibling_id(other.get("number"))
+        before_id = other.get("id")
         position_desc = "top"
     elif pos == "bottom":
         last_other = None
         for s in reversed(siblings):
-            if s.get("number") == child_number and repos_match(
-                {
-                    "ownerName": (s.get("repository") or {}).get("owner"),
-                    "name": (s.get("repository") or {}).get("name"),
-                },
-                ctx.owner_repo,
-            ):
-                continue
-            last_other = s
-            break
+            if s.get("id") and s.get("id") != child_id:
+                last_other = s
+                break
         if last_other is None:
             return {
                 "ok": False,
@@ -762,10 +829,10 @@ def reorder_sub_issue(
                     f"#{parent_number} — nothing to reorder against"
                 ),
             }
-        after_id = _find_sibling_id(last_other.get("number"))
+        after_id = last_other.get("id")
         position_desc = "bottom"
     elif pos == "after":
-        sib_id = _find_sibling_id(sibling_number)
+        sib_id = _find_sibling_id_by_number_in_repo(sibling_number)
         if not sib_id:
             return {
                 "ok": False,
@@ -781,7 +848,7 @@ def reorder_sub_issue(
         after_id = sib_id
         position_desc = f"after #{sibling_number}"
     elif pos == "before":
-        sib_id = _find_sibling_id(sibling_number)
+        sib_id = _find_sibling_id_by_number_in_repo(sibling_number)
         if not sib_id:
             return {
                 "ok": False,
@@ -796,6 +863,24 @@ def reorder_sub_issue(
             }
         before_id = sib_id
         position_desc = f"before #{sibling_number}"
+
+    # Belt-and-suspenders: if we somehow got here with neither anchor
+    # set (a bug in the cases above), refuse to fire the mutation —
+    # reprioritizeSubIssue with both ids null would return success and
+    # leave the position unchanged, which is the silent-noop bug
+    # review finding #2 called out.
+    if after_id is None and before_id is None:
+        return {
+            "ok": False,
+            "child_number": child_number,
+            "parent_number": parent_number,
+            "position": position_desc,
+            "outcome": "fail",
+            "error": (
+                "Internal: no anchor resolved (both afterId and beforeId "
+                "are null). Refusing to fire a vacuous reorder."
+            ),
+        }
 
     resp = ctx.query(
         _REPRIORITIZE_SUB_ISSUE_MUTATION,
@@ -839,12 +924,13 @@ def reorder_sub_issue(
 # =============================================================================
 
 _SPRINTS_QUERY_OPEN = """
-query($workspaceId: ID!) {
+query($workspaceId: ID!, $after: String) {
   workspace(id: $workspaceId) {
     id
     name
     activeSprint { id name }
-    sprints(first: 50, filters: { state: { eq: OPEN } }) {
+    sprints(first: 50, after: $after, filters: { state: { eq: OPEN } }) {
+      pageInfo { hasNextPage endCursor }
       nodes {
         id
         name
@@ -861,12 +947,13 @@ query($workspaceId: ID!) {
 """
 
 _SPRINTS_QUERY_ALL = """
-query($workspaceId: ID!) {
+query($workspaceId: ID!, $after: String) {
   workspace(id: $workspaceId) {
     id
     name
     activeSprint { id name }
-    sprints(first: 50) {
+    sprints(first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
       nodes {
         id
         name
@@ -884,14 +971,16 @@ query($workspaceId: ID!) {
 
 
 def _serialize_sprint(node: dict, *, active_id: str | None) -> dict:
+    # Use 0.0 (not bare 0) as the points-not-set fallback so callers
+    # don't see int when the field is documented as float. Review #10.
     return {
         "id": node.get("id"),
         "name": node.get("name") or "",
         "state": node.get("state") or "",
         "start_at": node.get("startAt") or None,
         "end_at": node.get("endAt") or None,
-        "completed_points": node.get("completedPoints") or 0,
-        "total_points": node.get("totalPoints") or 0,
+        "completed_points": node.get("completedPoints") or 0.0,
+        "total_points": node.get("totalPoints") or 0.0,
         "closed_issues_count": node.get("closedIssuesCount") or 0,
         "is_active": bool(active_id) and node.get("id") == active_id,
     }
@@ -899,6 +988,10 @@ def _serialize_sprint(node: dict, *, active_id: str | None) -> dict:
 
 def list_sprints(ctx: RepoContext, *, include_closed: bool = False) -> dict:
     """List sprints in the workspace.
+
+    Walks `sprints` pagination — workspaces with >50 sprints would
+    otherwise have older entries invisible to name resolution. Review
+    finding #5.
 
     Args:
         include_closed: when True, returns OPEN + CLOSED sprints. Defaults
@@ -912,23 +1005,68 @@ def list_sprints(ctx: RepoContext, *, include_closed: bool = False) -> dict:
             sprints: list[dict] — each {id, name, state, start_at, end_at,
                 completed_points, total_points, closed_issues_count,
                 is_active}
+            pagination_warning: str | None
     """
     query = _SPRINTS_QUERY_ALL if include_closed else _SPRINTS_QUERY_OPEN
-    resp = ctx.query(query, {"workspaceId": ctx.workspace_id})
-    check_graphql_errors(resp, context="list_sprints")
-    ws = (resp.get("data") or {}).get("workspace") or {}
-    active = ws.get("activeSprint") or {}
-    active_id = active.get("id")
-    nodes = ((ws.get("sprints") or {}).get("nodes")) or []
+    workspace_name = ""
+    active_id: str | None = None
+    nodes: list[dict] = []
+    cursor: str | None = None
+    last_cursor: str | None = None
+    iterations = 0
+    pagination_warning: str | None = None
+    first_page = True
+
+    while True:
+        iterations += 1
+        if iterations > MAX_PAGINATION_ITERATIONS:
+            pagination_warning = (
+                f"Sprint pagination iteration cap "
+                f"({MAX_PAGINATION_ITERATIONS}) exceeded — bailing"
+            )
+            break
+        resp = ctx.query(
+            query,
+            {"workspaceId": ctx.workspace_id, "after": cursor},
+        )
+        check_graphql_errors(resp, context="list_sprints")
+        ws = (resp.get("data") or {}).get("workspace") or {}
+        if first_page:
+            workspace_name = ws.get("name") or ""
+            active = ws.get("activeSprint") or {}
+            active_id = active.get("id")
+            first_page = False
+        conn = ws.get("sprints") or {}
+        for n in conn.get("nodes") or []:
+            nodes.append(n)
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        end_cursor = page_info.get("endCursor")
+        if not end_cursor or end_cursor == last_cursor:
+            pagination_warning = (
+                "Sprint pagination cursor not advancing across requests "
+                "— server likely mis-reporting hasNextPage. Bailing."
+            )
+            break
+        last_cursor = end_cursor
+        cursor = end_cursor
+
     return {
         "ok": True,
-        "workspace_name": ws.get("name") or "",
+        "workspace_name": workspace_name,
         "active_sprint_id": active_id,
         "sprints": [_serialize_sprint(n, active_id=active_id) for n in nodes],
+        "pagination_warning": pagination_warning,
     }
 
 
-_SPRINT_DETAIL_QUERY = """
+# Sprint detail comes in two pieces — the sprint header (single page,
+# always one node) and its issues (paginated). Keeping them as separate
+# queries lets us walk only the issue connection without re-fetching
+# the header for every page.
+
+_SPRINT_HEADER_QUERY = """
 query($sprintId: ID!) {
   node(id: $sprintId) {
     ... on Sprint {
@@ -941,7 +1079,17 @@ query($sprintId: ID!) {
       completedPoints
       totalPoints
       closedIssuesCount
-      sprintIssues(first: 100) {
+    }
+  }
+}
+"""
+
+_SPRINT_ISSUES_PAGE_QUERY = """
+query($sprintId: ID!, $after: String) {
+  node(id: $sprintId) {
+    ... on Sprint {
+      sprintIssues(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
         nodes {
           issue {
             number
@@ -970,19 +1118,30 @@ def _find_sprint_id(
 
     Returns (sprint_id, sprint_name, error). Exactly one of sprint_id /
     error is non-None.
+
+    Walks paginated sprints (see list_sprints) so workspaces with >50
+    sprints can still resolve older names.
     """
+    want = (sprint_name or "").strip()
+    if not want:
+        # Empty-string lookups would otherwise match no sprint and dump
+        # the full list as "available". Refuse early. (Review note.)
+        return (
+            None,
+            None,
+            "Sprint name must be non-empty (or use 'current' / 'active')",
+        )
     listing = list_sprints(ctx, include_closed=True)
     sprints = listing.get("sprints") or []
     active_id = listing.get("active_sprint_id")
-    want = (sprint_name or "").strip()
     if want.lower() in {"current", "active"}:
         if not active_id:
             return None, None, "No active sprint in this workspace"
         for s in sprints:
             if s.get("id") == active_id:
                 return active_id, s.get("name"), None
-        # Active sprint may not appear in our 50 nodes (very unlikely);
-        # fall back to active id with empty name.
+        # Active sprint may not appear in our walked nodes (server
+        # quirk); fall back to active id with empty name.
         return active_id, "", None
     want_lc = want.lower()
     for s in sprints:
@@ -996,11 +1155,88 @@ def _find_sprint_id(
     )
 
 
+def _walk_sprint_issues(
+    ctx: RepoContext, sprint_id: str
+) -> tuple[list[dict], str | None]:
+    """Walk every page of a sprint's `sprintIssues` connection.
+
+    Returns (issue_dicts, pagination_warning). Each issue dict has the
+    shape used by `get_sprint_detail`'s `issues` list.
+    """
+    out: list[dict] = []
+    cursor: str | None = None
+    last_cursor: str | None = None
+    iterations = 0
+    pagination_warning: str | None = None
+
+    while True:
+        iterations += 1
+        if iterations > MAX_PAGINATION_ITERATIONS:
+            pagination_warning = (
+                f"Sprint-issues pagination iteration cap "
+                f"({MAX_PAGINATION_ITERATIONS}) exceeded — bailing"
+            )
+            break
+        resp = ctx.query(
+            _SPRINT_ISSUES_PAGE_QUERY,
+            {"sprintId": sprint_id, "after": cursor},
+        )
+        check_graphql_errors(resp, context="sprint_issues_page")
+        node = (resp.get("data") or {}).get("node") or {}
+        conn = node.get("sprintIssues") or {}
+        for wrapper in conn.get("nodes") or []:
+            issue = (wrapper or {}).get("issue") or {}
+            assignees = [
+                a.get("login")
+                for a in ((issue.get("assignees") or {}).get("nodes") or [])
+                if a.get("login")
+            ]
+            pipeline_nodes = (
+                ((issue.get("pipelineIssues") or {}).get("nodes")) or []
+            )
+            pipeline_name = None
+            if pipeline_nodes:
+                pl = pipeline_nodes[0].get("pipeline") or {}
+                pipeline_name = pl.get("name") or None
+            rep = issue.get("repository") or {}
+            est = issue.get("estimate") or {}
+            out.append({
+                "number": issue.get("number"),
+                "title": issue.get("title") or "",
+                "state": issue.get("state") or "UNKNOWN",
+                "html_url": issue.get("htmlUrl") or "",
+                "estimate": est.get("value"),
+                "assignees": assignees,
+                "pipeline": pipeline_name,
+                "repository": {
+                    "owner": rep.get("ownerName") or "",
+                    "name": rep.get("name") or "",
+                },
+            })
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        end_cursor = page_info.get("endCursor")
+        if not end_cursor or end_cursor == last_cursor:
+            pagination_warning = (
+                "Sprint-issues pagination cursor not advancing — server "
+                "likely mis-reporting hasNextPage. Bailing."
+            )
+            break
+        last_cursor = end_cursor
+        cursor = end_cursor
+
+    return out, pagination_warning
+
+
 def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
     """Get detail + issues for a sprint named `sprint_name`.
 
     `sprint_name` accepts the special strings "current" or "active" to
     target the workspace's active sprint.
+
+    Pagination: walks every page of `sprintIssues` so sprints with >100
+    issues are reported fully (review finding #4).
 
     Returns:
         dict with:
@@ -1017,6 +1253,7 @@ def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
             issue_count: int
             issues: list[dict] — each {number, title, state, html_url,
                 estimate, assignees, pipeline, repository}
+            pagination_warning: str | None
             error: str | None
     """
     sprint_id, actual_name, err = _find_sprint_id(ctx, sprint_name)
@@ -1028,52 +1265,22 @@ def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
             "state": None,
             "start_at": None,
             "end_at": None,
-            "completed_points": 0,
-            "total_points": 0,
+            "completed_points": 0.0,
+            "total_points": 0.0,
             "closed_issues_count": 0,
             "description": None,
             "issue_count": 0,
             "issues": [],
+            "pagination_warning": None,
             "error": err,
         }
 
-    resp = ctx.query(_SPRINT_DETAIL_QUERY, {"sprintId": sprint_id})
-    check_graphql_errors(resp, context="get_sprint_detail")
-    node = (resp.get("data") or {}).get("node") or {}
+    # Two queries: header (single page) + paginated sprintIssues walk.
+    header_resp = ctx.query(_SPRINT_HEADER_QUERY, {"sprintId": sprint_id})
+    check_graphql_errors(header_resp, context="sprint_header")
+    node = (header_resp.get("data") or {}).get("node") or {}
 
-    issues_raw = (
-        ((node.get("sprintIssues") or {}).get("nodes")) or []
-    )
-    issues: list[dict] = []
-    for wrapper in issues_raw:
-        issue = (wrapper or {}).get("issue") or {}
-        assignees = [
-            a.get("login")
-            for a in ((issue.get("assignees") or {}).get("nodes") or [])
-            if a.get("login")
-        ]
-        pipeline_nodes = (
-            ((issue.get("pipelineIssues") or {}).get("nodes")) or []
-        )
-        pipeline_name = None
-        if pipeline_nodes:
-            pl = pipeline_nodes[0].get("pipeline") or {}
-            pipeline_name = pl.get("name") or None
-        rep = issue.get("repository") or {}
-        est = issue.get("estimate") or {}
-        issues.append({
-            "number": issue.get("number"),
-            "title": issue.get("title") or "",
-            "state": issue.get("state") or "UNKNOWN",
-            "html_url": issue.get("htmlUrl") or "",
-            "estimate": est.get("value"),
-            "assignees": assignees,
-            "pipeline": pipeline_name,
-            "repository": {
-                "owner": rep.get("ownerName") or "",
-                "name": rep.get("name") or "",
-            },
-        })
+    issues, pagination_warning = _walk_sprint_issues(ctx, sprint_id)
 
     return {
         "ok": True,
@@ -1082,12 +1289,14 @@ def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
         "state": node.get("state") or None,
         "start_at": node.get("startAt") or None,
         "end_at": node.get("endAt") or None,
-        "completed_points": node.get("completedPoints") or 0,
-        "total_points": node.get("totalPoints") or 0,
+        # 0.0 fallback preserves float type (review #10).
+        "completed_points": node.get("completedPoints") or 0.0,
+        "total_points": node.get("totalPoints") or 0.0,
         "closed_issues_count": node.get("closedIssuesCount") or 0,
         "description": node.get("description") or None,
         "issue_count": len(issues),
         "issues": issues,
+        "pagination_warning": pagination_warning,
         "error": None,
     }
 

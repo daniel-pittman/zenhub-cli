@@ -169,8 +169,13 @@ def _resolve_cwd(repo_path: str = "") -> str:
 
 
 def _run_zh(args: list[str], *, cwd: str | None = None,
-            stdin: str | None = None) -> dict:
-    """Invoke zh as a subprocess; return structured result."""
+            stdin: str | None = None, timeout: float = 60.0) -> dict:
+    """Invoke zh as a subprocess; return structured result.
+
+    `timeout` is a soft cap on the whole invocation. ZenHub GraphQL
+    queries typically return in < 5s; we cap at 60s to avoid the MCP
+    server hanging if the API is unresponsive — review note.
+    """
     if not ZH_BIN.exists():
         return {
             "ok": False,
@@ -179,13 +184,26 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
             "stderr": f"zh binary not found at {ZH_BIN}",
             "stdout_plain": "",
         }
-    result = subprocess.run(
-        [str(ZH_BIN)] + args,
-        capture_output=True,
-        text=True,
-        input=stdin,
-        cwd=cwd,
-    )
+    try:
+        result = subprocess.run(
+            [str(ZH_BIN)] + args,
+            capture_output=True,
+            text=True,
+            input=stdin,
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        return {
+            "ok": False,
+            "exit_code": -1,
+            "stdout": e.stdout or "",
+            "stderr": (
+                f"zh subprocess timed out after {timeout}s "
+                f"(args={args!r})"
+            ),
+            "stdout_plain": _ANSI_RE.sub("", e.stdout or ""),
+        }
     return {
         "ok": result.returncode == 0,
         "exit_code": result.returncode,
@@ -1169,8 +1187,13 @@ def subissue_list(parent_number: int, repo_path: str = "") -> dict:
     """
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
+        # Review finding #8: `parent_state` was missing from the early-
+        # error return shape while the docstring + other returns all
+        # include it. Callers reading `result["parent_state"]` would
+        # KeyError when context resolution fails (no git remote, etc.).
         return {**err, "parent_number": parent_number,
-                "parent_title": "", "total_count": 0, "fetched_count": 0,
+                "parent_title": "", "parent_state": None,
+                "total_count": 0, "fetched_count": 0,
                 "children": [], "pagination_warning": None}
     from zh_graphql_ops import list_sub_issues  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
@@ -1241,7 +1264,8 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     if err is not None:
         return {**err, "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
-                "succeeded": [], "failed": [], "github_errors": None}
+                "succeeded": [], "failed": [], "github_errors": None,
+                "partial_success_warning": None}
     from zh_graphql_ops import add_sub_issues  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1256,6 +1280,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "succeeded": [],
             "failed": [],
             "github_errors": None,
+            "partial_success_warning": None,
             "stderr": str(e),
         }
     return {
@@ -1267,6 +1292,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
         "github_errors": result.get("github_errors"),
+        "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
     }
 
@@ -1308,7 +1334,8 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     if err is not None:
         return {**err, "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
-                "succeeded": [], "failed": [], "github_errors": None}
+                "succeeded": [], "failed": [], "github_errors": None,
+                "partial_success_warning": None}
     from zh_graphql_ops import remove_sub_issues  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1323,6 +1350,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             "succeeded": [],
             "failed": [],
             "github_errors": None,
+            "partial_success_warning": None,
             "stderr": str(e),
         }
     return {
@@ -1334,6 +1362,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
         "github_errors": result.get("github_errors"),
+        "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
     }
 
@@ -1446,7 +1475,7 @@ def sprint_list(repo_path: str = "", include_closed: bool = False) -> dict:
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "workspace_name": "", "active_sprint_id": None,
-                "sprints": []}
+                "sprints": [], "pagination_warning": None}
     from zh_graphql_ops import list_sprints  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1457,6 +1486,7 @@ def sprint_list(repo_path: str = "", include_closed: bool = False) -> dict:
             "workspace_name": "",
             "active_sprint_id": None,
             "sprints": [],
+            "pagination_warning": None,
             "stderr": str(e),
         }
     return {
@@ -1464,6 +1494,7 @@ def sprint_list(repo_path: str = "", include_closed: bool = False) -> dict:
         "workspace_name": result.get("workspace_name", ""),
         "active_sprint_id": result.get("active_sprint_id"),
         "sprints": result.get("sprints", []),
+        "pagination_warning": result.get("pagination_warning"),
         "stderr": "",
     }
 
@@ -1509,9 +1540,10 @@ def sprint_show(sprint_name: str, repo_path: str = "") -> dict:
     if err is not None:
         return {**err, "sprint_id": None, "sprint_name": sprint_name,
                 "state": None, "start_at": None, "end_at": None,
-                "completed_points": 0, "total_points": 0,
+                "completed_points": 0.0, "total_points": 0.0,
                 "closed_issues_count": 0, "description": None,
-                "issue_count": 0, "issues": []}
+                "issue_count": 0, "issues": [],
+                "pagination_warning": None}
     from zh_graphql_ops import get_sprint_detail  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1524,12 +1556,13 @@ def sprint_show(sprint_name: str, repo_path: str = "") -> dict:
             "state": None,
             "start_at": None,
             "end_at": None,
-            "completed_points": 0,
-            "total_points": 0,
+            "completed_points": 0.0,
+            "total_points": 0.0,
             "closed_issues_count": 0,
             "description": None,
             "issue_count": 0,
             "issues": [],
+            "pagination_warning": None,
             "stderr": str(e),
         }
     return {
@@ -1539,12 +1572,13 @@ def sprint_show(sprint_name: str, repo_path: str = "") -> dict:
         "state": result.get("state"),
         "start_at": result.get("start_at"),
         "end_at": result.get("end_at"),
-        "completed_points": result.get("completed_points", 0),
-        "total_points": result.get("total_points", 0),
+        "completed_points": result.get("completed_points", 0.0),
+        "total_points": result.get("total_points", 0.0),
         "closed_issues_count": result.get("closed_issues_count", 0),
         "description": result.get("description"),
         "issue_count": result.get("issue_count", 0),
         "issues": result.get("issues", []),
+        "pagination_warning": result.get("pagination_warning"),
         "stderr": result.get("error") or "",
     }
 

@@ -85,3 +85,117 @@ def test_owner_repo_url_regex():
         m = zh_api._GH_URL_RE.search(url)
         assert m, f"failed to match {url!r}"
         assert f"{m.group('owner')}/{m.group('repo')}" == expected
+
+
+def test_owner_repo_url_regex_with_dots_in_repo_name():
+    """Review finding #1: repo names with dots used to be rejected.
+
+    GitHub allows dots in repo names (`docs.github.io`, `my.tool`,
+    `internal.docs`). The old `[^/.]+?` for the repo group silently
+    failed to match those. Fix changes it to `[^/]+?` with the
+    optional `\\.git` tail still claimed correctly.
+    """
+    cases = [
+        ("git@github.com:acme/docs.github.io.git", "acme/docs.github.io"),
+        ("https://github.com/acme/docs.github.io", "acme/docs.github.io"),
+        ("https://github.com/acme/internal.docs.git", "acme/internal.docs"),
+        ("git@github.com:acme/my.tool", "acme/my.tool"),
+        # Owner with dots also works (always did, but worth pinning)
+        ("https://github.com/owner.with.dots/repo", "owner.with.dots/repo"),
+    ]
+    for url, expected in cases:
+        m = zh_api._GH_URL_RE.search(url)
+        assert m, f"failed to match {url!r}"
+        assert f"{m.group('owner')}/{m.group('repo')}" == expected, (
+            f"got {m.group('owner')}/{m.group('repo')} for {url!r}"
+        )
+
+
+# =============================================================================
+# list_workspaces pagination (review finding #6)
+# =============================================================================
+
+def _ws_page(nodes: list[dict], *, has_next: bool = False,
+             end_cursor: str | None = None) -> dict:
+    """Workspaces-connection page wrapper used by the tests below."""
+    return {
+        "data": {
+            "repositoriesByGhId": [{
+                "id": "repo-gid-123",
+                "workspacesConnection": {
+                    "pageInfo": {
+                        "hasNextPage": has_next,
+                        "endCursor": end_cursor,
+                    },
+                    "nodes": nodes,
+                },
+            }]
+        }
+    }
+
+
+def test_list_workspaces_walks_pagination(monkeypatch):
+    """A repo connected to >50 workspaces — name lookup must walk pages.
+
+    Review finding #6: with the workspace cap at 50 nodes, ZH_WORKSPACE
+    lookup against an enterprise repo could silently miss workspaces
+    beyond position 50.
+    """
+    monkeypatch.setattr(zh_api, "get_gh_repo_id", lambda *a, **kw: 123)
+
+    page_one = [{"id": f"ws-{i}", "name": f"Workspace {i}"} for i in range(50)]
+    page_two = [{"id": "ws-50", "name": "Older Workspace"}]
+    responses = iter([
+        _ws_page(page_one, has_next=True, end_cursor="cursor-2"),
+        _ws_page(page_two, has_next=False),
+    ])
+    monkeypatch.setattr(
+        zh_api, "graphql_request",
+        lambda *a, **kw: next(responses),
+    )
+    nodes = zh_api.list_workspaces("acme/widgets", token="t", gh_token="t")
+    names = {n["name"] for n in nodes}
+    assert "Older Workspace" in names
+    assert len(nodes) == 51
+
+
+def test_get_workspace_id_resolves_name_on_page_two(monkeypatch):
+    """End-to-end: name lookup hits a workspace on page 2."""
+    monkeypatch.setattr(zh_api, "get_gh_repo_id", lambda *a, **kw: 123)
+    responses = iter([
+        _ws_page(
+            [{"id": f"ws-{i}", "name": f"Front {i}"} for i in range(50)],
+            has_next=True, end_cursor="cursor-2",
+        ),
+        _ws_page(
+            [{"id": "ws-deep", "name": "Deep Workspace"}],
+            has_next=False,
+        ),
+    ])
+    monkeypatch.setattr(
+        zh_api, "graphql_request",
+        lambda *a, **kw: next(responses),
+    )
+    ws_id = zh_api.get_workspace_id(
+        "acme/widgets",
+        workspace_name="deep workspace",
+        token="t", gh_token="t",
+    )
+    assert ws_id == "ws-deep"
+
+
+def test_list_workspaces_stuck_cursor_bails(monkeypatch):
+    """Server reports hasNextPage=true but cursor never advances."""
+    monkeypatch.setattr(zh_api, "get_gh_repo_id", lambda *a, **kw: 123)
+    stuck = _ws_page(
+        [{"id": "ws-a", "name": "A"}],
+        has_next=True,
+        end_cursor=None,  # explicitly missing
+    )
+    monkeypatch.setattr(
+        zh_api, "graphql_request",
+        lambda *a, **kw: stuck,
+    )
+    # Should return whatever was collected before bailing, not spin.
+    nodes = zh_api.list_workspaces("acme/widgets", token="t", gh_token="t")
+    assert {n["id"] for n in nodes} == {"ws-a"}

@@ -107,25 +107,38 @@ zh_graphql() {
     echo "$response"
 }
 
-# Get GitHub repo info from current directory
+# Get GitHub owner/repo. Resolution order:
+#   1. ZH_REPO_OVERRIDE — set by the `-r` / `--repo` global flag
+#   2. ZH_REPO — config-file value (read by load_config)
+#   3. git remote get-url origin in the current directory
+#
+# The first two paths are explicit; the third is the historical default
+# and is what every command does when nothing's overridden.
 get_repo_info() {
+    if [[ -n "${ZH_REPO_OVERRIDE:-}" ]]; then
+        echo "$ZH_REPO_OVERRIDE"
+        return
+    fi
+    if [[ -n "${ZH_REPO:-}" ]]; then
+        echo "$ZH_REPO"
+        return
+    fi
+
     local remote_url
     remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 
     if [[ -z "$remote_url" ]]; then
-        error "Not in a git repository with a GitHub remote.
+        error "No repository specified.
 
-This command must be run from within a git repository that:
-  1. Has a GitHub remote configured (origin)
-  2. Is connected to a ZenHub workspace
+Either:
+  - Use -r owner/repo (or --repo) to target a specific repository
+  - Set ZH_REPO=owner/repo in ${CONFIG_FILE}
+  - Run from within a git repository with a GitHub remote (origin)
 
-To fix:
-  - cd into your project directory
-  - Ensure 'git remote -v' shows a GitHub URL"
+For multi-workspace repos, also see -w / --workspace and ZH_WORKSPACE."
     fi
 
     # Parse owner/repo from various URL formats
-    local repo_path
     if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
         echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
     else
@@ -171,7 +184,16 @@ get_repo_id() {
     echo "$repo_id"
 }
 
-# Get workspace ID for a repository (using GitHub ID)
+# Get workspace ID for a repository (using GitHub ID).
+#
+# Workspace selection precedence:
+#   1. ZH_WORKSPACE_NAME (set by `-w` / `--workspace` global flag) — exact
+#      case-insensitive match against the workspace name. Errors with the
+#      list of available workspaces if there's no match.
+#   2. ZH_WORKSPACE (config-file value) — same resolution as above.
+#   3. First workspace returned by the API (historical default).
+#
+# (1) and (2) are merged into ZH_WORKSPACE_NAME by main()'s arg parser.
 get_workspace_id() {
     local owner_repo="$1"
 
@@ -188,7 +210,7 @@ get_workspace_id() {
         repositoriesByGhId(ghIds: $ghIds) {
             id
             name
-            workspacesConnection {
+            workspacesConnection(first: 50) {
                 nodes {
                     id
                     name
@@ -203,12 +225,39 @@ get_workspace_id() {
     local response
     response=$(zh_graphql "$query" "$variables")
 
-    # Get first workspace
-    local workspace_id
-    workspace_id=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[0].id // empty')
+    local workspace_nodes
+    workspace_nodes=$(echo "$response" | jq -c '.data.repositoriesByGhId[0].workspacesConnection.nodes // []')
 
-    if [[ -z "$workspace_id" ]]; then
+    local node_count
+    node_count=$(echo "$workspace_nodes" | jq 'length')
+
+    if [[ "$node_count" -eq 0 ]]; then
         error "No workspace found for this repository"
+    fi
+
+    # Resolve effective name: flag-set override beats env/config value
+    local effective_name="${ZH_WORKSPACE_NAME:-${ZH_WORKSPACE:-}}"
+
+    local workspace_id
+    if [[ -n "$effective_name" ]]; then
+        # Exact match on the workspace name (case-insensitive).
+        workspace_id=$(echo "$workspace_nodes" | jq -r --arg name "$effective_name" \
+            '[.[] | select((.name | ascii_downcase) == ($name | ascii_downcase))] | .[0].id // empty')
+
+        if [[ -z "$workspace_id" ]]; then
+            echo -e "${RED}Error:${NC} Workspace '${effective_name}' not found for ${owner_repo}." >&2
+            echo "" >&2
+            echo "Available workspaces:" >&2
+            echo "$workspace_nodes" | jq -r '.[] | "  - \(.name)"' >&2
+            exit 1
+        fi
+    else
+        # Default: first workspace. Historical behaviour, preserved when
+        # neither -w nor ZH_WORKSPACE is set.
+        workspace_id=$(echo "$workspace_nodes" | jq -r '.[0].id // empty')
+        if [[ -z "$workspace_id" ]]; then
+            error "No workspace found for this repository"
+        fi
     fi
 
     echo "$workspace_id"
@@ -233,7 +282,17 @@ cmd_help() {
 zh - ZenHub CLI Tool
 
 USAGE:
-    zh <command> [options]
+    zh [-r owner/repo] [-w workspace] <command> [options]
+
+GLOBAL OPTIONS (peeled off before the subcommand):
+    -r, --repo <owner/repo>   Target a specific GitHub repository instead
+                              of the one inferred from `git remote get-url
+                              origin`. Can also be set via ZH_REPO in the
+                              config file.
+    -w, --workspace <name>    Target a specific workspace by name
+                              (case-insensitive). If unset, the first
+                              workspace returned by the API wins.
+                              Can also be set via ZH_WORKSPACE.
 
 COMMANDS:
     issue <number>          View issue details
@@ -370,10 +429,15 @@ CONFIGURATION:
     Create ~/.config/zh/config with:
         ZH_TOKEN=your_graphql_token
         ZH_REST_TOKEN=your_rest_token
+        ZH_REPO=owner/repo              (optional — default repository)
+        ZH_WORKSPACE="My Workspace"     (optional — default workspace name)
 
     Generate tokens at:
         GraphQL: https://app.zenhub.com/settings/tokens
         REST:    https://app.zenhub.com/dashboard/tokens
+
+    -r / --repo and -w / --workspace global flags override the config
+    values for a single invocation.
 
 ALIASES:
     issue: i, show
@@ -428,12 +492,15 @@ cmd_workspaces() {
         error "Could not get GitHub repo ID for: $owner_repo"
     fi
 
+    # Pull up to 50 workspaces so a user inspecting a multi-workspace
+    # repo can see the full list (otherwise the API default of ~20 would
+    # silently truncate). Matches the cap in get_workspace_id.
     local query='
     query($ghIds: [Int!]!) {
         repositoriesByGhId(ghIds: $ghIds) {
             id
             name
-            workspacesConnection {
+            workspacesConnection(first: 50) {
                 nodes {
                     id
                     name
@@ -448,12 +515,22 @@ cmd_workspaces() {
     local response
     response=$(zh_graphql "$query" "$variables")
 
+    # Resolve the active workspace per the same precedence get_workspace_id
+    # uses, so the listing marks the one the rest of the CLI would target.
+    local active_name="${ZH_WORKSPACE_NAME:-${ZH_WORKSPACE:-}}"
+
     echo ""
     echo -e "${BOLD}Workspaces:${NC}"
+    if [[ -n "$active_name" ]]; then
+        echo -e "  ${CYAN}(targeting:${NC} ${active_name}${CYAN})${NC}"
+    else
+        echo -e "  ${CYAN}(targeting: first returned by API)${NC}"
+    fi
     echo ""
 
-    echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[] |
-        "  \(.name)\n    ID: \(.id)\n"'
+    echo "$response" | jq -r --arg active "$active_name" '.data.repositoriesByGhId[0].workspacesConnection.nodes[] |
+        (if ($active != "" and (.name | ascii_downcase) == ($active | ascii_downcase)) then "● " else "  " end) +
+        "\(.name)\n    ID: \(.id)\n"'
 }
 
 cmd_pipelines() {
@@ -2549,6 +2626,122 @@ Examples:
 # mutations (sprint-add / sprint-remove) are deferred to a follow-up.
 # =============================================================================
 
+# Pagination cap for sprint walks (50 pages × 50 nodes = 2500 sprints,
+# vastly more than any realistic workspace). Belt-and-suspenders against
+# a server-side cursor bug.
+ZH_SPRINT_PAGINATION_CAP=50
+
+# Walk every page of `workspace.sprints` and emit one combined JSON
+# document on stdout. Output shape matches a single-page response so
+# downstream jq filters don't need to know the listing was paginated.
+#
+#   { workspace_name, active_sprint_id, nodes: [...] }
+#
+# `state_filter` is optional; pass "OPEN" to filter to open sprints,
+# anything else to fetch all.
+zh_sprints_fetch_all() {
+    local workspace_id="$1"
+    local state_filter="${2:-}"
+
+    local query
+    if [[ "$state_filter" == "OPEN" ]]; then
+        query='
+        query($workspaceId: ID!, $after: String) {
+            workspace(id: $workspaceId) {
+                name
+                activeSprint { id }
+                sprints(first: 50, after: $after, filters: { state: { eq: OPEN } }) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        id
+                        name
+                        state
+                        startAt
+                        endAt
+                        completedPoints
+                        totalPoints
+                        closedIssuesCount
+                    }
+                }
+            }
+        }'
+    else
+        query='
+        query($workspaceId: ID!, $after: String) {
+            workspace(id: $workspaceId) {
+                name
+                activeSprint { id }
+                sprints(first: 50, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        id
+                        name
+                        state
+                        startAt
+                        endAt
+                        completedPoints
+                        totalPoints
+                        closedIssuesCount
+                    }
+                }
+            }
+        }'
+    fi
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+    local workspace_name=""
+    local active_sprint_id=""
+    local first_page=true
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt "$ZH_SPRINT_PAGINATION_CAP" ]]; then
+            warn "Sprint pagination iteration cap (${ZH_SPRINT_PAGINATION_CAP}) reached"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --arg workspace_id "$workspace_id" --argjson after "$cursor" \
+            '{workspaceId: $workspace_id, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        if [[ "$first_page" == "true" ]]; then
+            workspace_name=$(echo "$response" | jq -r '.data.workspace.name // ""')
+            active_sprint_id=$(echo "$response" | jq -r '.data.workspace.activeSprint.id // empty')
+            first_page=false
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '.data.workspace.sprints.nodes // []')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.workspace.sprints.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.workspace.sprints.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Sprint pagination cursor not advancing — bailing"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n \
+        --arg workspace_name "$workspace_name" \
+        --arg active_sprint_id "$active_sprint_id" \
+        --argjson nodes "$all_nodes" \
+        '{workspace_name: $workspace_name, active_sprint_id: $active_sprint_id, nodes: $nodes}'
+}
+
 cmd_sprints() {
     load_config
 
@@ -2574,61 +2767,17 @@ cmd_sprints() {
     local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
 
-    local query
+    local sprints_json
     if [[ "$show_all" == "true" ]]; then
-        query='
-        query($workspaceId: ID!) {
-            workspace(id: $workspaceId) {
-                name
-                activeSprint { id }
-                sprints(first: 50) {
-                    nodes {
-                        id
-                        name
-                        state
-                        startAt
-                        endAt
-                        completedPoints
-                        totalPoints
-                        closedIssuesCount
-                    }
-                }
-            }
-        }'
+        sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
     else
-        query='
-        query($workspaceId: ID!) {
-            workspace(id: $workspaceId) {
-                name
-                activeSprint { id }
-                sprints(first: 50, filters: { state: { eq: OPEN } }) {
-                    nodes {
-                        id
-                        name
-                        state
-                        startAt
-                        endAt
-                        completedPoints
-                        totalPoints
-                        closedIssuesCount
-                    }
-                }
-            }
-        }'
+        sprints_json=$(zh_sprints_fetch_all "$workspace_id" "OPEN")
     fi
 
-    local variables
-    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
-
-    local workspace_name active_sprint_id
-    workspace_name=$(echo "$response" | jq -r '.data.workspace.name')
-    active_sprint_id=$(echo "$response" | jq -r '.data.workspace.activeSprint.id // empty')
-
-    local count
-    count=$(echo "$response" | jq '.data.workspace.sprints.nodes | length')
+    local workspace_name active_sprint_id count
+    workspace_name=$(echo "$sprints_json" | jq -r '.workspace_name')
+    active_sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
+    count=$(echo "$sprints_json" | jq '.nodes | length')
 
     echo ""
     if [[ "$show_all" == "true" ]]; then
@@ -2641,7 +2790,7 @@ cmd_sprints() {
     if [[ "$count" -eq 0 ]]; then
         echo "  No sprints found"
     else
-        echo "$response" | jq -r --arg active_id "$active_sprint_id" '.data.workspace.sprints.nodes[] |
+        echo "$sprints_json" | jq -r --arg active_id "$active_sprint_id" '.nodes[] |
             "\(.id)" as $id |
             "\(.startAt[:10] // "?")" as $start |
             "\(.endAt[:10] // "?")" as $end |
@@ -2653,6 +2802,78 @@ cmd_sprints() {
         echo -e "${CYAN}Tip:${NC} Use --all to include closed sprints"
     fi
     echo ""
+}
+
+# Walk every page of a sprint's `sprintIssues` connection and emit a
+# combined JSON document. Shape matches a single-page response so
+# downstream jq filters don't need to know it was paginated.
+#
+#   { nodes: [ { issue: {...} }, ... ] }
+zh_sprint_issues_fetch_all() {
+    local sprint_id="$1"
+
+    local query='
+    query($sprintId: ID!, $after: String) {
+        node(id: $sprintId) {
+            ... on Sprint {
+                sprintIssues(first: 100, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        issue {
+                            number
+                            title
+                            state
+                            htmlUrl
+                            estimate { value }
+                            assignees { nodes { login } }
+                            repository { ownerName name }
+                            pipelineIssues { nodes { pipeline { name } } }
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Sprint-issues pagination iteration cap (200) reached"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --arg sprint_id "$sprint_id" --argjson after "$cursor" \
+            '{sprintId: $sprint_id, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '.data.node.sprintIssues.nodes // []')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.node.sprintIssues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.node.sprintIssues.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Sprint-issues pagination cursor not advancing — bailing"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n --argjson nodes "$all_nodes" '{nodes: $nodes}'
 }
 
 cmd_sprint() {
@@ -2696,43 +2917,32 @@ Examples:
     workspace_id=$(get_workspace_id "$owner_repo")
 
     # Resolve sprint id by name (case-insensitive) or current/active.
-    local sprints_query='
-    query($workspaceId: ID!) {
-        workspace(id: $workspaceId) {
-            activeSprint { id name }
-            sprints(first: 50, filters: {}) {
-                nodes { id name state }
-            }
-        }
-    }'
-
-    local sprints_vars
-    sprints_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
-
-    local sprints_response
-    sprints_response=$(zh_graphql "$sprints_query" "$sprints_vars")
+    # Walk every page of sprints so a workspace with >50 sprints can
+    # still resolve older names (review finding #5).
+    local sprints_json
+    sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
 
     local sprint_id
     if [[ "$sprint_name" == "current" ]] || [[ "$sprint_name" == "active" ]]; then
-        sprint_id=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.id // empty')
+        sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
         if [[ -z "$sprint_id" ]]; then
             error "No active sprint found"
         fi
-        sprint_name=$(echo "$sprints_response" | jq -r '.data.workspace.activeSprint.name')
+        sprint_name=$(echo "$sprints_json" | jq -r --arg id "$sprint_id" '.nodes[] | select(.id == $id) | .name' | head -1)
     else
-        sprint_id=$(echo "$sprints_response" | jq -r --arg name "$sprint_name" \
-            '.data.workspace.sprints.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+        sprint_id=$(echo "$sprints_json" | jq -r --arg name "$sprint_name" \
+            '.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
 
         if [[ -z "$sprint_id" ]]; then
             echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
             echo "" >&2
             echo "Available sprints:" >&2
-            echo "$sprints_response" | jq -r '.data.workspace.sprints.nodes[] | "  - \(.name) (\(.state))"' >&2
+            echo "$sprints_json" | jq -r '.nodes[] | "  - \(.name) (\(.state))"' >&2
             exit 1
         fi
     fi
 
-    # Fetch sprint details + issues.
+    # Fetch sprint header (single page) + paginated sprintIssues.
     local detail_query='
     query($sprintId: ID!) {
         node(id: $sprintId) {
@@ -2746,20 +2956,6 @@ Examples:
                 completedPoints
                 totalPoints
                 closedIssuesCount
-                sprintIssues(first: 100) {
-                    nodes {
-                        issue {
-                            number
-                            title
-                            state
-                            htmlUrl
-                            estimate { value }
-                            assignees { nodes { login } }
-                            repository { ownerName name }
-                            pipelineIssues { nodes { pipeline { name } } }
-                        }
-                    }
-                }
             }
         }
     }'
@@ -2769,6 +2965,9 @@ Examples:
 
     local detail_response
     detail_response=$(zh_graphql "$detail_query" "$detail_vars")
+
+    local issues_json
+    issues_json=$(zh_sprint_issues_fetch_all "$sprint_id")
 
     local sprint_state start_at end_at completed_pts total_pts closed_count description
     sprint_state=$(echo "$detail_response" | jq -r '.data.node.state // "UNKNOWN"')
@@ -2780,17 +2979,21 @@ Examples:
     description=$(echo "$detail_response" | jq -r '.data.node.description // empty')
 
     local issue_count
-    issue_count=$(echo "$detail_response" | jq '.data.node.sprintIssues.nodes | length')
+    issue_count=$(echo "$issues_json" | jq '.nodes | length')
 
     echo ""
-    echo -e "${BOLD}Sprint: ${sprint_name}${NC}"
+    # `printf '%s\n'` instead of `echo -e` so backslash sequences in the
+    # sprint name (user-controlled) aren't interpreted. Review #12.
+    printf "${BOLD}Sprint: %s${NC}\n" "$sprint_name"
     echo ""
     echo -e "  ${CYAN}State:${NC}     ${sprint_state}"
     echo -e "  ${CYAN}Period:${NC}    ${start_at} → ${end_at}"
     echo -e "  ${CYAN}Points:${NC}    ${completed_pts}/${total_pts} completed"
     echo -e "  ${CYAN}Closed:${NC}    ${closed_count} issues"
     if [[ -n "$description" ]]; then
-        echo -e "  ${CYAN}Description:${NC} ${description}"
+        # Same printf treatment for the description — it's user-typed
+        # in ZenHub and may contain backslash sequences (review #12).
+        printf "  ${CYAN}Description:${NC} %s\n" "$description"
     fi
     echo ""
     echo -e "${BOLD}Issues (${issue_count}):${NC}"
@@ -2800,11 +3003,11 @@ Examples:
         echo "  No issues in this sprint"
     else
         if [[ "$show_urls" == "true" ]]; then
-            echo "$detail_response" | jq -r '.data.node.sprintIssues.nodes[].issue |
+            echo "$issues_json" | jq -r '.nodes[].issue |
                 "\(.state)" as $state |
                 "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(.pipelineIssues.nodes[0].pipeline.name // "—")\n    \(if $state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.htmlUrl)\n"'
         else
-            echo "$detail_response" | jq -r '.data.node.sprintIssues.nodes[].issue |
+            echo "$issues_json" | jq -r '.nodes[].issue |
                 "\(.state)" as $state |
                 "  #\(.number)  \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title)"'
         fi
@@ -4661,6 +4864,61 @@ Run 'zh epic help' for usage information."
 # =============================================================================
 
 main() {
+    # Global flag parsing (peel off `-r` / `--repo` and `-w` /
+    # `--workspace` before the subcommand). Config-file defaults are
+    # already in the environment via load_config when the subcommand
+    # body runs, so we seed the override vars from them here for a
+    # uniform consumption point.
+    #
+    # Precedence (highest first):
+    #   1. command-line flag (-r / -w)
+    #   2. ZH_REPO / ZH_WORKSPACE env var (also set by load_config from
+    #      the config file)
+    #   3. git remote / first-workspace inference (in get_repo_info /
+    #      get_workspace_id)
+    #
+    # Note: load_config hasn't run yet at this point — subcommand bodies
+    # call it themselves — so ZH_REPO / ZH_WORKSPACE here only reflect
+    # the SHELL env, not the config file. The config-file path comes
+    # into play later: load_config sources the file, exposing ZH_REPO
+    # and ZH_WORKSPACE; get_repo_info / get_workspace_id then read them
+    # if ZH_REPO_OVERRIDE / ZH_WORKSPACE_NAME aren't set. So the flag
+    # always wins; env wins over config; config wins over inference.
+    ZH_REPO_OVERRIDE="${ZH_REPO_OVERRIDE:-}"
+    ZH_WORKSPACE_NAME="${ZH_WORKSPACE_NAME:-}"
+
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--repo)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires an owner/repo value"
+                fi
+                ZH_REPO_OVERRIDE="$2"
+                shift 2
+                ;;
+            -w|--workspace)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires a workspace name"
+                fi
+                ZH_WORKSPACE_NAME="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                args+=("$@")
+                break
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    # Export so subshells / piped invocations also see them
+    export ZH_REPO_OVERRIDE ZH_WORKSPACE_NAME
+    set -- "${args[@]}"
+
     local command="${1:-help}"
     shift || true
 

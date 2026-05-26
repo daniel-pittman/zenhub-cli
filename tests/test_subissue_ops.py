@@ -225,7 +225,7 @@ def test_list_sub_issues_stuck_cursor_breaks_walk():
     # second iteration.
     with _patch_ctx_query(ctx, [stuck, stuck, stuck]):
         out = zh_graphql_ops.list_sub_issues(ctx, 42)
-    assert "cursor unchanged" in (out["pagination_warning"] or "").lower()
+    assert "cursor not advancing" in (out["pagination_warning"] or "").lower()
 
 
 def test_list_sub_issues_iteration_cap_belt_and_suspenders():
@@ -598,3 +598,271 @@ def test_reorder_sub_issue_after_requires_sibling():
     ctx = _ctx()
     with pytest.raises(zh_api.ZhApiError):
         zh_graphql_ops.reorder_sub_issue(ctx, 100, "after")
+
+
+def test_reorder_sub_issue_rejects_self_anchor():
+    """Review finding #9: anchoring after/before yourself is meaningless."""
+    ctx = _ctx()
+    with pytest.raises(zh_api.ZhApiError) as exc:
+        zh_graphql_ops.reorder_sub_issue(
+            ctx, 100, "after", sibling_number=100
+        )
+    assert "self-anchor" in str(exc.value).lower()
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.reorder_sub_issue(
+            ctx, 100, "before", sibling_number=100
+        )
+
+
+def test_reorder_sub_issue_top_crosses_repos_via_id_anchor():
+    """Review finding #2: top/bottom must anchor by id, not by repo-filtered number.
+
+    Scenario: child #100 lives in acme/widgets. The "first" sibling is
+    a child in acme/OTHER (an issue numbered 50). Before the fix,
+    `_find_sibling_id` filtered by repo and returned None, the
+    mutation fired with both ids null, and the API returned success
+    while doing nothing. After the fix, the listing's `id` is used
+    directly — workspace-global, so cross-repo siblings are valid
+    anchors.
+    """
+    ctx = _ctx()
+    parent_info = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        # 1. Resolve child
+        _issue_by_info(100, parent=parent_info),
+        # 2. List siblings — first sibling is in a DIFFERENT repo
+        {
+            "data": {
+                "issueByInfo": {
+                    "number": 42,
+                    "title": "Parent",
+                    "state": "OPEN",
+                    "zenhubChildIssues": {
+                        "totalCount": 2,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "id": "issue-gid-50-OTHER",
+                                "number": 50,
+                                "title": "Sibling in other repo",
+                                "state": "OPEN",
+                                "assignees": {"nodes": []},
+                                "pipelineIssue": None,
+                                "repository": {
+                                    "ownerName": "acme", "name": "OTHER",
+                                },
+                            },
+                            {
+                                "id": "issue-gid-100",
+                                "number": 100,
+                                "title": "Self",
+                                "state": "OPEN",
+                                "assignees": {"nodes": []},
+                                "pipelineIssue": None,
+                                "repository": {
+                                    "ownerName": "acme", "name": "widgets",
+                                },
+                            },
+                        ],
+                    },
+                }
+            }
+        },
+        # 3. The mutation should fire with beforeId=<other repo's gid>
+        {
+            "data": {
+                "reprioritizeSubIssue": {
+                    "success": True, "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.reorder_sub_issue(ctx, 100, "top")
+    assert out["ok"] is True
+    assert out["outcome"] == "ok"
+
+
+def test_reorder_sub_issue_refuses_when_both_anchors_null():
+    """Belt-and-suspenders: if we somehow can't resolve any anchor, fail loud.
+
+    Defends against a regression that would silently no-op (the bug
+    behind review #2). With the explicit guard, this case returns
+    `outcome="fail"` rather than firing a vacuous mutation.
+    """
+    ctx = _ctx()
+    parent_info = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    # Sibling listing with no ids at all (degraded API response) AND
+    # multiple siblings — would short-circuit past the only-child noop.
+    responses = [
+        _issue_by_info(100, parent=parent_info),
+        {
+            "data": {
+                "issueByInfo": {
+                    "number": 42,
+                    "title": "Parent",
+                    "state": "OPEN",
+                    "zenhubChildIssues": {
+                        "totalCount": 2,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                # id missing entirely
+                                "number": 50,
+                                "title": "Sibling",
+                                "state": "OPEN",
+                                "assignees": {"nodes": []},
+                                "pipelineIssue": None,
+                                "repository": {
+                                    "ownerName": "acme", "name": "widgets",
+                                },
+                            },
+                        ],
+                    },
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.reorder_sub_issue(ctx, 100, "top")
+    # Sibling has no id, so "other" filter (`s.get("id") and ...`) gives
+    # None — we treat it as the only-child case (still a noop outcome).
+    assert out["ok"] is False
+    assert out["outcome"] == "noop"
+
+
+# =============================================================================
+# succeeded-divergence handling (review finding #3)
+# =============================================================================
+
+def test_add_sub_issues_succeeded_divergence_returns_empty_succeeded():
+    """When successCount doesn't match `input - failedIssues`, refuse to claim.
+
+    Concrete: API returns successCount=1, failedIssues=[] for 3 input
+    children. We can't tell which one of the three landed. Inference
+    by subtraction would lie ("all 3 succeeded"); the fix returns
+    succeeded=[] with a partial_success_warning describing the
+    divergence.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        _issue_by_info(102),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 1,           # only one actually landed
+                    "failedIssues": [],          # but API didn't tell us which
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101, 102])
+    assert out["succeeded"] == []
+    assert out["partial_success_warning"] is not None
+    assert "successCount=1" in out["partial_success_warning"]
+
+
+def test_remove_sub_issues_succeeded_divergence_returns_empty_succeeded():
+    """Same divergence guard on the remove side."""
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 1,
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101])
+    assert out["succeeded"] == []
+    assert out["partial_success_warning"] is not None
+
+
+def test_add_sub_issues_full_success_when_count_matches():
+    """Sanity: when successCount equals inferred set, we DO trust it."""
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 2,           # matches the 2 inputs
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    assert out["ok"] is True
+    assert sorted(out["succeeded"]) == [100, 101]
+    assert out["partial_success_warning"] is None
+
+
+# =============================================================================
+# listing surfaces `id` (review finding #2a)
+# =============================================================================
+
+def test_list_sub_issues_returns_id_for_each_child():
+    """`id` is now part of every CHILD node; tests anchoring depends on it."""
+    ctx = _ctx()
+    response = {
+        "data": {
+            "issueByInfo": {
+                "number": 42,
+                "title": "Parent",
+                "state": "OPEN",
+                "zenhubChildIssues": {
+                    "totalCount": 1,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {
+                            "id": "issue-gid-99",
+                            "number": 99,
+                            "title": "Child",
+                            "state": "OPEN",
+                            "assignees": {"nodes": []},
+                            "pipelineIssue": None,
+                            "repository": {
+                                "ownerName": "acme", "name": "widgets",
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    with _patch_ctx_query(ctx, [response]):
+        out = zh_graphql_ops.list_sub_issues(ctx, 42)
+    assert out["children"][0]["id"] == "issue-gid-99"
