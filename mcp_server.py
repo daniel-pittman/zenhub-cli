@@ -4,11 +4,12 @@ ZenHub MCP server — exposes ZenHub backlog operations to any Claude Code sessi
 on this machine via the `zh` CLI.
 
 Wraps tools/zh so that:
-  - Read tools (board, pipeline, issue, mine, epic_list, epic_show) return
-    structured data parseable by callers.
+  - Read tools (board, pipeline, issue, mine, epic_list, epic_show,
+    subissue_list) return structured data parseable by callers.
   - Write tools (create_issue, close_issue, move_issue, reorder, comment,
     epic_create, epic_update, epic_add_children, epic_remove_children,
-    epic_close, epic_reopen, assign, unassign, estimate) are explicit verbs
+    epic_close, epic_reopen, subissue_add_children, subissue_remove_children,
+    subissue_reorder, assign, unassign, estimate) are explicit verbs
     so callers can audit which destructive operations they invoked.
 
 Every tool optionally accepts a `repo_path` argument — the absolute path of a
@@ -1093,6 +1094,141 @@ def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
 # deleting an epic is irreversible. If you genuinely need to delete an epic,
 # do it via `zh epic delete <N>` directly from the CLI — that requires
 # human deliberation.
+
+
+# =============================================================================
+# Sub-issue management (Issue → Sub-issue hierarchy tier)
+# =============================================================================
+
+
+@mcp.tool()
+def subissue_list(parent_number: int, repo_path: str = "") -> dict:
+    """List sub-issues of a parent issue.
+
+    Args:
+        parent_number: Issue number of the parent.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, parent_number, raw, stderr.
+    """
+    r = _run_zh(["subissue", "list", str(parent_number)],
+                cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "parent_number": parent_number,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+@mcp.tool()
+def subissue_add_children(parent_number: int, child_numbers: list[int],
+                          repo_path: str = "") -> dict:
+    """Add one or more issues as sub-issues of a parent.
+
+    Args:
+        parent_number: Issue number of the parent.
+        child_numbers: List of issue numbers to link as sub-issues
+            (single API call).
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, parent_number, added (list of issue numbers), raw,
+        stderr.
+    """
+    if not child_numbers:
+        return {"ok": False, "stderr": "child_numbers must be non-empty"}
+    args = ["subissue", "add", str(parent_number)] + [str(n) for n in child_numbers]
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "parent_number": parent_number,
+        "added": child_numbers if r["ok"] else [],
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+@mcp.tool()
+def subissue_remove_children(parent_number: int, child_numbers: list[int],
+                             repo_path: str = "") -> dict:
+    """Remove one or more sub-issues from a parent.
+
+    Unlinks each child from its parent. Note: the underlying ZenHub mutation
+    does not require a parent ID (each child has exactly one parent), but
+    we accept and use it for friendlier messaging and as a safety hint.
+
+    Args:
+        parent_number: Issue number of the parent (used for messaging /
+            pre-check).
+        child_numbers: List of sub-issue numbers to unlink.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, parent_number, removed (list of issue numbers), raw,
+        stderr.
+    """
+    if not child_numbers:
+        return {"ok": False, "stderr": "child_numbers must be non-empty"}
+    args = ["subissue", "remove", str(parent_number)] + [str(n) for n in child_numbers]
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "parent_number": parent_number,
+        "removed": child_numbers if r["ok"] else [],
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+@mcp.tool()
+def subissue_reorder(child_number: int, position: str,
+                     sibling_number: int | None = None,
+                     repo_path: str = "") -> dict:
+    """Reorder a sub-issue among its siblings.
+
+    Uses sibling-anchored positioning (ZenHub's reprioritizeSubIssue mutation
+    semantics), not integer positions. Supported positions:
+
+      - "top"               — first sibling
+      - "bottom"            — last sibling
+      - "after"             — requires sibling_number; place right after sibling
+      - "before"            — requires sibling_number; place right before sibling
+
+    Args:
+        child_number: Sub-issue to reposition.
+        position: One of "top", "bottom", "after", "before".
+        sibling_number: Required when position is "after" or "before".
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, child_number, position, raw, stderr.
+    """
+    pos = position.lower().strip()
+    if pos not in {"top", "bottom", "after", "before"}:
+        return {
+            "ok": False,
+            "stderr": f"position must be one of top/bottom/after/before (got: {position!r})",
+        }
+    if pos in {"after", "before"} and sibling_number is None:
+        return {
+            "ok": False,
+            "stderr": f"position {pos!r} requires sibling_number",
+        }
+
+    args = ["subissue", "reorder", str(child_number), pos]
+    if pos in {"after", "before"}:
+        args.append(str(sibling_number))
+
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "child_number": child_number,
+        "position": pos if pos in {"top", "bottom"} else f"{pos} #{sibling_number}",
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
 
 
 # =============================================================================
