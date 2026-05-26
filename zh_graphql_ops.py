@@ -204,6 +204,12 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
 
         conn = issue.get("zenhubChildIssues") or {}
         for node in conn.get("nodes") or []:
+            # Defensive normalization: skip a None entry rather than
+            # crashing on `node.get(...)`. The API contract is a non-
+            # nullable list of nodes, but matrix tests pin against
+            # the surprise shape.
+            if node is None:
+                continue
             assignees = [
                 a.get("login")
                 for a in ((node.get("assignees") or {}).get("nodes") or [])
@@ -365,6 +371,11 @@ def add_sub_issues(
             failed: list[dict] — [{number, owner, name}, ...] for rejects
             github_errors: dict|None
             error: str|None — parent-not-found or other fatal cases
+
+    Duplicate input numbers are collapsed first-occurrence
+    (e.g. `[100, 100, 101]` is treated as `[100, 101]`) so the
+    success accounting cannot be inflated by repeating an input.
+    Mirrors the sprint mutations' boundary dedup (round-2 #10).
     """
     if not child_numbers:
         raise ZhApiError("child_numbers must be non-empty")
@@ -373,6 +384,10 @@ def add_sub_issues(
             raise ZhApiError(
                 f"every child number must be a positive int (got {n!r})"
             )
+
+    # Boundary dedup — preserves first-occurrence order so the output
+    # `succeeded` / `failed` lists are stable across calls.
+    child_numbers = list(dict.fromkeys(child_numbers))
 
     parent_issue = get_issue_by_info(ctx, parent_number)
     if not parent_issue:
@@ -498,6 +513,9 @@ def remove_sub_issues(
 
     Returns the same shape as `add_sub_issues` with `succeeded` listing
     the children actually unlinked.
+
+    Duplicate input numbers are collapsed first-occurrence (matches
+    `add_sub_issues` and the sprint mutations).
     """
     if not child_numbers:
         raise ZhApiError("child_numbers must be non-empty")
@@ -506,6 +524,9 @@ def remove_sub_issues(
             raise ZhApiError(
                 f"every child number must be a positive int (got {n!r})"
             )
+
+    # Boundary dedup.
+    child_numbers = list(dict.fromkeys(child_numbers))
 
     parent_issue = get_issue_by_info(ctx, parent_number)
     if not parent_issue:
@@ -1030,7 +1051,20 @@ def list_sprints(ctx: RepoContext, *, include_closed: bool = False) -> dict:
             {"workspaceId": ctx.workspace_id, "after": cursor},
         )
         check_graphql_errors(resp, context="list_sprints")
-        ws = (resp.get("data") or {}).get("workspace") or {}
+        data = resp.get("data") or {}
+        if "workspace" not in data or data.get("workspace") is None:
+            # GraphQL returns `data.workspace = null` when the
+            # workspace is deleted, ACL-revoked, or otherwise
+            # unresolvable. An empty-but-real workspace returns a
+            # non-null Workspace with `sprints.nodes = []`, which is
+            # distinct. Pre-fix this branch collapsed null → {} and
+            # silently returned ok=True with an empty sprint list,
+            # indistinguishable from a real empty workspace.
+            raise ZhApiError(
+                f"Workspace {ctx.workspace_id!r} resolved to null "
+                "(deleted, ACL-revoked, or otherwise inaccessible)"
+            )
+        ws = data["workspace"]
         if first_page:
             workspace_name = ws.get("name") or ""
             active = ws.get("activeSprint") or {}
@@ -1038,6 +1072,11 @@ def list_sprints(ctx: RepoContext, *, include_closed: bool = False) -> dict:
             first_page = False
         conn = ws.get("sprints") or {}
         for n in conn.get("nodes") or []:
+            # Skip null page entries defensively (matrix-3): API
+            # contract is non-null but unexpected shapes shouldn't
+            # crash the listing.
+            if n is None:
+                continue
             nodes.append(n)
         page_info = conn.get("pageInfo") or {}
         if not page_info.get("hasNextPage"):
@@ -1215,8 +1254,12 @@ def _walk_sprint_issues(
                 ((issue.get("pipelineIssues") or {}).get("nodes")) or []
             )
             pipeline_name = None
+            # Defensive: pipeline_nodes[0] may itself be None
+            # (unexpected shape; the schema says non-null but matrix
+            # tests pin the surprise). Use `or {}` to coalesce.
             if pipeline_nodes:
-                pl = pipeline_nodes[0].get("pipeline") or {}
+                first_pn = pipeline_nodes[0] or {}
+                pl = first_pn.get("pipeline") or {}
                 pipeline_name = pl.get("name") or None
             rep = issue.get("repository") or {}
             est = issue.get("estimate") or {}

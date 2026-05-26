@@ -2771,14 +2771,30 @@ zh_sprints_fetch_all() {
         local response
         response=$(zh_graphql "$query" "$variables")
 
+        # Defensive null-workspace detection. `data.workspace = null`
+        # signals a deleted / ACL-revoked workspace, distinct from an
+        # empty-but-real workspace (which returns a non-null Workspace
+        # with `sprints.nodes = []`). Pre-fix the jq `// fallback`
+        # forms below silently collapsed null → empty, indistinguishable
+        # from real empty. Matches the SPEC of the Python `list_sprints`
+        # walker.
+        local workspace_kind
+        workspace_kind=$(echo "$response" | jq -r '.data.workspace | type')
+        if [[ "$workspace_kind" == "null" ]]; then
+            error "Workspace '${workspace_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
         if [[ "$first_page" == "true" ]]; then
             workspace_name=$(echo "$response" | jq -r '.data.workspace.name // ""')
             active_sprint_id=$(echo "$response" | jq -r '.data.workspace.activeSprint.id // empty')
             first_page=false
         fi
 
+        # `select(. != null)` skips null page entries (same SPEC the
+        # Python walker enforces); the `// []` keeps the whole array
+        # access null-safe.
         local page_nodes
-        page_nodes=$(echo "$response" | jq -c '.data.workspace.sprints.nodes // []')
+        page_nodes=$(echo "$response" | jq -c '[(.data.workspace.sprints.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
@@ -3149,7 +3165,10 @@ zh_resolve_issue_ids_for_sprint() {
     local results=""
     local missing=""
     local num stripped issue_response issue_id issue_title
-    for num in "${nums[@]}"; do
+    # Conditional expansion to keep bash 3.2 + set -u happy when nums
+    # happens to be empty (caller normally validates $# > 0 but
+    # defensive layering matches round-3 #5).
+    for num in ${nums[@]+"${nums[@]}"}; do
         stripped="${num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${num}"
@@ -3866,7 +3885,7 @@ zh_resolve_issue_ids() {
     local issue_nums=("$@")
 
     local ids="[]"
-    for num in "${issue_nums[@]}"; do
+    for num in ${issue_nums[@]+"${issue_nums[@]}"}; do
         local stripped="${num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${num}"
@@ -4245,7 +4264,26 @@ cmd_subissue_add() {
 Example: zh subissue add 42 100 101"
     fi
 
-    local child_nums=("$@")
+    # Dedup input numbers (first-occurrence order) so a repeated arg
+    # can't inflate the success count when the API returns one link
+    # per unique issue. Same SPEC as the sprint mutations and the
+    # Python add_sub_issues boundary dedup.
+    local -a child_nums=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in ${child_nums[@]+"${child_nums[@]}"}; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            child_nums+=("$stripped_arg")
+        fi
+    done
+
     local stripped_parent="${parent_num#\#}"
 
     # Argument-format validation up-front so typos surface before any git or
@@ -4253,7 +4291,7 @@ Example: zh subissue add 42 100 101"
     if ! [[ "$stripped_parent" =~ ^[0-9]+$ ]]; then
         error "Invalid parent issue number: ${parent_num}"
     fi
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${raw_num}"
@@ -4397,7 +4435,25 @@ mis-typed parent numbers — otherwise 'remove 9999 100' would happily
 unlink #100 from its real parent while reporting 'removed from #9999'."
     fi
 
-    local child_nums=("$@")
+    # Dedup input numbers (first-occurrence order) so a repeated arg
+    # can't inflate the success count. Mirrors cmd_subissue_add and
+    # the Python remove_sub_issues boundary dedup.
+    local -a child_nums=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in ${child_nums[@]+"${child_nums[@]}"}; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            child_nums+=("$stripped_arg")
+        fi
+    done
+
     local stripped_parent="${parent_num#\#}"
 
     # Argument-format validation BEFORE any network or git lookup, so typos
@@ -4405,7 +4461,7 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
     if ! [[ "$stripped_parent" =~ ^[0-9]+$ ]]; then
         error "Invalid parent issue number: ${parent_num}"
     fi
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${raw_num}"
@@ -4883,7 +4939,11 @@ Example: zh subissue list 42"
         return
     fi
 
-    echo "$children_json" | jq -r '.nodes[] |
+    # `select(. != null)` skips any null page entries — same
+    # defensive-normalization SPEC the Python `list_sub_issues` walker
+    # follows. Without it `\(.number)` interpolation errors out on a
+    # null element ("Cannot iterate over null").
+    echo "$children_json" | jq -r '.nodes[] | select(. != null) |
         "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
         while IFS=$'\t' read -r num istate pipeline assignees ititle; do
             local marker="  "
