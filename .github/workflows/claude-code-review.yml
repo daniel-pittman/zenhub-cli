@@ -1,0 +1,67 @@
+# Automated Claude code review on every pull request.
+#
+# This workflow uses the OAuth-bound CLAUDE_CODE_OAUTH_TOKEN (provisioned by
+# `claude /install-github-app` from a local Claude Code session) rather than a
+# metered API key, so the review draws against a Claude subscription rather
+# than billing per-run.
+#
+# Why this workflow is safe on a PUBLIC repository:
+#
+#   * Trigger is `pull_request`, NOT `pull_request_target`. `pull_request_target`
+#     runs in the base repository's context and exposes secrets to code from
+#     an untrusted fork PR (a credential-exfiltration risk). `pull_request`
+#     runs the workflow definition from the BASE branch and does not expose
+#     secrets to fork code by default.
+#
+#   * "Require approval for all outside collaborators" is enabled in the
+#     repository's Actions settings. A first-time outside contributor's first
+#     workflow run must be approved by a maintainer before any Action executes,
+#     which bounds drive-by subscription-quota burn from random PRs.
+#
+#   * Permissions are scoped to what claude-code-action needs to read the PR
+#     diff, post a review comment, and request an OIDC token; no broader
+#     scope is granted.
+#
+#   * The direct GitHub action is pinned to a full commit SHA with a version
+#     comment. The plugin marketplace below is anthropics' own repository, so
+#     the trust posture is the same as trusting the action itself.
+#
+# The CLAUDE_CODE_OAUTH_TOKEN repository secret must be provisioned by a
+# maintainer (see SECURITY.md).
+
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      actions: read
+      id-token: write
+    steps:
+      # SHA-pinned actions/checkout v4.2.2
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      # SHA-pinned anthropics/claude-code-action v1.0.133. Bump by re-resolving
+      # the v1 tag's target commit:
+      #   gh api repos/anthropics/claude-code-action/git/refs/tags/v1
+      - name: Run Claude code review
+        uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1.0.133
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
+          plugins: 'code-review@claude-code-plugins'
+          include_fix_links: true
+          track_progress: true
+          allowed_bots: 'claude[bot]'
+          claude_args: '--model opus'
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
