@@ -286,6 +286,8 @@ Sub-issues sit below regular issues (Epic → Issue → Sub-issue). Use this tie
 
 When recommending sub-issue use over epics: epics are workspace-scoped and visible in the workspace epic list; sub-issues are issue-scoped and only visible from their parent. Choose epics for cross-team / multi-sprint groupings, sub-issues for tight "one parent ticket, several worker tickets" relationships.
 
+**Multi-repo workspaces:** `zh subissue` resolves issue numbers via the current git checkout's repo. In a multi-repo ZenHub workspace, a parent in one repo with sub-issues in another can't be wired up from a single working directory — each invocation has to run from the repo that owns the issue numbers being passed. Epic operations have the same scope limitation, but the 3-tier framing tends to invite cross-repo grouping more often than epics do (a parent ticket in a "platform" repo with worker sub-issues across "service-A" and "service-B" repos is a natural pattern that doesn't work with this CLI today). If a project hits this, propose: (a) keep the hierarchy single-repo by re-filing one side, (b) build the parent/child relationship via the ZenHub web UI directly, or (c) flag it as a future extension candidate for `zh`.
+
 ### Batch operations (wave pattern)
 
 A robust reference pattern for safely executing many ZH operations in sequence:
