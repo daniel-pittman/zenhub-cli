@@ -3185,6 +3185,29 @@ Examples:
   zh sprint add active 42              # 'active' is an alias for current"
     fi
 
+    # Dedup the input numbers (preserving first-occurrence order) so a
+    # repeated arg can't inflate the success count when the API
+    # returns one link per unique issue. Mirrors the Python boundary
+    # dedup in add_issues_to_sprint. Uses a plain-array contains-check
+    # rather than an associative array so it stays portable to the
+    # bash 3.2 that ships on macOS.
+    local -a inputs=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in "${inputs[@]}"; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            inputs+=("$stripped_arg")
+        fi
+    done
+    set -- "${inputs[@]}"
+
     local owner_repo
     owner_repo=$(get_repo_info)
 
@@ -3211,11 +3234,17 @@ Examples:
     # Fire the mutation. Ask for sprintIssues back so we can detect
     # partial failures (the API doesn't return failedIssues for this
     # mutation — anything not in the response inferred-failed).
+    # Project repository on each link so we can filter by repo before
+    # crediting numbers — sibling repos can share issue numbers in a
+    # multi-repo workspace.
     local mutation='
     mutation($input: AddIssuesToSprintsInput!) {
         addIssuesToSprints(input: $input) {
             sprintIssues {
-                issue { number }
+                issue {
+                    number
+                    repository { ownerName name }
+                }
                 sprint { id }
             }
         }
@@ -3228,10 +3257,27 @@ Examples:
     local response
     response=$(zh_graphql "$mutation" "$mutation_vars")
 
-    # Detect which input numbers came back as links.
+    # Detect which input numbers came back as links. Filter by sprint id
+    # AND by repo so a sibling repo's same-numbered issue can't credit
+    # as our success in a multi-repo workspace.
+    local owner_lc repo_lc
+    owner_lc="${owner_repo%%/*}"
+    repo_lc="${owner_repo##*/}"
+
     local returned_nums_csv
-    returned_nums_csv=$(echo "$response" | jq -r --arg sid "$sprint_id" \
-        '[.data.addIssuesToSprints.sprintIssues[] | select(.sprint.id == $sid) | .issue.number] | map(tostring) | join(",")')
+    returned_nums_csv=$(echo "$response" | jq -r \
+        --arg sid "$sprint_id" \
+        --arg owner "$owner_lc" \
+        --arg repo "$repo_lc" \
+        '[
+           .data.addIssuesToSprints.sprintIssues[]
+           | select(.sprint.id == $sid)
+           | select(
+               (.issue.repository.ownerName | ascii_downcase) == ($owner | ascii_downcase)
+               and (.issue.repository.name | ascii_downcase) == ($repo | ascii_downcase)
+             )
+           | .issue.number
+         ] | map(tostring) | join(",")')
 
     local input_nums_csv
     input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
@@ -3283,6 +3329,27 @@ Examples:
   zh sprint rm active 42               # 'rm' is an alias for remove"
     fi
 
+    # Dedup input numbers (first-occurrence order) so a repeated arg
+    # can't be over-counted. Mirrors the Python boundary dedup in
+    # remove_issues_from_sprint. Plain-array contains-check for
+    # bash 3.2 portability (no associative arrays).
+    local -a inputs=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in "${inputs[@]}"; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            inputs+=("$stripped_arg")
+        fi
+    done
+    set -- "${inputs[@]}"
+
     local owner_repo
     owner_repo=$(get_repo_info)
 
@@ -3324,11 +3391,30 @@ Examples:
     zh_graphql "$mutation" "$mutation_vars" > /dev/null
 
     # Post-state walk to determine which inputs are still in the sprint.
+    # zh_sprint_issues_fetch_all already projects repository per issue,
+    # so we can filter by repo here — sibling repos can share issue
+    # numbers in a multi-repo workspace and we must not mis-classify
+    # our removal as failed because some other repo's same-numbered
+    # issue is still in the sprint.
     local post_state
     post_state=$(zh_sprint_issues_fetch_all "$sprint_id")
 
+    local owner_lc repo_lc
+    owner_lc="${owner_repo%%/*}"
+    repo_lc="${owner_repo##*/}"
+
     local still_attached_nums_csv
-    still_attached_nums_csv=$(echo "$post_state" | jq -r '[.nodes[].issue.number] | map(tostring) | join(",")')
+    still_attached_nums_csv=$(echo "$post_state" | jq -r \
+        --arg owner "$owner_lc" \
+        --arg repo "$repo_lc" \
+        '[
+           .nodes[]
+           | select(
+               (.issue.repository.ownerName | ascii_downcase) == ($owner | ascii_downcase)
+               and (.issue.repository.name | ascii_downcase) == ($repo | ascii_downcase)
+             )
+           | .issue.number
+         ] | map(tostring) | join(",")')
 
     local input_nums_csv
     input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
