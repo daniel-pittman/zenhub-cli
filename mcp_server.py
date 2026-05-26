@@ -1670,21 +1670,59 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
     Partial-failure handling: the API returns the sprint's post-
     mutation state. We compare the input numbers against the sprint's
     post-state `sprintIssues`; anything STILL attached after the
-    mutation is inferred-failed. For sprints with >100 issues we
-    follow up with a paginated read to make sure post-page-2 entries
-    aren't mistaken for failures.
+    mutation is inferred-failed. For sprints with >100 issues, OR
+    when the mutation response omits the target sprint entirely, we
+    walk the sprint directly to determine the authoritative post-
+    state. Each post-state issue is filtered by repository so a
+    sibling repo's same-numbered issue can't mis-classify our
+    removal.
 
-    Args / returns: same shape as `sprint_add_issues`.
+    Returns the same shape as `sprint_add_issues`, plus:
+      - `inspected_full`: bool — True when we walked every page (or
+        the response was complete on its own).
+      - `pagination_warning`: str | None — surfaced when the follow-
+        up walk bailed defensively (stuck cursor / iteration cap).
+      - `response_anomaly`: str | None — surfaced when the mutation
+        response omitted or returned an empty `sprints` array.
     """
     if not issue_numbers:
-        return {"ok": False, "stderr": "issue_numbers must be non-empty"}
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
+            "stderr": "issue_numbers must be non-empty",
+        }
     if not sprint_name or not str(sprint_name).strip():
-        return {"ok": False, "stderr": "sprint_name must be non-empty"}
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
+            "stderr": "sprint_name must be non-empty",
+        }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "sprint_id": None, "sprint_name": sprint_name,
                 "outcome": "fail", "success_count": 0, "failed_count": 0,
-                "succeeded": [], "failed": []}
+                "succeeded": [], "failed": [],
+                "inspected_full": False,
+                "pagination_warning": None,
+                "response_anomaly": None}
     from zh_graphql_ops import remove_issues_from_sprint  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1701,6 +1739,9 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
             "stderr": str(e),
         }
     return {
@@ -1712,6 +1753,9 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
+        "inspected_full": result.get("inspected_full", False),
+        "pagination_warning": result.get("pagination_warning"),
+        "response_anomaly": result.get("response_anomaly"),
         "stderr": result.get("error") or "",
     }
 

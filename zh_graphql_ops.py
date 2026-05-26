@@ -1366,6 +1366,13 @@ def _resolve_issue_ids_in_repo(
 
     Returns `({number: gid}, not_found_numbers)`. Pre-flight validation
     so we can fail cleanly on typos before firing a mutation.
+
+    Note on duplicates: this function returns a `{number: gid}` dict, so
+    duplicate input numbers collapse to a single entry. Dedup should
+    happen at the CALL SITE (with `dict.fromkeys` to preserve order)
+    BEFORE handing the list here, otherwise the caller's `issue_numbers`
+    keeps the duplicates and the success/failure accounting can over-
+    report. The two mutation entrypoints below do this explicitly.
     """
     out: dict[int, str] = {}
     missing: list[int] = []
@@ -1387,7 +1394,14 @@ def add_issues_to_sprint(
     `sprintIssues` against the input set. Issues that don't appear in
     the response are inferred-failed — the API doesn't tell us WHY
     (e.g. issue already in the sprint, archived, etc.), only that the
-    new link didn't materialize.
+    new link didn't materialize. The link's `issue.repository` is
+    cross-checked against `ctx.owner_repo` (case-insensitive) so a
+    sibling repo's same-numbered issue can't accidentally count as
+    success in a multi-repo workspace.
+
+    Duplicate input numbers are collapsed first-occurrence (e.g.
+    `[42, 42, 43]` is treated as `[42, 43]`) so the success accounting
+    can't be inflated by repeating an input.
 
     Args:
         ctx: RepoContext.
@@ -1415,6 +1429,11 @@ def add_issues_to_sprint(
             raise ZhApiError(
                 f"every issue number must be a positive int (got {n!r})"
             )
+
+    # Dedup at the boundary — preserves first-occurrence order so the
+    # output `succeeded` / `failed` lists are stable across calls.
+    # Review finding #10.
+    issue_numbers = list(dict.fromkeys(issue_numbers))
 
     sprint_id, actual_sprint_name, err = _find_sprint_id(ctx, sprint_name)
     if err or not sprint_id:
@@ -1461,15 +1480,18 @@ def add_issues_to_sprint(
     returned_links = payload.get("sprintIssues") or []
 
     # The API returns one SprintIssue per (issue, sprint) link that was
-    # created. Filter to links for THIS sprint and pull out the issue
-    # number from each. Cross-reference against our input to identify
-    # successes and inferred-failures.
+    # created. Filter to links for THIS sprint AND in the ctx's repo
+    # before pulling issue numbers — without the repo filter, a
+    # sibling repo's same-numbered issue could falsely register as
+    # success in a multi-repo workspace. Review finding #8.
     succeeded_numbers: set[int] = set()
     for link in returned_links:
         sprint = (link or {}).get("sprint") or {}
         if sprint.get("id") != sprint_id:
             continue
         issue = (link or {}).get("issue") or {}
+        if not repos_match(issue.get("repository"), ctx.owner_repo):
+            continue
         num = issue.get("number")
         if isinstance(num, int):
             succeeded_numbers.add(num)
@@ -1496,15 +1518,35 @@ def remove_issues_from_sprint(
 ) -> dict:
     """Remove one or more issues from a sprint.
 
-    Identifies partial failures by walking the sprint's post-mutation
-    `sprintIssues` (in the response) and checking which input numbers
-    are STILL there. Anything still attached is inferred-failed.
+    Identifies partial failures by checking which input numbers are
+    STILL attached to the sprint AFTER the mutation. The mutation
+    response includes the sprint's first 100 sprintIssues; we walk all
+    pages when the response was full (>100 issues) and ALSO when the
+    response didn't include the target sprint at all (a documented
+    API contract anomaly we recover from rather than fail loudly).
 
-    Note on completeness: the response's `sprint.sprintIssues` is
-    capped at 100. For sprints with >100 issues we follow up with a
-    paginated read of the sprint to determine the full post-state.
+    Each post-state issue's `repository` is filtered against
+    `ctx.owner_repo` (case-insensitive) before its number lands in the
+    "still attached" set — without this, a sibling repo's same-
+    numbered issue in the sprint could mis-classify our removal as a
+    failure.
 
-    Args mirror add_issues_to_sprint. Returns the same shape.
+    Duplicate input numbers are collapsed first-occurrence before any
+    counting happens.
+
+    Returns:
+        dict with the same shape as add_issues_to_sprint, plus:
+            inspected_full: bool — True if we walked every page (or
+                if the mutation response had <100 nodes so we knew
+                the response was complete).
+            pagination_warning: str | None — propagated from the
+                follow-up walk if the walker bailed defensively
+                (stuck cursor or iteration cap).
+            response_anomaly: str | None — set if the mutation
+                response omitted the target sprint or returned an
+                empty `sprints` array; we recovered via a follow-up
+                walk and surface the anomaly so callers can log /
+                investigate.
     """
     if not issue_numbers:
         raise ZhApiError("issue_numbers must be non-empty")
@@ -1513,6 +1555,9 @@ def remove_issues_from_sprint(
             raise ZhApiError(
                 f"every issue number must be a positive int (got {n!r})"
             )
+
+    # Same dedup boundary as add. Review finding #10.
+    issue_numbers = list(dict.fromkeys(issue_numbers))
 
     sprint_id, actual_sprint_name, err = _find_sprint_id(ctx, sprint_name)
     if err or not sprint_id:
@@ -1525,6 +1570,9 @@ def remove_issues_from_sprint(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
             "error": err,
         }
 
@@ -1539,6 +1587,9 @@ def remove_issues_from_sprint(
             "failed_count": len(missing),
             "succeeded": [],
             "failed": missing,
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
             "error": (
                 "Some issue numbers were not found in this repository: "
                 + ", ".join(f"#{n}" for n in missing)
@@ -1558,44 +1609,94 @@ def remove_issues_from_sprint(
     payload = (resp.get("data") or {}).get("removeIssuesFromSprints") or {}
     sprints_after = payload.get("sprints") or []
 
-    # Locate the target sprint's post-state.
+    # Locate the target sprint's post-state in the response.
     target_sprint = next(
         (s for s in sprints_after if (s or {}).get("id") == sprint_id),
         None,
     )
 
-    # Decide which input numbers are still attached. Start from the
-    # mutation response (up to 100 issues); if there were more we
-    # follow up with a paginated walk so we don't classify removed
-    # issues as still-attached just because they're on page 2.
-    still_attached_numbers: set[int] = set()
-    inspected_full = False
-    if target_sprint is not None:
-        nodes = ((target_sprint.get("sprintIssues") or {}).get("nodes")) or []
-        for n_link in nodes:
+    # Build the still-attached set, filtering by repo so a sibling
+    # repo's same-numbered issue can't mis-classify our removal as a
+    # failure. Review finding #3.
+    def _attached_from_nodes(nodes: list[dict]) -> set[int]:
+        attached: set[int] = set()
+        for n_link in nodes or []:
             issue = (n_link or {}).get("issue") or {}
+            if not repos_match(issue.get("repository"), ctx.owner_repo):
+                continue
             num = issue.get("number")
             if isinstance(num, int):
+                attached.add(num)
+        return attached
+
+    still_attached_numbers: set[int] = set()
+    inspected_full = False
+    pagination_warning: str | None = None
+    response_anomaly: str | None = None
+
+    if target_sprint is None:
+        # Review finding #1: the response's `sprints: [Sprint!]!` field
+        # is non-null-list-of-non-null-sprint per schema, so an empty
+        # array or a response missing our sprint id is anomalous. The
+        # mutation may well have succeeded; we just lost the post-
+        # state reference. Recover by walking the sprint directly
+        # rather than silently treating every input as removed.
+        if not sprints_after:
+            response_anomaly = (
+                "Mutation response had an empty `sprints` array; "
+                "walked sprint directly to determine post-state."
+            )
+        else:
+            returned_ids = [
+                (s or {}).get("id") for s in sprints_after if s
+            ]
+            response_anomaly = (
+                f"Mutation response did not include sprint {sprint_id!r} "
+                f"in its `sprints` array (got: {returned_ids!r}); "
+                "walked sprint directly to determine post-state."
+            )
+        walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+        # The repository field from the walker is in
+        # {"owner": ..., "name": ...} form, not {"ownerName", "name"};
+        # adapt before passing to repos_match.
+        for w in walked:
+            rep = w.get("repository") or {}
+            if not repos_match(
+                {"ownerName": rep.get("owner"), "name": rep.get("name")},
+                ctx.owner_repo,
+            ):
+                continue
+            num = w.get("number")
+            if isinstance(num, int):
                 still_attached_numbers.add(num)
-        # If the response was truncated, walk for the full state.
-        # (Conservative: walk whenever the response was full, since we
-        # can't tell from the mutation payload alone whether there's
-        # more.)
+        inspected_full = True
+        pagination_warning = walk_warning
+    else:
+        nodes = ((target_sprint.get("sprintIssues") or {}).get("nodes")) or []
+        still_attached_numbers = _attached_from_nodes(nodes)
+        # If the response was full, walk for the rest. Review finding
+        # #2 / #14: preserve and surface the walker's
+        # pagination_warning (was previously discarded via `_,`).
         if len(nodes) >= 100:
-            walked, _ = _walk_sprint_issues(ctx, sprint_id)
-            still_attached_numbers = {
-                w.get("number") for w in walked
-                if isinstance(w.get("number"), int)
-            }
+            walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+            still_attached_numbers = set()
+            for w in walked:
+                rep = w.get("repository") or {}
+                if not repos_match(
+                    {"ownerName": rep.get("owner"), "name": rep.get("name")},
+                    ctx.owner_repo,
+                ):
+                    continue
+                num = w.get("number")
+                if isinstance(num, int):
+                    still_attached_numbers.add(num)
+            inspected_full = True
+            pagination_warning = walk_warning
+        else:
+            # Response had <100 nodes, so we know it was the whole
+            # post-state.
             inspected_full = True
 
-    # An input was successfully removed iff it's not in the still-
-    # attached set AFTER the mutation. To avoid false-positives when
-    # the mutation response was incomplete and we couldn't follow up,
-    # we'd want a follow-up read — but the conservative path (above)
-    # already handles that. `inspected_full` is recorded for caller
-    # transparency.
-    _ = inspected_full
     succeeded = [n for n in issue_numbers if n not in still_attached_numbers]
     failed = [n for n in issue_numbers if n in still_attached_numbers]
     outcome = _classify_outcome(len(succeeded), len(failed))
@@ -1609,5 +1710,8 @@ def remove_issues_from_sprint(
         "failed_count": len(failed),
         "succeeded": succeeded,
         "failed": failed,
+        "inspected_full": inspected_full,
+        "pagination_warning": pagination_warning,
+        "response_anomaly": response_anomaly,
         "error": None,
     }

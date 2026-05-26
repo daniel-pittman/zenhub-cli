@@ -598,3 +598,364 @@ def test_remove_issues_from_sprint_validates_inputs():
         zh_graphql_ops.remove_issues_from_sprint(ctx, "Sprint 7", [])
     with pytest.raises(zh_api.ZhApiError):
         zh_graphql_ops.remove_issues_from_sprint(ctx, "Sprint 7", [-1])
+
+
+# =============================================================================
+# Second-pass review fixes: #1, #2, #3, #8, #10
+# =============================================================================
+
+# ---- #1: empty `sprints` array in mutation response -----------------------
+
+def _remove_resp_empty_sprints() -> dict:
+    """Mutation response anomaly: `sprints: []` despite the schema's
+    non-null-list-of-non-null-sprint type. Pre-fix this would silently
+    treat every input as removed."""
+    return {"data": {"removeIssuesFromSprints": {"sprints": []}}}
+
+
+def _remove_resp_wrong_sprint(other_sprint_id: str = "sprint-OTHER") -> dict:
+    """Mutation response includes a sprint, but not the one we targeted."""
+    return {
+        "data": {
+            "removeIssuesFromSprints": {
+                "sprints": [
+                    {
+                        "id": other_sprint_id,
+                        "sprintIssues": {"nodes": []},
+                    }
+                ]
+            }
+        }
+    }
+
+
+def _walked_issues_page(nodes: list[dict], *, has_next: bool = False,
+                        end_cursor: str | None = None) -> dict:
+    """Wrapper for the _walk_sprint_issues page query response."""
+    return _sprint_issues_page(nodes, has_next=has_next, end_cursor=end_cursor)
+
+
+def test_remove_walks_when_response_has_empty_sprints_array(monkeypatch):
+    """Review #1: empty `sprints` array triggers explicit re-read.
+
+    The non-null-list-of-non-null-sprint schema means an empty array
+    is anomalous. Pre-fix, `target_sprint` resolved to None, the inner
+    block was skipped, and every input ended up in `succeeded`. After
+    the fix we walk the sprint to determine real post-state.
+    """
+    ctx = _ctx()
+    responses = [
+        # 1. _find_sprint_id
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        # 2-3. Issue pre-flight
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        # 4. Mutation response with anomalous empty sprints array
+        _remove_resp_empty_sprints(),
+        # 5. The follow-up walk: 100 is gone, 101 is still attached
+        _walked_issues_page([_issue_node(101)]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100, 101]
+        )
+    assert out["succeeded"] == [100]
+    assert out["failed"] == [101]
+    assert out["outcome"] == "partial"
+    assert out["inspected_full"] is True
+    assert out["response_anomaly"] is not None
+    assert "empty" in out["response_anomaly"].lower()
+
+
+def test_remove_walks_when_response_omits_target_sprint():
+    """Review #1: response includes a different sprint, not ours."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _remove_resp_wrong_sprint("sprint-DIFFERENT"),
+        _walked_issues_page([]),  # walk shows empty sprint
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100]
+        )
+    assert out["succeeded"] == [100]
+    assert out["failed"] == []
+    assert out["outcome"] == "ok"
+    assert out["response_anomaly"] is not None
+    assert "did not include sprint" in out["response_anomaly"].lower()
+
+
+# ---- #2: pagination_warning preserved from follow-up walk -----------------
+
+def test_remove_surfaces_pagination_warning_from_followup_walk():
+    """Review #2: the walker's pagination_warning was discarded via `_,`.
+
+    Now it must propagate to the result dict so callers see when the
+    follow-up walk bailed defensively (stuck cursor or iteration cap).
+    """
+    ctx = _ctx()
+    # Build a response where the mutation returns 100 nodes (forcing
+    # a follow-up walk), then the walk hits a stuck cursor.
+    full_page = [_issue_node(2000 + i) for i in range(100)]
+    full_remove_resp = {
+        "data": {
+            "removeIssuesFromSprints": {
+                "sprints": [
+                    {
+                        "id": "sprint-7",
+                        "sprintIssues": {
+                            "nodes": [
+                                {
+                                    "issue": {
+                                        "number": 2000 + i,
+                                        "repository": {
+                                            "ownerName": "acme",
+                                            "name": "widgets",
+                                        },
+                                    }
+                                }
+                                for i in range(100)
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    # The walk response has the first page full but cursor missing
+    # while hasNextPage=true — should trip the stuck-cursor guard.
+    stuck_walk_page = _sprint_issues_page(
+        full_page, has_next=True, end_cursor=None
+    )
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        full_remove_resp,
+        stuck_walk_page,
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100]
+        )
+    assert out["pagination_warning"] is not None
+    assert "cursor not advancing" in out["pagination_warning"].lower()
+    assert out["inspected_full"] is True
+
+
+# ---- #3: filter still-attached nodes by repo (multi-repo workspace) -------
+
+def test_remove_filters_post_state_by_repo():
+    """Review #3: a sibling-repo issue #42 in the sprint must NOT
+    mis-classify our (acme/widgets#42) removal as still-attached.
+    """
+    ctx = _ctx()  # owner_repo="acme/widgets"
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(42),
+        # Post-state: 42 from acme/widgets is GONE, but 42 from
+        # acme/OTHER is still in the sprint. Pre-fix would think
+        # we failed to remove.
+        {
+            "data": {
+                "removeIssuesFromSprints": {
+                    "sprints": [{
+                        "id": "sprint-7",
+                        "sprintIssues": {
+                            "nodes": [
+                                {"issue": {
+                                    "number": 42,
+                                    "repository": {
+                                        "ownerName": "acme",
+                                        "name": "OTHER",
+                                    },
+                                }},
+                            ]
+                        },
+                    }]
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [42]
+        )
+    assert out["succeeded"] == [42]
+    assert out["failed"] == []
+    assert out["outcome"] == "ok"
+
+
+def test_remove_post_state_with_owner_case_difference():
+    """Review #3: repo comparison must be case-insensitive (matches
+    `repos_match`'s contract used elsewhere in the codebase).
+    """
+    ctx = _ctx()  # owner_repo="acme/widgets"
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(42),
+        # Same repo but the API returned ALL CAPS owner name — the
+        # filter should still treat it as our repo.
+        {
+            "data": {
+                "removeIssuesFromSprints": {
+                    "sprints": [{
+                        "id": "sprint-7",
+                        "sprintIssues": {
+                            "nodes": [
+                                {"issue": {
+                                    "number": 42,
+                                    "repository": {
+                                        "ownerName": "ACME",
+                                        "name": "WIDGETS",
+                                    },
+                                }},
+                            ]
+                        },
+                    }]
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [42]
+        )
+    # Same number + matching repo (case-insensitive) → still attached
+    assert out["failed"] == [42]
+    assert out["succeeded"] == []
+
+
+# ---- #8: filter add response by repo --------------------------------------
+
+def test_add_filters_response_links_by_repo():
+    """Review #8: a sibling-repo link must NOT count as our success.
+
+    Construct a mutation response with TWO links for issue #42 — one
+    in acme/widgets (ours) and one in acme/OTHER (not ours). Only
+    the ctx-repo link should land in succeeded.
+    """
+    ctx = _ctx()  # owner_repo="acme/widgets"
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(42),
+        # Response has two links for #42, only one in our repo
+        {
+            "data": {
+                "addIssuesToSprints": {
+                    "sprintIssues": [
+                        {
+                            "id": "link-A",
+                            "issue": {
+                                "number": 42,
+                                "repository": {
+                                    "ownerName": "acme",
+                                    "name": "OTHER",
+                                },
+                            },
+                            "sprint": {"id": "sprint-7"},
+                        },
+                        {
+                            "id": "link-B",
+                            "issue": {
+                                "number": 42,
+                                "repository": {
+                                    "ownerName": "acme",
+                                    "name": "widgets",
+                                },
+                            },
+                            "sprint": {"id": "sprint-7"},
+                        },
+                    ]
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 7", [42])
+    assert out["succeeded"] == [42]
+    assert out["failed"] == []
+    assert out["outcome"] == "ok"
+
+
+def test_add_does_not_count_only_sibling_repo_link_as_success():
+    """If the API returns ONLY a sibling-repo link for our number, we
+    must NOT credit it as success."""
+    ctx = _ctx()  # owner_repo="acme/widgets"
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(42),
+        {
+            "data": {
+                "addIssuesToSprints": {
+                    "sprintIssues": [
+                        {
+                            "id": "link-OTHER",
+                            "issue": {
+                                "number": 42,
+                                "repository": {
+                                    "ownerName": "acme",
+                                    "name": "OTHER",
+                                },
+                            },
+                            "sprint": {"id": "sprint-7"},
+                        }
+                    ]
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(ctx, "Sprint 7", [42])
+    assert out["succeeded"] == []
+    assert out["failed"] == [42]
+    assert out["outcome"] == "fail"
+
+
+# ---- #10: dedup input at the boundary -------------------------------------
+
+def test_add_deduplicates_input_numbers():
+    """Review #10: duplicate input numbers must collapse first-occurrence.
+
+    Pre-fix, `[42, 42, 43]` could resolve to ids `{42: gid, 43: gid}`,
+    fire the mutation with 2 ids, get 2 links back, and `succeeded`
+    might list `[42, 42, 43]` (each duplicate matched) — over-counting
+    success.
+    """
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        # Pre-flight only looks up unique ids
+        _issue_by_info_resp(42),
+        _issue_by_info_resp(43),
+        _add_resp([42, 43]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(
+            ctx, "Sprint 7", [42, 42, 43]
+        )
+    # After dedup: `[42, 43]` and both succeed
+    assert sorted(out["succeeded"]) == [42, 43]
+    assert out["failed"] == []
+    assert out["success_count"] == 2  # NOT 3
+    assert len(out["succeeded"]) == 2  # NOT 3
+
+
+def test_remove_deduplicates_input_numbers():
+    """Same dedup contract on remove."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(42),
+        _issue_by_info_resp(43),
+        # Post-state: neither 42 nor 43 — both successfully removed
+        _remove_resp([]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [42, 43, 42]
+        )
+    assert sorted(out["succeeded"]) == [42, 43]
+    assert out["success_count"] == 2
+    assert out["failed"] == []
