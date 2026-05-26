@@ -36,6 +36,14 @@ permissions:
   contents: read
   pull-requests: write
 
+# Cancel superseded runs on the same PR. This one matters most for cost:
+# the security-review workflow uses the metered ANTHROPIC_API_KEY (not the
+# OAuth token), so each run bills against the API account. Push-after-push
+# iteration without this block burns credits on stale SHAs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   security-review:
     runs-on: ubuntu-latest

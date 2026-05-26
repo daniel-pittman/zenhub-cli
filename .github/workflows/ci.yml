@@ -14,6 +14,15 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same PR / ref. Without this, rapid PR
+# iteration queues parallel runs against stale SHAs, which on the metered /
+# subscription-bound review workflows below would burn credits unnecessarily.
+# CI itself is free, but we set the same posture across all workflows for
+# consistency and to keep the Actions tab readable.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   syntax:
     runs-on: ubuntu-latest

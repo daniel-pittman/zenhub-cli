@@ -35,6 +35,13 @@ on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
 
+# Cancel superseded runs on the same PR. Rapid push-after-push iteration
+# would otherwise queue parallel Claude-review runs against stale SHAs,
+# burning OAuth subscription quota for output nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
     runs-on: ubuntu-latest
