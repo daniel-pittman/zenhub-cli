@@ -182,11 +182,22 @@ def _seconds_since(iso: Optional[str]) -> float:
 
 
 # Repo names on GitHub can contain dots ("docs.github.io",
-# "my.tool", "internal.docs"). The old `[^/.]+?` group silently
-# failed to match those. Matches the regex in zh_api.py:_GH_URL_RE
-# and the bash regex in `zh`. Exported as a module constant so tests
-# can exercise it directly without needing a git checkout.
-_GITHUB_URL_RE = re.compile(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$")
+# "my.tool", "internal.docs").
+#
+# The prefix `(?:git@github\.com:|https?://github\.com/)` is the
+# canonical form, unified with `zh_api._GH_URL_RE` and the bash
+# regex in `zh:get_repo_info`. The source URL always comes from
+# `git remote get-url origin` (or the `ZH_REPO` config override),
+# which produces either `git@github.com:owner/repo[.git]` (ssh) or
+# `https://github.com/owner/repo[.git]` (https). Schemes like
+# `ssh://git@github.com/...`, `git://...`, and `git+ssh://...` are
+# accepted by some git clients but are NOT what `git remote get-url`
+# emits, so the regex rejects them to keep the three parser
+# locations in lockstep. Round-4 finding #5.
+_GITHUB_URL_RE = re.compile(
+    r"(?:git@github\.com:|https?://github\.com/)"
+    r"([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
 
 
 def repo_from_cwd(cwd: str) -> str:

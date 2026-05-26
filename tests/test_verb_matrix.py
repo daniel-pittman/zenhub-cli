@@ -695,7 +695,12 @@ class TestGetSprintDetail:
 
     def test_null_issue_wrapper_skipped(self):
         """SPEC: a sprintIssues page containing `[None, {"issue": ...}]`
-        must skip the None entry, not crash on `.get`."""
+        must SKIP the None entry — not emit a phantom record into
+        `issues`. The other two walkers (list_sub_issues, list_sprints)
+        already enforce this; the sprint-issues walker historically
+        appended `{number: None, title: ""}` for nulls because the
+        loop body did `(wrapper or {}).get("issue") or {}`.
+        Round-4 finding #4."""
         ctx = make_ctx()
         with patch_ctx_query(ctx, [
             sprints_page([sprint_node("sprint-7", "Sprint 7")]),
@@ -706,6 +711,18 @@ class TestGetSprintDetail:
         assert out["ok"] is True
         nums = [i["number"] for i in out["issues"]]
         assert 100 in nums
+        # SPEC tightening: there should be exactly ONE issue (#100).
+        # A phantom record from the None wrapper would show up as a
+        # 2nd entry with `number == None` and empty title. Pin that
+        # the phantom is NOT emitted.
+        assert out["issue_count"] == 1, (
+            f"phantom record leaked: issues={out['issues']!r}"
+        )
+        # Belt-and-suspenders: every issue must have a valid number.
+        for i in out["issues"]:
+            assert isinstance(i["number"], int), (
+                f"non-int number leaked from null wrapper: {i!r}"
+            )
 
     def test_null_pipeline_node_entry_does_not_crash(self):
         """SPEC: `pipelineIssues.nodes[0]` can be null defensively.
@@ -1141,20 +1158,124 @@ class TestGhUrlRegex:
 
     def test_gist_url_rejected(self):
         """SPEC: gist URLs are not GitHub repos and must NOT parse as
-        owner/repo. The regex anchors on `github.com[:/]` so this is
-        already enforced, but pin it explicitly."""
+        owner/repo. Pre-round-4 the regex used a permissive
+        `github.com[:/]` anchor that incidentally matched
+        `gist.github.com` (documented as "imperfect-but-harmless").
+        Round-4 unified the regex on a strict
+        `https?://github.com/` prefix that now rejects gist URLs
+        outright. Round-4 #5."""
         m = zh_api._GH_URL_RE.search("https://gist.github.com/acme/abc123")
-        # gist.github.com matches `github.com[:/]` because the regex
-        # doesn't require start-of-string. Document the SPEC contract:
-        # the regex IS imperfect on gist URLs (matches the path) — but
-        # since we never get gist URLs from `git remote get-url origin`
-        # for repos, the imperfection is harmless. Pin behavior so we
-        # at least know what it is.
-        if m:
-            # If it matches, owner+repo together must not look like a
-            # gist (numeric repo id). Existing behavior: matches
-            # ("acme", "abc123"). Document with a note.
-            assert m.group("owner") == "acme"
+        assert m is None, (
+            f"gist URL should NOT match the canonical regex; got {m!r}"
+        )
+
+
+class TestUrlRegexParity:
+    """Round-4 finding #5: three GitHub-URL regexes (zh_api,
+    similarity, zh bash) used to accept different sets of inputs.
+    They must now agree.
+
+    The canonical contract: the source URL is always what
+    `git remote get-url origin` emits in practice, which is either
+    `git@github.com:owner/repo[.git]` (ssh) or
+    `https://github.com/owner/repo[.git]` (https). Schemes accepted
+    by some git clients but NOT emitted by `git remote get-url`
+    (ssh://, git://, git+ssh://) are rejected.
+    """
+
+    # The Python regexes are importable; the bash one isn't directly,
+    # so we test both Python parsers and document that the bash regex
+    # is kept structurally identical (verified inline at the source).
+
+    ACCEPTED_FORMS = [
+        ("git@github.com:acme/widgets.git", "acme", "widgets"),
+        ("git@github.com:acme/widgets", "acme", "widgets"),
+        ("https://github.com/acme/widgets.git", "acme", "widgets"),
+        ("https://github.com/acme/widgets", "acme", "widgets"),
+        ("http://github.com/acme/widgets/", "acme", "widgets"),
+        # Dots in repo names — all three parsers must handle.
+        ("git@github.com:acme/docs.github.io.git",
+         "acme", "docs.github.io"),
+        ("https://github.com/acme/internal.docs", "acme", "internal.docs"),
+    ]
+
+    REJECTED_FORMS = [
+        # SSH-protocol-prefixed (not what `git remote get-url` emits)
+        "ssh://git@github.com/acme/widgets",
+        # Old git:// (not what `git remote get-url` emits for GH)
+        "git://github.com/acme/widgets",
+        # git+ssh:// (likewise)
+        "git+ssh://git@github.com/acme/widgets",
+        # Gist URLs (different service)
+        # NB: zh_api documented this as imperfect-but-harmless above.
+        # The stricter prefix now rejects gist URLs explicitly.
+        "https://gist.github.com/acme/abc123",
+    ]
+
+    def _zh_api_parse(self, url):
+        m = zh_api._GH_URL_RE.search(url)
+        if not m:
+            return None
+        return (m.group("owner"), m.group("repo"))
+
+    def _similarity_parse(self, url):
+        from similarity import _GITHUB_URL_RE
+        m = _GITHUB_URL_RE.search(url)
+        if not m:
+            return None
+        return (m.group(1), m.group(2))
+
+    def test_zh_api_accepts_canonical_forms(self):
+        for url, owner, repo in self.ACCEPTED_FORMS:
+            result = self._zh_api_parse(url)
+            assert result == (owner, repo), (
+                f"zh_api regex failed on {url!r}: got {result!r}"
+            )
+
+    def test_similarity_accepts_canonical_forms(self):
+        for url, owner, repo in self.ACCEPTED_FORMS:
+            result = self._similarity_parse(url)
+            assert result == (owner, repo), (
+                f"similarity regex failed on {url!r}: got {result!r}"
+            )
+
+    def test_zh_api_rejects_non_canonical_forms(self):
+        """SPEC: prefix-anchored regex MUST NOT silently match
+        schemes that `git remote get-url origin` doesn't emit.
+        Matrix gap from round-4 #5."""
+        for url in self.REJECTED_FORMS:
+            result = self._zh_api_parse(url)
+            assert result is None, (
+                f"zh_api regex unexpectedly matched {url!r}: "
+                f"got {result!r}"
+            )
+
+    def test_similarity_rejects_non_canonical_forms(self):
+        """Same SPEC as the zh_api side — parity is the load-bearing
+        property."""
+        for url in self.REJECTED_FORMS:
+            result = self._similarity_parse(url)
+            assert result is None, (
+                f"similarity regex unexpectedly matched {url!r}: "
+                f"got {result!r}"
+            )
+
+    def test_parsers_agree_on_every_input(self):
+        """The two Python parsers must produce identical outputs for
+        the same input — anything else is the kind of drift that
+        bit us in rounds 1 / 2 / 3. (Bash is structurally identical
+        but not directly testable from Python; see commit message.)"""
+        all_inputs = (
+            [url for url, _, _ in self.ACCEPTED_FORMS]
+            + list(self.REJECTED_FORMS)
+        )
+        for url in all_inputs:
+            zh_api_result = self._zh_api_parse(url)
+            sim_result = self._similarity_parse(url)
+            assert zh_api_result == sim_result, (
+                f"parsers disagree on {url!r}: "
+                f"zh_api={zh_api_result!r} similarity={sim_result!r}"
+            )
 
 
 # =============================================================================

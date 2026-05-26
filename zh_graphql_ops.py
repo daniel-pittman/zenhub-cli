@@ -1244,6 +1244,15 @@ def _walk_sprint_issues(
         node = data["node"]
         conn = node.get("sprintIssues") or {}
         for wrapper in conn.get("nodes") or []:
+            # Defensive: skip null page entries the way the other two
+            # walkers (list_sub_issues, list_sprints) do, rather than
+            # appending a phantom `{number: None, title: ""}` record.
+            # `remove_issues_from_sprint` filters phantoms via
+            # `isinstance(num, int)` so it's unaffected, but
+            # `get_sprint_detail` leaks the phantom into its `issues`
+            # list. Matrix gap from round 4 finding #4.
+            if wrapper is None:
+                continue
             issue = (wrapper or {}).get("issue") or {}
             assignees = [
                 a.get("login")

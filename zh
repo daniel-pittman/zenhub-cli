@@ -142,17 +142,25 @@ For multi-workspace repos, also see -w / --workspace and ZH_WORKSPACE."
     #
     # Repo names on GitHub can contain dots (e.g. "docs.github.io",
     # "my.tool", "internal.docs"). The repo group used to be `[^/.]+`
-    # which silently failed to match those. The Python `_GH_URL_RE`
-    # was fixed previously; this brings the bash regex in line.
+    # which silently failed to match those.
+    #
+    # The prefix anchors strictly on either `git@github.com:` (ssh)
+    # or `https?://github.com/` (https) — the two forms `git remote
+    # get-url origin` emits in practice. Schemes like `ssh://`,
+    # `git://`, and `git+ssh://` are accepted by some git clients
+    # but not produced by `git remote get-url`, so we reject them to
+    # keep this regex in lockstep with the Python parsers in
+    # `zh_api._GH_URL_RE` and `similarity._GITHUB_URL_RE`.
+    # Round-4 finding #5.
     #
     # Bash extended regex doesn't support non-greedy quantifiers, so
-    # we match greedily on `[^/]+` and then strip the optional
-    # `.git` suffix and trailing `/` from the captured repo name.
-    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/]+) ]]; then
-        local owner="${BASH_REMATCH[1]}"
-        local repo="${BASH_REMATCH[2]}"
-        # Drop trailing slash + optional .git suffix.
-        repo="${repo%/}"
+    # we trim any trailing `/` from the URL up-front and match
+    # greedily on `[^/]+`, then strip the optional `.git` suffix
+    # from the captured repo name.
+    local trimmed_url="${remote_url%/}"
+    if [[ "$trimmed_url" =~ ^(git@github\.com:|https?://github\.com/)([^/]+)/([^/]+)$ ]]; then
+        local owner="${BASH_REMATCH[2]}"
+        local repo="${BASH_REMATCH[3]}"
         repo="${repo%.git}"
         echo "${owner}/${repo}"
     else
@@ -2971,8 +2979,13 @@ zh_sprint_issues_fetch_all() {
             error "Sprint '${sprint_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
         fi
 
+        # `select(. != null)` strips null page entries before
+        # aggregating. The Python walker now skips null wrappers
+        # (round-4 #4); this is the bash mirror. Without it,
+        # downstream `.nodes[].issue` would emit phantom `null`
+        # lines for each null wrapper.
         local page_nodes
-        page_nodes=$(echo "$response" | jq -c '.data.node.sprintIssues.nodes // []')
+        page_nodes=$(echo "$response" | jq -c '[(.data.node.sprintIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
@@ -4396,7 +4409,7 @@ Example: zh subissue add 42 100 101"
     parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
 
     local child_ids_json
-    child_ids_json=$(zh_resolve_issue_ids "$repo_id" "${child_nums[@]}")
+    child_ids_json=$(zh_resolve_issue_ids "$repo_id" ${child_nums[@]+"${child_nums[@]}"})
 
     local mutation_vars
     mutation_vars=$(jq -n \
@@ -4447,7 +4460,7 @@ Example: zh subissue add 42 100 101"
     # in shell rather than asking the API because addSubIssues only returns
     # failedIssues (not the inverse).
     local added_nums_csv_parts=""
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         local was_failed
         was_failed=$(echo "$response" | jq -r --argjson n "$stripped" \
@@ -4567,7 +4580,7 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
     # findings recorded earlier in the same batch.
     local child_id_list="[]"
     local mismatches=""
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
 
         local lookup_query='
@@ -4676,7 +4689,7 @@ parent relationship before retrying."
         '(.data.removeSubIssues.failedIssues // []) | map("#" + (.number|tostring)) | join(",")')
 
     local removed_nums_csv_parts=""
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         local was_failed
         was_failed=$(echo "$response" | jq -r --argjson n "$stripped" \
@@ -5000,7 +5013,16 @@ Example: zh subissue list 42"
     local parent_title child_count fetched_count
     parent_title=$(echo "$children_json" | jq -r '.parentTitle')
     child_count=$(echo "$children_json" | jq -r '.totalCount // 0')
-    fetched_count=$(echo "$children_json" | jq -r '.nodes | length')
+
+    # Normalize once: strip any null page entries up-front so the
+    # count we report and the loop we iterate share the same view of
+    # the data. Round-4 #7: the pre-fix code counted `.nodes | length`
+    # (pre-filter) and iterated `.nodes[] | select(. != null)`
+    # (post-filter), so the divergence warning below could compare
+    # inflated counts against `child_count`.
+    local children_clean
+    children_clean=$(echo "$children_json" | jq -c '[.nodes[] | select(. != null)]')
+    fetched_count=$(echo "$children_clean" | jq -r 'length')
 
     echo ""
     echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
@@ -5023,11 +5045,9 @@ Example: zh subissue list 42"
         return
     fi
 
-    # `select(. != null)` skips any null page entries — same
-    # defensive-normalization SPEC the Python `list_sub_issues` walker
-    # follows. Without it `\(.number)` interpolation errors out on a
-    # null element ("Cannot iterate over null").
-    echo "$children_json" | jq -r '.nodes[] | select(. != null) |
+    # Iterate the normalized intermediate so the display matches the
+    # count above. Null entries were already filtered out.
+    echo "$children_clean" | jq -r '.[] |
         "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
         while IFS=$'\t' read -r num istate pipeline assignees ititle; do
             local marker="  "
