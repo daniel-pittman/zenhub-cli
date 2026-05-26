@@ -243,6 +243,79 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
     return issues
 
 
+def _parse_subissue_listing(plain: str) -> dict:
+    """Parse `zh subissue list <parent#>` output into structured form.
+
+    Returns:
+        {
+            "parent_title": str,
+            "total_count": int,
+            "children": [{"number": int, "title": str, "state": str,
+                          "pipeline": str | None, "assignees": [str]}, ...],
+            "fetched_count": int,  # may differ from total_count if pagination drifts
+        }
+
+    Parser is defensive — any line that doesn't match the row format is
+    skipped, and missing fields degrade to sensible defaults. If the output
+    is unparseable the caller still has `raw` to fall back on.
+    """
+    out = {
+        "parent_title": "",
+        "total_count": 0,
+        "children": [],
+        "fetched_count": 0,
+    }
+
+    lines = plain.splitlines()
+
+    # Header: "Sub-issues of #<N> <parent_title>"
+    for line in lines:
+        m = re.match(r"^Sub-issues of #(\d+)\s+(.*)$", line.strip())
+        if m:
+            out["parent_title"] = m.group(2).strip()
+            break
+
+    # "  Children: <N>"
+    for line in lines:
+        m = re.match(r"^\s*Children:\s*(\d+)\s*$", line)
+        if m:
+            out["total_count"] = int(m.group(1))
+            break
+
+    # Rows: "  #NNN   │ pipeline_truncated_to_20 │ assignees_truncated_to_15 │ [✓ ]Title"
+    # The closed-marker prefix (✓) on the title is meaningful — preserve the
+    # explicit state derivation rather than parsing it out of the marker.
+    row_re = re.compile(
+        r"^\s*#(\d+)\s+│\s*(.*?)\s*│\s*(.*?)\s*│\s*(✓\s+)?(.*?)\s*$"
+    )
+    for line in lines:
+        m = row_re.match(line)
+        if not m:
+            continue
+        number = int(m.group(1))
+        pipeline = m.group(2).strip() or None
+        # The pipeline column shows "—" for unset; normalize to None.
+        if pipeline == "—":
+            pipeline = None
+        assignees_raw = m.group(3).strip()
+        if assignees_raw == "unassigned":
+            assignees: list[str] = []
+        else:
+            assignees = [a.strip() for a in assignees_raw.split(",") if a.strip()]
+        is_closed = m.group(4) is not None
+        title = m.group(5).strip()
+        out["children"].append({
+            "number": number,
+            "title": title,
+            "state": "CLOSED" if is_closed else "OPEN",
+            "pipeline": pipeline,
+            "assignees": assignees,
+        })
+
+    out["fetched_count"] = len(out["children"])
+    return out
+
+
 def _parse_new_issue_number(plain: str) -> int | None:
     """Extract issue number from 'Created issue #NNN' output."""
     m = re.search(r"Created issue #(\d+)", plain)
@@ -1105,18 +1178,51 @@ def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
 def subissue_list(parent_number: int, repo_path: str = "") -> dict:
     """List sub-issues of a parent issue.
 
+    Returns both the human-readable `raw` text and a structured `children`
+    array so LLM callers don't have to re-parse the columns. The
+    `total_count` is what ZenHub's `zenhubChildIssues.totalCount` reported;
+    `fetched_count` is how many rows the parser actually extracted from
+    `raw`. Under normal operation those agree — a divergence indicates
+    either parser-format drift or pagination drift in `zh` itself.
+
     Args:
         parent_number: Issue number of the parent.
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, parent_number, raw, stderr.
+        dict with:
+            ok: bool
+            parent_number: int
+            parent_title: str
+            total_count: int                 — from "Children: N" header
+            fetched_count: int               — len(children)
+            children: list[dict] where each dict has
+                number: int
+                title: str
+                state: "OPEN" | "CLOSED"
+                pipeline: str | None
+                assignees: list[str]
+            raw: str                         — the full formatted CLI output
+            stderr: str
     """
     r = _run_zh(["subissue", "list", str(parent_number)],
                 cwd=_resolve_cwd(repo_path))
+    if r["ok"]:
+        parsed = _parse_subissue_listing(r["stdout_plain"])
+    else:
+        parsed = {
+            "parent_title": "",
+            "total_count": 0,
+            "fetched_count": 0,
+            "children": [],
+        }
     return {
         "ok": r["ok"],
         "parent_number": parent_number,
+        "parent_title": parsed["parent_title"],
+        "total_count": parsed["total_count"],
+        "fetched_count": parsed["fetched_count"],
+        "children": parsed["children"],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
