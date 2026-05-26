@@ -3427,35 +3427,32 @@ mutation unlinks each child from whatever parent it currently has."
     fi
 }
 
-cmd_subissue_list() {
-    local parent_num="${1:-}"
+# Fetch ALL sub-issues for a parent issue, walking the zenhubChildIssues
+# connection with cursor pagination until pageInfo.hasNextPage is false.
+#
+# Echoes a single JSON object on stdout:
+#   { totalCount: N, parentTitle: "...", nodes: [ {number,title,state,assignees,pipelineIssue,repository}, ... ] }
+#
+# Or echoes the literal string "null" if the parent issue is not found.
+#
+# Arguments: repo_id, workspace_id, parent_num
+zh_subissue_fetch_all() {
+    local repo_id="$1"
+    local workspace_id="$2"
+    local parent_num="$3"
 
-    if [[ -z "$parent_num" ]]; then
-        error "Usage: zh subissue list <parent#>
-Example: zh subissue list 42"
-    fi
-
-    parent_num="${parent_num#\#}"
-
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
-
-    local workspace_id
-    workspace_id=$(get_workspace_id "$owner_repo")
-
-    # Fetch the parent issue + its child connection. Matches the format
-    # cmd_epic_show uses for child issues.
     local query='
-    query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!) {
+    query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!, $after: String) {
         issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
             number
             title
             state
-            zenhubChildIssues(first: 100) {
+            zenhubChildIssues(first: 100, after: $after) {
                 totalCount
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
                 nodes {
                     number
                     title
@@ -3475,24 +3472,170 @@ Example: zh subissue list 42"
         }
     }'
 
-    local variables
-    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$parent_num" \
-        --arg workspace_id "$workspace_id" \
-        '{repoId: $repo_id, issueNumber: $issue_num, workspaceId: $workspace_id}')
+    local cursor="null"
+    local all_nodes="[]"
+    local total_count=0
+    local parent_title=""
+    local first_page=true
 
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    while :; do
+        local variables
+        variables=$(jq -n \
+            --arg repo_id "$repo_id" \
+            --argjson issue_num "$parent_num" \
+            --arg workspace_id "$workspace_id" \
+            --argjson after "$cursor" \
+            '{repoId: $repo_id, issueNumber: $issue_num, workspaceId: $workspace_id, after: $after}')
 
-    local issue
-    issue=$(echo "$response" | jq '.data.issueByInfo')
+        local response
+        response=$(zh_graphql "$query" "$variables")
 
-    if [[ "$issue" == "null" ]]; then
+        local issue_json
+        issue_json=$(echo "$response" | jq '.data.issueByInfo')
+
+        if [[ "$issue_json" == "null" ]]; then
+            echo "null"
+            return
+        fi
+
+        if [[ "$first_page" == "true" ]]; then
+            parent_title=$(echo "$issue_json" | jq -r '.title // ""')
+            total_count=$(echo "$issue_json" | jq -r '.zenhubChildIssues.totalCount // 0')
+            first_page=false
+        fi
+
+        # Append this page's nodes to all_nodes.
+        local page_nodes
+        page_nodes=$(echo "$issue_json" | jq -c '.zenhubChildIssues.nodes // []')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.endCursor // empty')
+
+        if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
+            break
+        fi
+
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n \
+        --argjson nodes "$all_nodes" \
+        --argjson total "$total_count" \
+        --arg title "$parent_title" \
+        '{totalCount: $total, parentTitle: $title, nodes: $nodes}'
+}
+
+# Lightweight variant of zh_subissue_fetch_all that returns only {id, number}
+# per child. Used by reorder to look up sibling IDs across all pages without
+# pulling assignee/pipeline/repo data we don't need.
+#
+# Echoes JSON: { totalCount: N, nodes: [{id, number}, ...] } or "null" if the
+# parent isn't found.
+#
+# Arguments: repo_id, parent_num
+zh_subissue_fetch_ids_only() {
+    local repo_id="$1"
+    local parent_num="$2"
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!, $after: String) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            zenhubChildIssues(first: 100, after: $after) {
+                totalCount
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+                nodes {
+                    id
+                    number
+                }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local all_nodes="[]"
+    local total_count=0
+    local first_page=true
+
+    while :; do
+        local variables
+        variables=$(jq -n \
+            --arg repo_id "$repo_id" \
+            --argjson issue_num "$parent_num" \
+            --argjson after "$cursor" \
+            '{repoId: $repo_id, issueNumber: $issue_num, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        local issue_json
+        issue_json=$(echo "$response" | jq '.data.issueByInfo')
+
+        if [[ "$issue_json" == "null" ]]; then
+            echo "null"
+            return
+        fi
+
+        if [[ "$first_page" == "true" ]]; then
+            total_count=$(echo "$issue_json" | jq -r '.zenhubChildIssues.totalCount // 0')
+            first_page=false
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$issue_json" | jq -c '.zenhubChildIssues.nodes // []')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.endCursor // empty')
+
+        if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
+            break
+        fi
+
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n \
+        --argjson nodes "$all_nodes" \
+        --argjson total "$total_count" \
+        '{totalCount: $total, nodes: $nodes}'
+}
+
+cmd_subissue_list() {
+    local parent_num="${1:-}"
+
+    if [[ -z "$parent_num" ]]; then
+        error "Usage: zh subissue list <parent#>
+Example: zh subissue list 42"
+    fi
+
+    parent_num="${parent_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local children_json
+    children_json=$(zh_subissue_fetch_all "$repo_id" "$workspace_id" "$parent_num")
+
+    if [[ "$children_json" == "null" ]]; then
         error "Issue #${parent_num} not found in this repository"
     fi
 
-    local parent_title child_count
-    parent_title=$(echo "$issue" | jq -r '.title')
-    child_count=$(echo "$issue" | jq -r '.zenhubChildIssues.totalCount // 0')
+    local parent_title child_count fetched_count
+    parent_title=$(echo "$children_json" | jq -r '.parentTitle')
+    child_count=$(echo "$children_json" | jq -r '.totalCount // 0')
+    fetched_count=$(echo "$children_json" | jq -r '.nodes | length')
 
     echo ""
     echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
@@ -3506,7 +3649,7 @@ Example: zh subissue list 42"
         return
     fi
 
-    echo "$issue" | jq -r '.zenhubChildIssues.nodes[] |
+    echo "$children_json" | jq -r '.nodes[] |
         "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
         while IFS=$'\t' read -r num istate pipeline assignees ititle; do
             local marker="  "
@@ -3518,6 +3661,13 @@ Example: zh subissue list 42"
             printf "  ${BOLD}#%-5s${NC} │ %-20s │ %-15s │ ${color}%s%s${NC}\n" \
                 "$num" "${pipeline:0:20}" "${assignees:0:15}" "$marker" "$ititle"
         done
+
+    # Defensive: surface any mismatch between totalCount and what we actually
+    # fetched. This shouldn't happen with cursor pagination, but if a future
+    # API change broke pageInfo.hasNextPage we'd at least notice.
+    if [[ "$fetched_count" -ne "$child_count" ]]; then
+        warn "Listed ${fetched_count} of ${child_count} sub-issues (pagination drift)"
+    fi
 
     echo ""
 }
@@ -3545,8 +3695,9 @@ resolved to the first/last sibling on the client side."
     fi
 
     # Argument-only validation up-front, before any network round-trips:
-    # 'after' and 'before' require a third positional. Doing this check here
-    # rather than inside the case below saves a wasted API call.
+    # 'after' and 'before' require a third positional, and the sibling can't
+    # be the child being moved. Doing these checks here rather than inside
+    # the case below saves wasted API calls and surfaces typos faster.
     case "$position" in
         top|first|bottom|last)
             ;;
@@ -3554,6 +3705,14 @@ resolved to the first/last sibling on the client side."
             if [[ -z "$sibling_num" ]]; then
                 error "'${position}' requires a sibling issue number.
 Example: zh subissue reorder ${child_num} ${position} 101"
+            fi
+            # Reject self-anchor: passing the same number for child and
+            # sibling would send `afterId == childIssueId` to the API, which
+            # is at best a no-op and at worst undefined behavior. Compare
+            # stripped values so `#100` vs `100` doesn't sneak through.
+            if [[ "${child_num#\#}" == "${sibling_num#\#}" ]]; then
+                error "Cannot anchor #${child_num#\#} against itself.
+'${position}' requires a different sibling issue number."
             fi
             ;;
         *)
@@ -3570,8 +3729,10 @@ Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
-    # Resolve the child issue and find its parent. We need both: the API
-    # requires both parentId and childIssueId on every reprioritize call.
+    # Step 1: resolve the child to its ZenHub ID + parent reference. We don't
+    # fetch the sibling list here — that comes from the paginated fetcher
+    # below — because the parent could have >100 children and the sibling we
+    # need to anchor against may be on a later page.
     local lookup_query='
     query($repoId: ID!, $issueNumber: Int!) {
         issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
@@ -3580,12 +3741,6 @@ Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
             parentIssue {
                 id
                 number
-                zenhubChildIssues(first: 100) {
-                    nodes {
-                        id
-                        number
-                    }
-                }
             }
         }
     }'
@@ -3611,13 +3766,25 @@ Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
 Use 'zh subissue add <parent#> ${child_num}' first."
     fi
 
+    # Step 2: fetch ALL sibling IDs via the paginated helper. For top/bottom
+    # we need first/last sibling IDs; for after/before we need to look up the
+    # named sibling by issue number, which could live on any page. The
+    # ids-only variant skips assignee/pipeline/repo projection since reorder
+    # doesn't need them.
+    local sibling_ids_json
+    sibling_ids_json=$(zh_subissue_fetch_ids_only "$repo_id" "$parent_num")
+
+    if [[ "$sibling_ids_json" == "null" ]]; then
+        error "Could not load siblings of #${child_num} (parent #${parent_num} not found?)"
+    fi
+
     # Resolve the position keyword to an afterId or beforeId. ZenHub treats
     # `afterId: null` and `beforeId: null` specially:
     #   - afterId only set → place right after that sibling
     #   - beforeId only set → place right before that sibling
     #   - both null         → place at the top (no anchor)
-    #   - top → beforeId = first sibling's id
-    #   - bottom → afterId = last sibling's id
+    #   - top → beforeId = first sibling's id (excluding self)
+    #   - bottom → afterId = last sibling's id (excluding self)
     local after_id="null"
     local before_id="null"
     local position_desc=""
@@ -3625,9 +3792,9 @@ Use 'zh subissue add <parent#> ${child_num}' first."
     case "$position" in
         top|first)
             local first_sib_id
-            first_sib_id=$(echo "$lookup_response" | \
+            first_sib_id=$(echo "$sibling_ids_json" | \
                 jq -r --arg cid "$child_id" \
-                '[.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select(.id != $cid)][0].id // empty')
+                '[.nodes[] | select(.id != $cid)][0].id // empty')
             if [[ -z "$first_sib_id" ]]; then
                 # Already only-child or nothing to anchor against. Leave both
                 # null — the API treats that as "move to top".
@@ -3639,9 +3806,9 @@ Use 'zh subissue add <parent#> ${child_num}' first."
             ;;
         bottom|last)
             local last_sib_id
-            last_sib_id=$(echo "$lookup_response" | \
+            last_sib_id=$(echo "$sibling_ids_json" | \
                 jq -r --arg cid "$child_id" \
-                '[.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select(.id != $cid)][-1].id // empty')
+                '[.nodes[] | select(.id != $cid)][-1].id // empty')
             if [[ -z "$last_sib_id" ]]; then
                 position_desc="bottom (only child)"
             else
@@ -3650,21 +3817,11 @@ Use 'zh subissue add <parent#> ${child_num}' first."
             fi
             ;;
         after)
-            if [[ -z "$sibling_num" ]]; then
-                error "'after' requires a sibling issue number.
-Example: zh subissue reorder ${child_num} after 101"
-            fi
             sibling_num="${sibling_num#\#}"
-            # Use jq's `first(...)` to short-circuit at the first match. We
-            # avoid piping to `head -n 1` here because under `set -o pipefail`
-            # a SIGPIPE from jq could surface as exit 141 if the sibling list
-            # is large enough for jq to still be producing output when head
-            # closes its input. Each issue number is unique per parent, so
-            # `first` returns exactly that one id (or empty if no match).
             local sib_id
-            sib_id=$(echo "$lookup_response" | \
+            sib_id=$(echo "$sibling_ids_json" | \
                 jq -r --arg n "$sibling_num" \
-                'first(.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id) // empty')
+                'first(.nodes[] | select((.number|tostring) == $n) | .id) // empty')
             if [[ -z "$sib_id" ]]; then
                 error "Sibling #${sibling_num} is not a child of parent #${parent_num}"
             fi
@@ -3672,24 +3829,16 @@ Example: zh subissue reorder ${child_num} after 101"
             position_desc="after #${sibling_num}"
             ;;
         before)
-            if [[ -z "$sibling_num" ]]; then
-                error "'before' requires a sibling issue number.
-Example: zh subissue reorder ${child_num} before 102"
-            fi
             sibling_num="${sibling_num#\#}"
             local sib_id
-            sib_id=$(echo "$lookup_response" | \
+            sib_id=$(echo "$sibling_ids_json" | \
                 jq -r --arg n "$sibling_num" \
-                'first(.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id) // empty')
+                'first(.nodes[] | select((.number|tostring) == $n) | .id) // empty')
             if [[ -z "$sib_id" ]]; then
                 error "Sibling #${sibling_num} is not a child of parent #${parent_num}"
             fi
             before_id="\"${sib_id}\""
             position_desc="before #${sibling_num}"
-            ;;
-        *)
-            error "Invalid position: ${position}
-Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
             ;;
     esac
 
