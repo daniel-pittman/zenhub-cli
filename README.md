@@ -2,6 +2,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/daniel-pittman/zenhub-cli)](https://github.com/daniel-pittman/zenhub-cli/releases)
+[![CI](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 A powerful command-line interface for ZenHub. Manage issues, pipelines, sprints, and more directly from your terminal.
 
@@ -400,6 +402,8 @@ $ zh issue 100
 
 **Sub-issues vs Epics:** epics are workspace-scoped and visible in the workspace's Epics view; sub-issues are issue-scoped and only visible from their parent. Choose epics for cross-team / multi-sprint groupings; choose sub-issues for tight "one parent ticket, a few worker tickets" relationships.
 
+> **Multi-repo workspaces:** `zh subissue` commands resolve issue numbers via the *current git checkout's* GitHub repo. In a ZenHub workspace that spans multiple GitHub repos, a parent in repo A with sub-issues in repo B can't be managed from a single working directory — each `zh subissue` invocation has to be run from a checkout of the repo whose issue numbers are being passed. The 3-tier framing (Epic → Issue → Sub-issue) often invites cross-repo grouping; plan parent/child placement with that limitation in mind, or do the cross-repo plumbing via the ZenHub web UI. Epic operations have the same scope limitation; sub-issues just feel it more often because the hierarchy is tighter.
+
 ### Discovery Commands
 
 ```bash
@@ -538,7 +542,7 @@ A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. I
 
 ### What it exposes
 
-Roughly 25 tools covering the same surface as `zh`:
+Roughly 30 tools covering the same surface as `zh`:
 
 | Category | Tools |
 |---|---|
