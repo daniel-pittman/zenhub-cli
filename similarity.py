@@ -195,7 +195,9 @@ def _seconds_since(iso: Optional[str]) -> float:
 # emits, so the regex rejects them to keep the three parser
 # locations in lockstep. Round-4 finding #5.
 _GITHUB_URL_RE = re.compile(
-    r"(?:git@github\.com:|https?://github\.com/)"
+    # `^` anchor (round-5 #6) rejects garbage prefixes. Matches the
+    # zh_api._GH_URL_RE form exactly.
+    r"^(?:git@github\.com:|https?://github\.com/)"
     r"([^/]+)/([^/]+?)(?:\.git)?/?$"
 )
 
@@ -205,10 +207,20 @@ def repo_from_cwd(cwd: str) -> str:
 
     Supports both https and ssh remote URL forms.
     Raises RuntimeError on failure.
+
+    Uses `git remote get-url origin` rather than `git config --get
+    remote.origin.url` — the former honors `url.<x>.insteadOf`
+    rewriting that the user may have configured globally (typical
+    for corporate-network mirrors or push/pull splits). The latter
+    returns the raw config value, which can disagree with what
+    `git fetch` / `git push` actually use. `zh_api.get_owner_repo_
+    from_git` already uses `git remote get-url`; aligning here so
+    the similarity cache and the MCP context resolution see the
+    same effective remote. Round-5 #7.
     """
     try:
         url = subprocess.check_output(
-            ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
             text=True,
             stderr=subprocess.PIPE,
         ).strip()

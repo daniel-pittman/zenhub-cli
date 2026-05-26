@@ -43,6 +43,21 @@ from zh_api import (
 )
 
 
+def _is_positive_int(n) -> bool:  # noqa: ANN001
+    """Strict positive-int check that rejects bool.
+
+    `isinstance(n, int)` returns True for `bool` (bool is a subclass
+    of int in Python), so naive validation `isinstance(n, int) and
+    n > 0` would accept `True` (== 1) and `False` (== 0). This
+    helper rejects bools explicitly. Round-5 #10.
+    """
+    return (
+        isinstance(n, int)
+        and not isinstance(n, bool)
+        and n > 0
+    )
+
+
 def get_issue_by_info(
     ctx: RepoContext, issue_number: int
 ) -> dict | None:
@@ -51,7 +66,7 @@ def get_issue_by_info(
     Returns None when the issue doesn't exist in this repository. Raises
     ZhApiError for bad input or top-level GraphQL errors.
     """
-    if not isinstance(issue_number, int) or issue_number <= 0:
+    if not _is_positive_int(issue_number):
         raise ZhApiError(
             f"issue number must be a positive int (got {issue_number!r})"
         )
@@ -145,7 +160,7 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
                 repository: {"owner": str, "name": str}
             pagination_warning: str | None — set if we bailed defensively
     """
-    if not isinstance(parent_number, int) or parent_number <= 0:
+    if not _is_positive_int(parent_number):
         raise ZhApiError(
             f"parent_number must be a positive int (got {parent_number!r})"
         )
@@ -329,7 +344,7 @@ def _resolve_child_id(
     ctx: RepoContext, child_number: int
 ) -> dict:
     """Look up a child issue's GraphQL id + its current parent (if any)."""
-    if not isinstance(child_number, int) or child_number <= 0:
+    if not _is_positive_int(child_number):
         raise ZhApiError(
             f"child issue number must be a positive int (got {child_number!r})"
         )
@@ -380,7 +395,7 @@ def add_sub_issues(
     if not child_numbers:
         raise ZhApiError("child_numbers must be non-empty")
     for n in child_numbers:
-        if not isinstance(n, int) or n <= 0:
+        if not _is_positive_int(n):
             raise ZhApiError(
                 f"every child number must be a positive int (got {n!r})"
             )
@@ -520,7 +535,7 @@ def remove_sub_issues(
     if not child_numbers:
         raise ZhApiError("child_numbers must be non-empty")
     for n in child_numbers:
-        if not isinstance(n, int) or n <= 0:
+        if not _is_positive_int(n):
             raise ZhApiError(
                 f"every child number must be a positive int (got {n!r})"
             )
@@ -729,7 +744,7 @@ def reorder_sub_issue(
     elif pos in {"bottom", "last"}:
         pos = "bottom"
     elif pos in {"after", "before"}:
-        if not isinstance(sibling_number, int) or sibling_number <= 0:
+        if not _is_positive_int(sibling_number):
             raise ZhApiError(
                 f"position {pos!r} requires a positive sibling_number "
                 f"(got {sibling_number!r})"
@@ -740,7 +755,7 @@ def reorder_sub_issue(
         )
 
     # Resolve the child + its parent.
-    if not isinstance(child_number, int) or child_number <= 0:
+    if not _is_positive_int(child_number):
         raise ZhApiError(
             f"child_number must be a positive int (got {child_number!r})"
         )
@@ -1497,7 +1512,7 @@ def add_issues_to_sprint(
     if not issue_numbers:
         raise ZhApiError("issue_numbers must be non-empty")
     for n in issue_numbers:
-        if not isinstance(n, int) or n <= 0:
+        if not _is_positive_int(n):
             raise ZhApiError(
                 f"every issue number must be a positive int (got {n!r})"
             )
@@ -1645,7 +1660,7 @@ def remove_issues_from_sprint(
     if not issue_numbers:
         raise ZhApiError("issue_numbers must be non-empty")
     for n in issue_numbers:
-        if not isinstance(n, int) or n <= 0:
+        if not _is_positive_int(n):
             raise ZhApiError(
                 f"every issue number must be a positive int (got {n!r})"
             )

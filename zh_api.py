@@ -198,7 +198,13 @@ _GH_URL_RE = re.compile(
     # then strip an optional trailing `.git` and trailing `/`. A
     # non-greedy `[^/]+?` ensures the optional `\.git` suffix is
     # claimed at the end rather than absorbed into the name.
-    r"(?:git@github\.com:|https?://github\.com/)"
+    #
+    # The `^` anchor (round-5 #6) rejects garbage prefixes — without
+    # it `re.search` would accept "prefix-junk-git@github.com:owner/
+    # repo" by matching the substring starting at `git@`. The
+    # canonical contract is: input must START with one of the two
+    # accepted scheme forms.
+    r"^(?:git@github\.com:|https?://github\.com/)"
     r"(?P<owner>[^/]+)/"
     r"(?P<repo>[^/]+?)(?:\.git)?/?$"
 )

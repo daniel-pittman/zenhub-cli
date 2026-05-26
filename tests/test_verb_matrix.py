@@ -661,7 +661,17 @@ class TestGetSprintDetail:
     def test_null_sprint_header_raises(self):
         """SPEC: header query returns `data.node = null` → fail loudly.
         A sprint that's known to the index but null at header time is
-        either deleted or ACL-revoked between phases."""
+        either deleted or ACL-revoked between phases.
+
+        Test-discipline note (round-5 #3): an earlier version wrapped
+        this in `with pytest.raises((ZhApiError, Exception)):` and put
+        the assert inside the block. `AssertionError` is a subclass
+        of `Exception`, so any assertion that fired inside the block
+        was silently caught — the test would pass whether
+        `get_sprint_detail` raised, returned ok=False, OR returned
+        ok=True. Restructured so the SPEC ("raise OR return ok=False;
+        never silent ok=True") is actually enforceable.
+        """
         ctx = make_ctx()
         with patch_ctx_query(ctx, [
             sprints_page([sprint_node("sprint-7", "Sprint 7")]),
@@ -671,14 +681,15 @@ class TestGetSprintDetail:
             # StopIteration AFTER missing the assertion below.
             sprint_issues_null_node(),
         ]):
-            with pytest.raises((zh_api.ZhApiError, Exception)):
-                # Either raises (preferred) or returns ok=False; the
-                # current implementation reads `node.get("name") or ...`
-                # which would NPE on None. We accept either failure
-                # mode but not silent success.
+            try:
                 out = zh_graphql_ops.get_sprint_detail(ctx, "current")
-                # If we got here without raising, must be ok=False.
-                assert out["ok"] is False
+            except zh_api.ZhApiError:
+                return  # SPEC: raising loudly is acceptable
+        assert out["ok"] is False, (
+            "get_sprint_detail returned ok=True for a null sprint "
+            "header — SPEC says raise ZhApiError OR return ok=False, "
+            "never silent success"
+        )
 
     def test_walker_null_node_in_detail_path_raises(self):
         """SPEC: the issues-page walker hitting null-node mid-walk
@@ -1210,6 +1221,10 @@ class TestUrlRegexParity:
         # NB: zh_api documented this as imperfect-but-harmless above.
         # The stricter prefix now rejects gist URLs explicitly.
         "https://gist.github.com/acme/abc123",
+        # Garbage prefix (round-5 #6) — `^` anchor rejects.
+        "prefix-junk-git@github.com:owner/repo",
+        "noise https://github.com/owner/repo",
+        " git@github.com:owner/repo",
     ]
 
     def _zh_api_parse(self, url):

@@ -444,6 +444,26 @@ def test_add_sub_issues_validates_numeric_input():
         zh_graphql_ops.add_sub_issues(ctx, 42, [100, -5])
 
 
+def test_add_sub_issues_rejects_bool_input():
+    """Round-5 finding #10: `bool` is a subclass of `int` in Python,
+    so naive `isinstance(n, int)` accepts `True` (== 1) and
+    `False` (== 0). The validator must explicitly reject bool to
+    avoid firing the mutation with garbage input that GraphQL
+    might or might not silently accept.
+    """
+    ctx = _ctx()
+    with pytest.raises(zh_api.ZhApiError) as exc:
+        zh_graphql_ops.add_sub_issues(ctx, 42, [True])  # type: ignore[list-item]
+    assert "positive int" in str(exc.value).lower()
+    # Same for the parent_number / child_number args
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.add_sub_issues(ctx, True, [100])  # type: ignore[arg-type]
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.remove_sub_issues(ctx, 42, [False])  # type: ignore[list-item]
+    with pytest.raises(zh_api.ZhApiError):
+        zh_graphql_ops.reorder_sub_issue(ctx, True, "top")  # type: ignore[arg-type]
+
+
 # =============================================================================
 # remove_sub_issues
 # =============================================================================

@@ -111,6 +111,28 @@ def test_owner_repo_url_regex_with_dots_in_repo_name():
         )
 
 
+def test_garbage_prefix_rejected():
+    """Round-5 finding #6: without `^` anchor, `re.search` would
+    accept a garbage prefix by matching the URL substring.
+    Canonical contract: input must START with one of the two
+    accepted scheme forms.
+    """
+    garbage_inputs = [
+        "prefix-junk-git@github.com:owner/repo",
+        "noise https://github.com/owner/repo",
+        # Embedded newline + valid URL on second line (re.search would
+        # accept this without the anchor + MULTILINE caveats)
+        "\nhttps://github.com/owner/repo",
+        # Leading whitespace
+        " git@github.com:owner/repo",
+    ]
+    for url in garbage_inputs:
+        m = zh_api._GH_URL_RE.search(url)
+        assert m is None, (
+            f"garbage-prefixed URL {url!r} should NOT match; got {m!r}"
+        )
+
+
 # =============================================================================
 # list_workspaces pagination (review finding #6)
 # =============================================================================
