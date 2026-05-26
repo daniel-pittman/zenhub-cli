@@ -109,3 +109,29 @@ def test_sprint_remove_full_shape_includes_new_fields():
     assert "inspected_full" in r
     assert "pagination_warning" in r
     assert "response_anomaly" in r
+
+
+# ---- subissue_add_children / subissue_remove_children (round-3 #4) -------
+
+SUBISSUE_MUTATION_KEYS = {
+    "ok", "parent_number", "outcome",
+    "success_count", "failed_count", "succeeded", "failed",
+    "github_errors", "partial_success_warning", "stderr",
+}
+
+
+def test_subissue_add_children_empty_returns_full_shape():
+    """Round-3 #4: bare `{ok, stderr}` was the bug; full documented
+    key set is the SPEC."""
+    r = mcp_server.subissue_add_children(42, [])
+    assert r["ok"] is False
+    assert "child_numbers" in r["stderr"]
+    _has_keys(r, SUBISSUE_MUTATION_KEYS)
+
+
+def test_subissue_remove_children_empty_returns_full_shape():
+    """Round-3 #4 — same SPEC on the remove side."""
+    r = mcp_server.subissue_remove_children(42, [])
+    assert r["ok"] is False
+    assert "child_numbers" in r["stderr"]
+    _has_keys(r, SUBISSUE_MUTATION_KEYS)

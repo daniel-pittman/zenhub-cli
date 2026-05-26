@@ -2915,6 +2915,17 @@ zh_sprint_issues_fetch_all() {
         local response
         response=$(zh_graphql "$query" "$variables")
 
+        # Detect null node before treating empty `nodes` as authoritative.
+        # GraphQL returns `data.node = null` when the sprint is deleted,
+        # ACL-revoked, or otherwise inaccessible. Pre-fix the walker
+        # silently emitted an empty result, which downstream callers
+        # treated as "real empty sprint" — masking the failure.
+        local node_kind
+        node_kind=$(echo "$response" | jq -r '.data.node | type')
+        if [[ "$node_kind" == "null" ]]; then
+            error "Sprint '${sprint_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
         local page_nodes
         page_nodes=$(echo "$response" | jq -c '.data.node.sprintIssues.nodes // []')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
@@ -3191,12 +3202,20 @@ Examples:
     # dedup in add_issues_to_sprint. Uses a plain-array contains-check
     # rather than an associative array so it stays portable to the
     # bash 3.2 that ships on macOS.
+    # Bash 3.2 (stock /bin/bash on macOS) errors under `set -u` when
+    # an empty array is expanded as "${arr[@]}" — the first iteration
+    # of the for-loop below sees `inputs` empty and trips on
+    # `inputs[@]: unbound variable`. The `${arr[@]+"${arr[@]}"}` form
+    # makes the expansion conditional: it produces nothing when the
+    # array is unset/empty, so the inner loop is a no-op on the first
+    # iteration. Bash 4.4+ fixed this behaviour but the script ships
+    # to macOS too.
     local -a inputs=()
     local raw_num stripped_arg seen_num
     for raw_num in "$@"; do
         stripped_arg="${raw_num#\#}"
         local already_seen=false
-        for seen_num in "${inputs[@]}"; do
+        for seen_num in ${inputs[@]+"${inputs[@]}"}; do
             if [[ "$seen_num" == "$stripped_arg" ]]; then
                 already_seen=true
                 break
@@ -3206,7 +3225,7 @@ Examples:
             inputs+=("$stripped_arg")
         fi
     done
-    set -- "${inputs[@]}"
+    set -- ${inputs[@]+"${inputs[@]}"}
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -3333,12 +3352,20 @@ Examples:
     # can't be over-counted. Mirrors the Python boundary dedup in
     # remove_issues_from_sprint. Plain-array contains-check for
     # bash 3.2 portability (no associative arrays).
+    # Bash 3.2 (stock /bin/bash on macOS) errors under `set -u` when
+    # an empty array is expanded as "${arr[@]}" — the first iteration
+    # of the for-loop below sees `inputs` empty and trips on
+    # `inputs[@]: unbound variable`. The `${arr[@]+"${arr[@]}"}` form
+    # makes the expansion conditional: it produces nothing when the
+    # array is unset/empty, so the inner loop is a no-op on the first
+    # iteration. Bash 4.4+ fixed this behaviour but the script ships
+    # to macOS too.
     local -a inputs=()
     local raw_num stripped_arg seen_num
     for raw_num in "$@"; do
         stripped_arg="${raw_num#\#}"
         local already_seen=false
-        for seen_num in "${inputs[@]}"; do
+        for seen_num in ${inputs[@]+"${inputs[@]}"}; do
             if [[ "$seen_num" == "$stripped_arg" ]]; then
                 already_seen=true
                 break
@@ -3348,7 +3375,7 @@ Examples:
             inputs+=("$stripped_arg")
         fi
     done
-    set -- "${inputs[@]}"
+    set -- ${inputs[@]+"${inputs[@]}"}
 
     local owner_repo
     owner_repo=$(get_repo_info)

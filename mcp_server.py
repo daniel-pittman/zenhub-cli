@@ -1287,7 +1287,21 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             stderr: str
     """
     if not child_numbers:
-        return {"ok": False, "stderr": "child_numbers must be non-empty"}
+        # Full result shape on the empty-input guard so strict MCP
+        # callers don't KeyError on documented keys after a guard
+        # rejection. Mirrors the sprint-tool fix from `bef3313`.
+        return {
+            "ok": False,
+            "parent_number": parent_number,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "github_errors": None,
+            "partial_success_warning": None,
+            "stderr": "child_numbers must be non-empty",
+        }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "parent_number": parent_number, "outcome": "fail",
@@ -1357,7 +1371,21 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             stderr: str
     """
     if not child_numbers:
-        return {"ok": False, "stderr": "child_numbers must be non-empty"}
+        # Full result shape on the empty-input guard so strict MCP
+        # callers don't KeyError on documented keys after a guard
+        # rejection. Mirrors the sprint-tool fix from `bef3313`.
+        return {
+            "ok": False,
+            "parent_number": parent_number,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "github_errors": None,
+            "partial_success_warning": None,
+            "stderr": "child_numbers must be non-empty",
+        }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "parent_number": parent_number, "outcome": "fail",

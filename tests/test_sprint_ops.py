@@ -741,7 +741,12 @@ def test_remove_surfaces_pagination_warning_from_followup_walk():
         )
     assert out["pagination_warning"] is not None
     assert "cursor not advancing" in out["pagination_warning"].lower()
-    assert out["inspected_full"] is True
+    # SPEC: when the walker bails on stuck cursor / iteration cap, we
+    # only saw a partial post-state, so coverage isn't "full." The
+    # prior assertion (`inspected_full is True` here) pinned the
+    # round-2 regression — it's the canonical self-justifying bug-pin
+    # for this PR. Real spec: `inspected_full == (walk_warning is None)`.
+    assert out["inspected_full"] is False
 
 
 # ---- #3: filter still-attached nodes by repo (multi-repo workspace) -------
@@ -959,3 +964,123 @@ def test_remove_deduplicates_input_numbers():
     assert sorted(out["succeeded"]) == [42, 43]
     assert out["success_count"] == 2
     assert out["failed"] == []
+
+
+# =============================================================================
+# Third-pass review fixes: null-node walker + inspected_full SPEC
+# =============================================================================
+
+def test_walk_sprint_issues_raises_on_null_node():
+    """`data.node = null` (deleted sprint / ACL revoked) must NOT
+    silently return an empty list. Pre-fix this was indistinguishable
+    from a real empty sprint and downstream callers treated every
+    input as removed.
+    """
+    ctx = _ctx()
+    with _patch_ctx_query(ctx, [{"data": {"node": None}}]):
+        with pytest.raises(zh_api.ZhApiError) as exc:
+            zh_graphql_ops._walk_sprint_issues(ctx, "sprint-deleted")
+    msg = str(exc.value).lower()
+    assert "null" in msg
+    assert "sprint-deleted" in msg
+
+
+def test_remove_recovery_walker_null_node_surfaces_fail():
+    """When the mutation response omits the target sprint AND the
+    recovery walk hits `data.node = null`, the result must be a
+    structured failure — NOT a silent success that claims every
+    input was removed.
+    """
+    ctx = _ctx()
+    responses = [
+        # _find_sprint_id
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        # Issue pre-flight
+        _issue_by_info_resp(100),
+        # Mutation response missing the target sprint → triggers walker
+        {"data": {"removeIssuesFromSprints": {"sprints": []}}},
+        # Walker sees null node → ZhApiError
+        {"data": {"node": None}},
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100]
+        )
+    assert out["ok"] is False
+    assert out["outcome"] == "fail"
+    assert out["succeeded"] == []
+    assert out["failed"] == [100]
+    assert out["inspected_full"] is False
+    assert "could not be determined" in (out["error"] or "").lower()
+
+
+def test_remove_followup_walker_null_node_surfaces_fail():
+    """When the mutation response WAS full (>=100 nodes) and the
+    follow-up walk hits null-node, same structured fail. Distinct
+    code path from the recovery branch above; both must guard.
+    """
+    ctx = _ctx()
+    full_remove_resp = {
+        "data": {
+            "removeIssuesFromSprints": {
+                "sprints": [
+                    {
+                        "id": "sprint-7",
+                        "sprintIssues": {
+                            "nodes": [
+                                {
+                                    "issue": {
+                                        "number": 2000 + i,
+                                        "repository": {
+                                            "ownerName": "acme",
+                                            "name": "widgets",
+                                        },
+                                    }
+                                }
+                                for i in range(100)
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        full_remove_resp,
+        {"data": {"node": None}},
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100]
+        )
+    assert out["ok"] is False
+    assert out["outcome"] == "fail"
+    assert out["inspected_full"] is False
+    assert "could not be confirmed" in (out["error"] or "").lower()
+
+
+def test_remove_walk_warning_sets_inspected_full_false_in_recovery():
+    """SPEC: in the recovery branch (response omitted target sprint),
+    walker bailing defensively also means we only saw a partial post-
+    state. `inspected_full` must reflect that.
+    """
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        # Anomaly: empty sprints array triggers recovery walk
+        {"data": {"removeIssuesFromSprints": {"sprints": []}}},
+        # Walker sees stuck cursor
+        _sprint_issues_page(
+            [_issue_node(100)], has_next=True, end_cursor=None
+        ),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100]
+        )
+    assert out["pagination_warning"] is not None
+    assert out["inspected_full"] is False
+    assert out["response_anomaly"] is not None

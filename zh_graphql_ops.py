@@ -1162,6 +1162,15 @@ def _walk_sprint_issues(
 
     Returns (issue_dicts, pagination_warning). Each issue dict has the
     shape used by `get_sprint_detail`'s `issues` list.
+
+    Raises ZhApiError when the GraphQL response has `data.node = null`
+    (deleted sprint, ACL revoked between resolution and walk, race
+    condition during membership-edit pipelines). The empty-list-with-
+    no-warning shape that the function used to return on null-node was
+    indistinguishable from a real empty sprint, which let downstream
+    callers (notably the explicit-reread recovery path in
+    `remove_issues_from_sprint`) silently claim every input was
+    removed.
     """
     out: list[dict] = []
     cursor: str | None = None
@@ -1182,7 +1191,18 @@ def _walk_sprint_issues(
             {"sprintId": sprint_id, "after": cursor},
         )
         check_graphql_errors(resp, context="sprint_issues_page")
-        node = (resp.get("data") or {}).get("node") or {}
+        data = resp.get("data") or {}
+        if "node" not in data or data.get("node") is None:
+            # data.node is null per GraphQL contract when the targeted
+            # Sprint can't be resolved (deleted between query phases,
+            # ACL change, etc.). Distinct from a real sprint with
+            # zero issues — never silently swallow.
+            raise ZhApiError(
+                f"Sprint {sprint_id!r} resolved to null in "
+                f"sprintIssues walk (deleted, ACL-revoked, or "
+                f"otherwise inaccessible)"
+            )
+        node = data["node"]
         conn = node.get("sprintIssues") or {}
         for wrapper in conn.get("nodes") or []:
             issue = (wrapper or {}).get("issue") or {}
@@ -1655,7 +1675,32 @@ def remove_issues_from_sprint(
                 f"in its `sprints` array (got: {returned_ids!r}); "
                 "walked sprint directly to determine post-state."
             )
-        walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+        # The walker raises ZhApiError on null-node; let that propagate
+        # as a structured failure result rather than crashing the whole
+        # MCP tool. The mutation may have already taken effect; we just
+        # can't determine the post-state, which is fail-state semantics.
+        try:
+            walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+        except ZhApiError as walk_err:
+            return {
+                "ok": False,
+                "sprint_id": sprint_id,
+                "sprint_name": actual_sprint_name or sprint_name,
+                "outcome": "fail",
+                "success_count": 0,
+                "failed_count": len(issue_numbers),
+                "succeeded": [],
+                "failed": list(issue_numbers),
+                "inspected_full": False,
+                "pagination_warning": None,
+                "response_anomaly": (response_anomaly or "") + (
+                    f" Recovery walk also failed: {walk_err}"
+                ),
+                "error": (
+                    "Sprint post-state could not be determined: "
+                    f"{walk_err}"
+                ),
+            }
         # The repository field from the walker is in
         # {"owner": ..., "name": ...} form, not {"ownerName", "name"};
         # adapt before passing to repos_match.
@@ -1669,16 +1714,40 @@ def remove_issues_from_sprint(
             num = w.get("number")
             if isinstance(num, int):
                 still_attached_numbers.add(num)
-        inspected_full = True
+        # inspected_full reflects whether the walk completed without a
+        # defensive bail (stuck cursor / iteration cap). When the
+        # walker emits a warning the result is partial; pinning it
+        # True would mis-advertise our coverage.
+        inspected_full = walk_warning is None
         pagination_warning = walk_warning
     else:
         nodes = ((target_sprint.get("sprintIssues") or {}).get("nodes")) or []
         still_attached_numbers = _attached_from_nodes(nodes)
-        # If the response was full, walk for the rest. Review finding
-        # #2 / #14: preserve and surface the walker's
-        # pagination_warning (was previously discarded via `_,`).
+        # If the response was full, walk for the rest.
         if len(nodes) >= 100:
-            walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+            try:
+                walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+            except ZhApiError as walk_err:
+                return {
+                    "ok": False,
+                    "sprint_id": sprint_id,
+                    "sprint_name": actual_sprint_name or sprint_name,
+                    "outcome": "fail",
+                    "success_count": 0,
+                    "failed_count": len(issue_numbers),
+                    "succeeded": [],
+                    "failed": list(issue_numbers),
+                    "inspected_full": False,
+                    "pagination_warning": None,
+                    "response_anomaly": (
+                        "Mutation response was full; follow-up walk "
+                        f"to confirm post-state failed: {walk_err}"
+                    ),
+                    "error": (
+                        "Sprint post-state could not be confirmed: "
+                        f"{walk_err}"
+                    ),
+                }
             still_attached_numbers = set()
             for w in walked:
                 rep = w.get("repository") or {}
@@ -1690,11 +1759,14 @@ def remove_issues_from_sprint(
                 num = w.get("number")
                 if isinstance(num, int):
                     still_attached_numbers.add(num)
-            inspected_full = True
+            # Same SPEC contract as the recovery branch above: walker
+            # warning means partial coverage, so inspected_full is
+            # False.
+            inspected_full = walk_warning is None
             pagination_warning = walk_warning
         else:
             # Response had <100 nodes, so we know it was the whole
-            # post-state.
+            # post-state. No walk needed; coverage is full.
             inspected_full = True
 
     succeeded = [n for n in issue_numbers if n not in still_attached_numbers]

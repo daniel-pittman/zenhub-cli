@@ -181,6 +181,14 @@ def _seconds_since(iso: Optional[str]) -> float:
 # -----------------------------------------------------------------------------
 
 
+# Repo names on GitHub can contain dots ("docs.github.io",
+# "my.tool", "internal.docs"). The old `[^/.]+?` group silently
+# failed to match those. Matches the regex in zh_api.py:_GH_URL_RE
+# and the bash regex in `zh`. Exported as a module constant so tests
+# can exercise it directly without needing a git checkout.
+_GITHUB_URL_RE = re.compile(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$")
+
+
 def repo_from_cwd(cwd: str) -> str:
     """Derive `owner/repo` from a git checkout's origin remote.
 
@@ -197,7 +205,7 @@ def repo_from_cwd(cwd: str) -> str:
         raise RuntimeError(
             f"Cannot derive repo from {cwd}: {e.stderr.strip() or 'not a git checkout'}"
         )
-    m = re.search(r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?/?$", url)
+    m = _GITHUB_URL_RE.search(url)
     if not m:
         raise RuntimeError(f"Cannot parse GitHub repo from URL: {url}")
     return f"{m.group(1)}/{m.group(2)}"
