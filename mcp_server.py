@@ -329,14 +329,27 @@ def _parse_subissue_mutation_result(plain: str, verb: str) -> dict:
 
     The bash command always emits exactly one line of the form:
 
-        RESULT:<verb> outcome=ok|partial|fail success=N failed=N <key>=#a,#b failed_nums=#c
+        RESULT:<verb> outcome=ok|partial|fail|noop success=N failed=N \
+            <key>=#a,#b failed_nums=#c
 
     where <verb> is "add" or "remove" and <key> is "added" or "removed".
     See cmd_subissue_add / cmd_subissue_remove in `zh`.
 
+    The "noop" outcome is the (success=0, failed=0) case — the API neither
+    added nor rejected anything (e.g. every requested child was already
+    linked to this parent). The wrapper treats it as non-success. See
+    round-3 review finding #2.
+
+    The CSV values inside `<key>=...` and `failed_nums=...` are guaranteed
+    space-free by the bash emitter (round-3 finding #1). The tokeniser
+    here splits on " " — if a space ever shows up inside a CSV value the
+    bare follow-on tokens have no "=" and get silently dropped, producing
+    an undercount. _parse_hashlist tolerates leading/trailing whitespace
+    on each comma-separated token as belt-and-suspenders.
+
     Returns:
         {
-            "outcome": "ok" | "partial" | "fail" | "unknown",
+            "outcome": "ok" | "partial" | "fail" | "noop" | "unknown",
             "success_count": int,
             "failed_count": int,
             "succeeded_numbers": [int, ...],
@@ -362,8 +375,8 @@ def _parse_subissue_mutation_result(plain: str, verb: str) -> dict:
     if line is None:
         return out
 
-    # Tokenise key=value pairs from after the verb. Values may contain
-    # commas (CSV lists) but never spaces in our emitter, so split on space.
+    # Tokenise key=value pairs from after the verb. The bash emitter
+    # guarantees no spaces inside any value, so splitting on " " is safe.
     for tok in line[len(prefix):].split(" "):
         if "=" not in tok:
             continue
@@ -378,6 +391,65 @@ def _parse_subissue_mutation_result(plain: str, verb: str) -> dict:
             out["succeeded_numbers"] = _parse_hashlist(v)
         elif k == "failed_nums":
             out["failed_numbers"] = _parse_hashlist(v)
+    return out
+
+
+def _parse_subissue_reorder_result(plain: str) -> dict:
+    """Parse the RESULT:reorder machine summary line from `zh subissue reorder`.
+
+    Emitted by `cmd_subissue_reorder` in three cases:
+
+        RESULT:reorder outcome=ok    child=#N parent=#M position=top
+        RESULT:reorder outcome=fail  child=#N parent=#M position=after_#K
+        RESULT:reorder outcome=noop  child=#N parent=#M position=top
+
+    "noop" is the only-child case — `child` is the only sub-issue of
+    `parent`, so there is no sibling to anchor against; the bash command
+    skipped the mutation. See round-3 review finding #3.
+
+    The position value is underscore-collapsed by bash (e.g. "after #101"
+    -> "after_#101") because the tokeniser splits on " ".
+
+    Returns:
+        {
+            "outcome": "ok" | "noop" | "fail" | "unknown",
+            "child_number": int | None,
+            "parent_number": int | None,
+            "position": str,             # "top", "bottom", "after_#101", ...
+        }
+    """
+    out: dict = {
+        "outcome": "unknown",
+        "child_number": None,
+        "parent_number": None,
+        "position": "",
+    }
+    prefix = "RESULT:reorder "
+    line = next(
+        (ln for ln in plain.splitlines() if ln.startswith(prefix)),
+        None,
+    )
+    if line is None:
+        return out
+
+    for tok in line[len(prefix):].split(" "):
+        if "=" not in tok:
+            continue
+        k, _, v = tok.partition("=")
+        if k == "outcome":
+            out["outcome"] = v or "unknown"
+        elif k == "child":
+            stripped = v.lstrip("#")
+            if stripped.isdigit():
+                out["child_number"] = int(stripped)
+        elif k == "parent":
+            stripped = v.lstrip("#")
+            if stripped.isdigit():
+                out["parent_number"] = int(stripped)
+        elif k == "position":
+            # Convert the bash-collapsed underscore form back to spaces for
+            # human-readable consumption ("after_#101" -> "after #101").
+            out["position"] = v.replace("_", " ")
     return out
 
 
@@ -1323,6 +1395,12 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     `ok` will be false; both `added` and `failed` are still populated so
     callers can act on the partial outcome rather than retrying blindly.
 
+    `outcome="noop"` is the (success=0, failed=0) case — the API neither
+    added nor rejected anything, typically because every requested child
+    was already linked to this parent. `ok` is false in that case so an
+    LLM caller can't confuse it with a successful add. See round-3
+    review finding #2.
+
     Args:
         parent_number: Issue number of the parent.
         child_numbers: List of issue numbers to link as sub-issues
@@ -1331,9 +1409,9 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
 
     Returns:
         dict with:
-            ok: bool                — true iff every requested child was added
+            ok: bool                — true iff outcome == "ok"
             parent_number: int
-            outcome: "ok" | "partial" | "fail" | "unknown"
+            outcome: "ok" | "partial" | "fail" | "noop" | "unknown"
             success_count: int      — API-reported successCount
             failed_count: int       — API-reported failedIssues length
             added: list[int]        — children the API actually added
@@ -1347,7 +1425,12 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     parsed = _parse_subissue_mutation_result(r["stdout_plain"], verb="add")
     return {
-        "ok": r["ok"] and parsed["outcome"] == "ok",
+        # `ok` is gated on the parsed outcome rather than r["ok"] alone. The
+        # bash command exits non-zero on partial/fail/noop, so r["ok"] is
+        # also false in those cases — checking outcome directly defends
+        # against a future bash-side regression that keeps the exit code
+        # but loses the RESULT line.
+        "ok": parsed["outcome"] == "ok",
         "parent_number": parent_number,
         "outcome": parsed["outcome"],
         "success_count": parsed["success_count"],
@@ -1371,6 +1454,10 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     machine summary line so the returned `removed` / `failed` arrays come
     from the API's actual outcome rather than the raw input list.
 
+    `outcome="noop"` is the (success=0, failed=0) case — the API didn't
+    unlink anything despite pre-flight validation passing (a race, or an
+    API-side oddity). `ok` is false in that case. See round-3 finding #2.
+
     Args:
         parent_number: Issue number of the parent. Each child must currently
             be a sub-issue of this parent — wrong-parent typos are rejected
@@ -1380,9 +1467,9 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
 
     Returns:
         dict with:
-            ok: bool                — true iff every requested child was removed
+            ok: bool                — true iff outcome == "ok"
             parent_number: int
-            outcome: "ok" | "partial" | "fail" | "unknown"
+            outcome: "ok" | "partial" | "fail" | "noop" | "unknown"
             success_count: int      — API-reported successCount
             failed_count: int       — API-reported failedIssues length
             removed: list[int]      — children the API actually unlinked
@@ -1396,7 +1483,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     parsed = _parse_subissue_mutation_result(r["stdout_plain"], verb="remove")
     return {
-        "ok": r["ok"] and parsed["outcome"] == "ok",
+        "ok": parsed["outcome"] == "ok",
         "parent_number": parent_number,
         "outcome": parsed["outcome"],
         "success_count": parsed["success_count"],
@@ -1422,6 +1509,19 @@ def subissue_reorder(child_number: int, position: str,
       - "after"             — requires sibling_number; place right after sibling
       - "before"            — requires sibling_number; place right before sibling
 
+    Parses the `RESULT:reorder` machine summary line emitted by `zh subissue
+    reorder` so callers can distinguish:
+
+      - outcome="ok"   — mutation fired and ZenHub reported success
+      - outcome="noop" — child is the only sub-issue of its parent; nothing
+                        to reorder against. The bash command warned and did
+                        NOT fire the mutation. See round-3 finding #3.
+      - outcome="fail" — the API rejected the reorder.
+      - outcome="unknown" — no RESULT line; bash failed before emitting one.
+
+    `ok` is true only when outcome=="ok"; an only-child reorder no longer
+    looks like a successful reorder to MCP callers.
+
     Args:
         child_number: Sub-issue to reposition.
         position: One of "top", "bottom", "after", "before".
@@ -1429,7 +1529,14 @@ def subissue_reorder(child_number: int, position: str,
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, child_number, position, raw, stderr.
+        dict with:
+            ok: bool                — true iff outcome == "ok"
+            child_number: int
+            position: str           — "top" | "bottom" | "after #N" | "before #N"
+            outcome: "ok" | "noop" | "fail" | "unknown"
+            parent_number: int | None  — from the RESULT line, when available
+            raw: str
+            stderr: str
     """
     pos = position.lower().strip()
     if pos not in {"top", "bottom", "after", "before"}:
@@ -1448,10 +1555,13 @@ def subissue_reorder(child_number: int, position: str,
         args.append(str(sibling_number))
 
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    parsed = _parse_subissue_reorder_result(r["stdout_plain"])
     return {
-        "ok": r["ok"],
+        "ok": parsed["outcome"] == "ok",
         "child_number": child_number,
         "position": pos if pos in {"top", "bottom"} else f"{pos} #{sibling_number}",
+        "outcome": parsed["outcome"],
+        "parent_number": parsed["parent_number"],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
