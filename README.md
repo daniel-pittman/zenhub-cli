@@ -136,7 +136,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
 | `epic <subcommand>` | `epics` | Manage ZenHub native epics (see [Epics](#epics)) |
-| `subissue <subcommand>` | `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
+| `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |

@@ -91,7 +91,7 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh reorder` → `order`, `pos`
 - `zh estimate` → `est`, `points`
 - `zh epic list` → `zh epic ls`; `show` → `view`; `create` → `new`; `remove` → `rm`; `reopen` → `open`; `update` → `edit`, `modify`
-- `zh subissue` → `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
+- `zh subissue` → `subissues`, `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 

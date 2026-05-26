@@ -3376,10 +3376,13 @@ mutation unlinks each child from whatever parent it currently has."
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
-    # Resolve parent (used only for the friendlier message — the API doesn't
-    # actually need it for removal, since each child has exactly one parent).
-    local parent_id
-    parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
+    # Verify the parent exists as a pre-flight sanity check. The API's
+    # removeSubIssues mutation doesn't actually need a parent ID (each child
+    # carries its own parent), but resolving the user-provided parent number
+    # here catches typos like `zh subissue remove 9999 100` before we try to
+    # unlink anything. Discard the resolved ID — it isn't used in the
+    # mutation payload.
+    zh_resolve_issue_id "$repo_id" "$parent_num" > /dev/null
 
     info "Removing ${#child_nums[@]} sub-issue(s) from parent #${parent_num#\#}..."
 
@@ -3652,10 +3655,16 @@ Use 'zh subissue add <parent#> ${child_num}' first."
 Example: zh subissue reorder ${child_num} after 101"
             fi
             sibling_num="${sibling_num#\#}"
+            # Use jq's `first(...)` to short-circuit at the first match. We
+            # avoid piping to `head -n 1` here because under `set -o pipefail`
+            # a SIGPIPE from jq could surface as exit 141 if the sibling list
+            # is large enough for jq to still be producing output when head
+            # closes its input. Each issue number is unique per parent, so
+            # `first` returns exactly that one id (or empty if no match).
             local sib_id
             sib_id=$(echo "$lookup_response" | \
                 jq -r --arg n "$sibling_num" \
-                '.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id' | head -n 1)
+                'first(.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id) // empty')
             if [[ -z "$sib_id" ]]; then
                 error "Sibling #${sibling_num} is not a child of parent #${parent_num}"
             fi
@@ -3671,7 +3680,7 @@ Example: zh subissue reorder ${child_num} before 102"
             local sib_id
             sib_id=$(echo "$lookup_response" | \
                 jq -r --arg n "$sibling_num" \
-                '.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id' | head -n 1)
+                'first(.data.issueByInfo.parentIssue.zenhubChildIssues.nodes[] | select((.number|tostring) == $n) | .id) // empty')
             if [[ -z "$sib_id" ]]; then
                 error "Sibling #${sibling_num} is not a child of parent #${parent_num}"
             fi
