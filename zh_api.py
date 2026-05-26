@@ -514,22 +514,52 @@ def resolve_context(
     Args:
         cwd: Working directory to read `git remote` from. Ignored when
             `owner_repo` is supplied.
-        owner_repo: Optional explicit "owner/repo" (e.g. when called from
-            an MCP tool without a usable git checkout).
+        owner_repo: Optional explicit "owner/repo". If unset, falls
+            back to ZH_REPO_OVERRIDE > ZH_REPO > config > git remote.
         workspace_name: Optional workspace name for multi-workspace repos.
-            Falls back to ZH_WORKSPACE config var, then first workspace.
+            If unset, falls back to ZH_WORKSPACE_NAME > ZH_WORKSPACE >
+            config > first-workspace.
         config: Pre-loaded config dict (else loaded from default path).
+
+    Environment-variable contract (kept in sync with `zh`'s bash side,
+    see `main()` and `get_repo_info` / `get_workspace_id` there):
+
+      Repo selection (highest precedence first):
+        1. owner_repo arg
+        2. ZH_REPO_OVERRIDE env (set by bash `-r` / `--repo` flag)
+        3. ZH_REPO env / config
+        4. git remote of cwd
+
+      Workspace selection (highest precedence first):
+        1. workspace_name arg
+        2. ZH_WORKSPACE_NAME env (set by bash `-w` / `--workspace` flag)
+        3. ZH_WORKSPACE env / config
+        4. First workspace returned by the API
+
+    Both sides read the same env vars in the same order so calling
+    Python directly (e.g. from the MCP server when invoked from a
+    `-r owner/repo`-style bash wrapper) honors the same flags.
     """
     if config is None:
         config = load_config()
     token = resolve_token(config)
+
+    # Repo: explicit arg > ZH_REPO_OVERRIDE > ZH_REPO env > config > git
+    if owner_repo is None:
+        owner_repo = (
+            os.environ.get("ZH_REPO_OVERRIDE", "").strip()
+            or os.environ.get("ZH_REPO", "").strip()
+            or config.get("ZH_REPO", "").strip()
+            or None
+        )
     if owner_repo is None:
         owner_repo = get_owner_repo_from_git(cwd=cwd)
 
-    # Workspace name: explicit arg > ZH_WORKSPACE env > config > None
+    # Workspace: explicit arg > ZH_WORKSPACE_NAME > ZH_WORKSPACE > config
     if workspace_name is None:
         workspace_name = (
-            os.environ.get("ZH_WORKSPACE", "").strip()
+            os.environ.get("ZH_WORKSPACE_NAME", "").strip()
+            or os.environ.get("ZH_WORKSPACE", "").strip()
             or config.get("ZH_WORKSPACE", "").strip()
             or None
         )

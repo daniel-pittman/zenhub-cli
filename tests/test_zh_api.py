@@ -199,3 +199,84 @@ def test_list_workspaces_stuck_cursor_bails(monkeypatch):
     # Should return whatever was collected before bailing, not spin.
     nodes = zh_api.list_workspaces("acme/widgets", token="t", gh_token="t")
     assert {n["id"] for n in nodes} == {"ws-a"}
+
+
+# =============================================================================
+# Env-var contract: resolve_context honors the same vars bash exports
+# =============================================================================
+
+def _patch_context_deps(monkeypatch):
+    """Stub out the network parts of resolve_context."""
+    monkeypatch.setattr(zh_api, "resolve_token", lambda config=None: "tok")
+    monkeypatch.setattr(zh_api, "get_zenhub_repo_id", lambda *a, **kw: "repo-gid")
+    monkeypatch.setattr(
+        zh_api, "get_workspace_id",
+        lambda owner_repo, **kw: f"ws-for-{kw.get('workspace_name') or 'default'}",
+    )
+    monkeypatch.setattr(zh_api, "load_config", lambda *a, **kw: {})
+
+
+def test_resolve_context_reads_zh_workspace_name(monkeypatch):
+    """ZH_WORKSPACE_NAME (set by bash `-w` flag) is honored.
+
+    The bash `main()` arg parser exports ZH_WORKSPACE_NAME when it sees
+    `-w "Backend Team"`. Python `resolve_context` must read the same
+    var, otherwise the flag silently drops on the Python side.
+    """
+    _patch_context_deps(monkeypatch)
+    monkeypatch.setenv("ZH_WORKSPACE_NAME", "Backend Team")
+    # Set ZH_WORKSPACE to a different value to make sure _NAME wins
+    monkeypatch.setenv("ZH_WORKSPACE", "Should Be Ignored")
+    ctx = zh_api.resolve_context(owner_repo="acme/widgets")
+    # get_workspace_id stub bakes the name into the returned id
+    assert ctx.workspace_id == "ws-for-Backend Team"
+
+
+def test_resolve_context_falls_back_to_zh_workspace(monkeypatch):
+    """If only ZH_WORKSPACE is set (config-style), it still works."""
+    _patch_context_deps(monkeypatch)
+    monkeypatch.delenv("ZH_WORKSPACE_NAME", raising=False)
+    monkeypatch.setenv("ZH_WORKSPACE", "From Config")
+    ctx = zh_api.resolve_context(owner_repo="acme/widgets")
+    assert ctx.workspace_id == "ws-for-From Config"
+
+
+def test_resolve_context_reads_zh_repo_override(monkeypatch):
+    """ZH_REPO_OVERRIDE (set by bash `-r` flag) wins over ZH_REPO."""
+    _patch_context_deps(monkeypatch)
+    monkeypatch.setenv("ZH_REPO_OVERRIDE", "flag/repo")
+    monkeypatch.setenv("ZH_REPO", "env/repo")
+    ctx = zh_api.resolve_context()
+    assert ctx.owner_repo == "flag/repo"
+
+
+def test_resolve_context_falls_back_to_zh_repo(monkeypatch):
+    """ZH_REPO (env or config) wins over the git-remote default."""
+    _patch_context_deps(monkeypatch)
+    monkeypatch.delenv("ZH_REPO_OVERRIDE", raising=False)
+    monkeypatch.setenv("ZH_REPO", "env/repo")
+    # Don't stub get_owner_repo_from_git — if our env handling is
+    # broken and we fall through, the call will raise (no git remote
+    # in pytest cwd).
+    ctx = zh_api.resolve_context()
+    assert ctx.owner_repo == "env/repo"
+
+
+def test_resolve_context_explicit_arg_wins(monkeypatch):
+    """Explicit owner_repo arg trumps every env var."""
+    _patch_context_deps(monkeypatch)
+    monkeypatch.setenv("ZH_REPO_OVERRIDE", "ignored/override")
+    monkeypatch.setenv("ZH_REPO", "ignored/env")
+    ctx = zh_api.resolve_context(owner_repo="arg/repo")
+    assert ctx.owner_repo == "arg/repo"
+
+
+def test_resolve_context_explicit_workspace_arg_wins(monkeypatch):
+    """Explicit workspace_name arg trumps every env var."""
+    _patch_context_deps(monkeypatch)
+    monkeypatch.setenv("ZH_WORKSPACE_NAME", "ignored-flag-name")
+    monkeypatch.setenv("ZH_WORKSPACE", "ignored-config-name")
+    ctx = zh_api.resolve_context(
+        owner_repo="acme/widgets", workspace_name="From Arg"
+    )
+    assert ctx.workspace_id == "ws-for-From Arg"

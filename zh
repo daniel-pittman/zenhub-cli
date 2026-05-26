@@ -138,9 +138,23 @@ Either:
 For multi-workspace repos, also see -w / --workspace and ZH_WORKSPACE."
     fi
 
-    # Parse owner/repo from various URL formats
-    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
-        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    # Parse owner/repo from various URL formats.
+    #
+    # Repo names on GitHub can contain dots (e.g. "docs.github.io",
+    # "my.tool", "internal.docs"). The repo group used to be `[^/.]+`
+    # which silently failed to match those. The Python `_GH_URL_RE`
+    # was fixed previously; this brings the bash regex in line.
+    #
+    # Bash extended regex doesn't support non-greedy quantifiers, so
+    # we match greedily on `[^/]+` and then strip the optional
+    # `.git` suffix and trailing `/` from the captured repo name.
+    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/]+) ]]; then
+        local owner="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+        # Drop trailing slash + optional .git suffix.
+        repo="${repo%/}"
+        repo="${repo%.git}"
+        echo "${owner}/${repo}"
     else
         error "Could not parse GitHub repository from remote URL: $remote_url"
     fi
@@ -184,6 +198,71 @@ get_repo_id() {
     echo "$repo_id"
 }
 
+# Hard cap on workspace-list pagination iterations. 50 pages × 50 nodes
+# = 2,500 workspaces, vastly more than any plausible per-repo count, so
+# the cap only ever fires on a server-side stuck-cursor bug.
+ZH_WORKSPACE_PAGINATION_CAP=50
+
+# Walk every page of `workspacesConnection` for a repo and emit a single
+# JSON array of `{id, name}` nodes on stdout. Same stuck-cursor +
+# iteration-cap defenses as the sub-issue and sprint walkers.
+#
+# Argument: gh_id (GitHub numeric repo id).
+zh_workspaces_fetch_all() {
+    local gh_id="$1"
+
+    local query='
+    query($ghIds: [Int!]!, $after: String) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            id
+            workspacesConnection(first: 50, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes { id name }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt "$ZH_WORKSPACE_PAGINATION_CAP" ]]; then
+            warn "Workspace pagination iteration cap (${ZH_WORKSPACE_PAGINATION_CAP}) reached"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --argjson gh_id "$gh_id" --argjson after "$cursor" \
+            '{ghIds: [$gh_id], after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '.data.repositoriesByGhId[0].workspacesConnection.nodes // []')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Workspace pagination cursor not advancing — bailing"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    echo "$all_nodes"
+}
+
 # Get workspace ID for a repository (using GitHub ID).
 #
 # Workspace selection precedence:
@@ -193,7 +272,11 @@ get_repo_id() {
 #   2. ZH_WORKSPACE (config-file value) — same resolution as above.
 #   3. First workspace returned by the API (historical default).
 #
-# (1) and (2) are merged into ZH_WORKSPACE_NAME by main()'s arg parser.
+# (1) and (2) are merged via ZH_WORKSPACE_NAME -> ZH_WORKSPACE precedence
+# below. The Python `resolve_context` follows the same chain.
+#
+# Walks every page of `workspacesConnection` via zh_workspaces_fetch_all
+# so name resolution finds workspaces beyond position 50.
 get_workspace_id() {
     local owner_repo="$1"
 
@@ -205,28 +288,8 @@ get_workspace_id() {
         error "Could not get GitHub repo ID for: $owner_repo"
     fi
 
-    local query='
-    query($ghIds: [Int!]!) {
-        repositoriesByGhId(ghIds: $ghIds) {
-            id
-            name
-            workspacesConnection(first: 50) {
-                nodes {
-                    id
-                    name
-                }
-            }
-        }
-    }'
-
-    local variables
-    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
-
     local workspace_nodes
-    workspace_nodes=$(echo "$response" | jq -c '.data.repositoriesByGhId[0].workspacesConnection.nodes // []')
+    workspace_nodes=$(zh_workspaces_fetch_all "$gh_id")
 
     local node_count
     node_count=$(echo "$workspace_nodes" | jq 'length')
@@ -507,28 +570,11 @@ cmd_workspaces() {
         error "Could not get GitHub repo ID for: $owner_repo"
     fi
 
-    # Pull up to 50 workspaces so a user inspecting a multi-workspace
-    # repo can see the full list (otherwise the API default of ~20 would
-    # silently truncate). Matches the cap in get_workspace_id.
-    local query='
-    query($ghIds: [Int!]!) {
-        repositoriesByGhId(ghIds: $ghIds) {
-            id
-            name
-            workspacesConnection(first: 50) {
-                nodes {
-                    id
-                    name
-                }
-            }
-        }
-    }'
-
-    local variables
-    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    # Walk every page of workspacesConnection so the listing is complete
+    # for repos connected to >50 workspaces. Same walker the resolver
+    # uses, so what you see here is what the rest of the CLI sees.
+    local workspace_nodes
+    workspace_nodes=$(zh_workspaces_fetch_all "$gh_id")
 
     # Resolve the active workspace per the same precedence get_workspace_id
     # uses, so the listing marks the one the rest of the CLI would target.
@@ -543,7 +589,7 @@ cmd_workspaces() {
     fi
     echo ""
 
-    echo "$response" | jq -r --arg active "$active_name" '.data.repositoriesByGhId[0].workspacesConnection.nodes[] |
+    echo "$workspace_nodes" | jq -r --arg active "$active_name" '.[] |
         (if ($active != "" and (.name | ascii_downcase) == ($active | ascii_downcase)) then "● " else "  " end) +
         "\(.name)\n    ID: \(.id)\n"'
 }
