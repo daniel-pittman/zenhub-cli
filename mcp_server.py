@@ -1785,11 +1785,15 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
         coverage note pointing at a re-verification command).
 
     Coverage semantics: when `inspected_full=False` the outcome is
-    DOWNGRADED to `partial` (or `fail` when zero positives confirmed)
-    regardless of what the partial walk happened to show, because
-    inputs the walker never reached cannot be classified as
-    `succeeded`. `succeeded` still lists what the partial walk did
-    confirm absent from the post-state.
+    DOWNGRADED to `partial` (or `fail` when zero positives
+    confirmed). `succeeded` lists ONLY inputs the partial walk
+    actually observed AND observed as absent from the post-state
+    (round-5 #1: previously inputs the walker never reached were
+    incorrectly counted as succeeded). `failed` lists inputs the
+    walker observed still-attached. Inputs the walker never
+    reached are NEITHER succeeded NOR failed — they're un-verified,
+    and `response_anomaly` names the un-verified count plus a
+    `zh sprint show '<name>'` re-verification command.
     """
     if not issue_numbers:
         return {

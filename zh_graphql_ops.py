@@ -1211,11 +1211,22 @@ def _find_sprint_id(
 
 def _walk_sprint_issues(
     ctx: RepoContext, sprint_id: str
-) -> tuple[list[dict], str | None]:
+) -> tuple[list[dict], set[int], str | None]:
     """Walk every page of a sprint's `sprintIssues` connection.
 
-    Returns (issue_dicts, pagination_warning). Each issue dict has the
-    shape used by `get_sprint_detail`'s `issues` list.
+    Returns (issue_dicts, walked_numbers, pagination_warning).
+
+    * `issue_dicts` — repo-filtered, fully-decoded issue records used
+      by `get_sprint_detail`'s `issues` list.
+    * `walked_numbers` — every issue number the walker iterated, PRE-
+      REPO-FILTER. Load-bearing for the round-5 #1 succeeded-
+      inflation fix: `remove_issues_from_sprint` needs to know
+      which inputs the walker actually saw, separately from which
+      ones are in our repo, so partial-coverage classification can
+      distinguish "walker observed it absent" from "walker never
+      reached it."
+    * `pagination_warning` — set when the walk bailed defensively
+      (stuck cursor or iteration cap).
 
     Raises ZhApiError when the GraphQL response has `data.node = null`
     (deleted sprint, ACL revoked between resolution and walk, race
@@ -1227,6 +1238,7 @@ def _walk_sprint_issues(
     removed.
     """
     out: list[dict] = []
+    walked_numbers: set[int] = set()
     cursor: str | None = None
     last_cursor: str | None = None
     iterations = 0
@@ -1269,6 +1281,13 @@ def _walk_sprint_issues(
             if wrapper is None:
                 continue
             issue = (wrapper or {}).get("issue") or {}
+            # Record EVERY iterated issue number (pre-repo-filter) so
+            # downstream callers can distinguish "walker reached this
+            # input and confirmed its absence" from "walker never
+            # reached this input." Round-5 #1.
+            walked_num = issue.get("number")
+            if isinstance(walked_num, int) and not isinstance(walked_num, bool):
+                walked_numbers.add(walked_num)
             assignees = [
                 a.get("login")
                 for a in ((issue.get("assignees") or {}).get("nodes") or [])
@@ -1313,7 +1332,7 @@ def _walk_sprint_issues(
         last_cursor = end_cursor
         cursor = end_cursor
 
-    return out, pagination_warning
+    return out, walked_numbers, pagination_warning
 
 
 def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
@@ -1367,7 +1386,12 @@ def get_sprint_detail(ctx: RepoContext, sprint_name: str) -> dict:
     check_graphql_errors(header_resp, context="sprint_header")
     node = (header_resp.get("data") or {}).get("node") or {}
 
-    issues, pagination_warning = _walk_sprint_issues(ctx, sprint_id)
+    # `walked_numbers` ignored here — `get_sprint_detail` doesn't
+    # need partial-coverage classification; it just emits whatever
+    # the walker observed.
+    issues, _walked_numbers, pagination_warning = _walk_sprint_issues(
+        ctx, sprint_id
+    )
 
     return {
         "ok": True,
@@ -1638,24 +1662,36 @@ def remove_issues_from_sprint(
     Coverage semantics
     ------------------
 
+    When `inspected_full` is True (mutation response was complete OR
+    we walked every page without bailing), the SPEC is simple:
+    `succeeded = inputs - still_attached`, `failed = inputs ∩
+    still_attached`, and `success_count + failed_count == len(inputs)`.
+
     When `inspected_full` is False (walker bailed mid-walk on stuck
     cursor / iteration cap), `still_attached_numbers` is by
     construction a strict subset of what's actually attached. Inputs
-    the walker never reached would naively land in `succeeded` even
-    though their removal was never confirmed. This function
-    deliberately DOWNGRADES the outcome in that case:
+    the walker never reached can't be classified as succeeded OR
+    failed — we never confirmed anything about them. The honest SPEC
+    is:
 
+      - `succeeded = inputs ∩ walked_numbers - still_attached` —
+        inputs the walker actually observed AND observed as absent
+        from the post-state.
+      - `failed = inputs ∩ walked_numbers ∩ still_attached` —
+        inputs the walker observed still-attached.
+      - inputs in `walked_numbers` neither succeeded nor failed —
+        they're un-verified, surfaced as a count in
+        `response_anomaly` rather than in `succeeded` / `failed`.
       - `outcome = "partial"` when at least one input was confirmed
-        removed by the partial walk.
-      - `outcome = "fail"` when none were confirmed.
-      - `ok = (outcome == "ok")` — so partial coverage always reports
-        `ok=False`.
+        removed by the partial walk, `"fail"` otherwise.
+      - `ok = (outcome == "ok")` — so partial coverage always
+        reports `ok=False`.
 
-    `succeeded` still lists the input numbers that the partial walk
-    DID confirm absent from the post-state, so callers have
-    actionable per-issue information. `response_anomaly` is
-    extended with a coverage note pointing the caller at a
-    re-verification command (`zh sprint show '<name>'`).
+    `walked_numbers` itself is not part of the returned dict (it's
+    an implementation detail of the partial-coverage classification),
+    but the count of un-verified inputs is named in `response_anomaly`
+    so callers can see it directly. Re-verification command is
+    `zh sprint show '<name>'`.
     """
     if not issue_numbers:
         raise ZhApiError("issue_numbers must be non-empty")
@@ -1724,21 +1760,31 @@ def remove_issues_from_sprint(
         None,
     )
 
-    # Build the still-attached set, filtering by repo so a sibling
-    # repo's same-numbered issue can't mis-classify our removal as a
-    # failure. Review finding #3.
-    def _attached_from_nodes(nodes: list[dict]) -> set[int]:
+    # Build the still-attached set + the walked set, filtering
+    # still-attached by repo so a sibling repo's same-numbered issue
+    # can't mis-classify our removal as a failure (review #3). The
+    # walked set is PRE-repo-filter so we can answer "did the walker
+    # actually observe this input number?" — load-bearing for the
+    # partial-coverage classification below.
+    def _attached_from_nodes(
+        nodes: list[dict],
+    ) -> tuple[set[int], set[int]]:
+        """Returns (still_attached_in_repo, walked_numbers_any_repo)."""
         attached: set[int] = set()
+        walked: set[int] = set()
         for n_link in nodes or []:
             issue = (n_link or {}).get("issue") or {}
+            num = issue.get("number")
+            if isinstance(num, int) and not isinstance(num, bool):
+                walked.add(num)
             if not repos_match(issue.get("repository"), ctx.owner_repo):
                 continue
-            num = issue.get("number")
-            if isinstance(num, int):
+            if isinstance(num, int) and not isinstance(num, bool):
                 attached.add(num)
-        return attached
+        return attached, walked
 
     still_attached_numbers: set[int] = set()
+    walked_numbers: set[int] = set()
     inspected_full = False
     pagination_warning: str | None = None
     response_anomaly: str | None = None
@@ -1769,7 +1815,9 @@ def remove_issues_from_sprint(
         # MCP tool. The mutation may have already taken effect; we just
         # can't determine the post-state, which is fail-state semantics.
         try:
-            walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+            walked, walked_numbers, walk_warning = _walk_sprint_issues(
+                ctx, sprint_id,
+            )
         except ZhApiError as walk_err:
             return {
                 "ok": False,
@@ -1801,7 +1849,7 @@ def remove_issues_from_sprint(
             ):
                 continue
             num = w.get("number")
-            if isinstance(num, int):
+            if isinstance(num, int) and not isinstance(num, bool):
                 still_attached_numbers.add(num)
         # inspected_full reflects whether the walk completed without a
         # defensive bail (stuck cursor / iteration cap). When the
@@ -1811,11 +1859,13 @@ def remove_issues_from_sprint(
         pagination_warning = walk_warning
     else:
         nodes = ((target_sprint.get("sprintIssues") or {}).get("nodes")) or []
-        still_attached_numbers = _attached_from_nodes(nodes)
+        still_attached_numbers, walked_numbers = _attached_from_nodes(nodes)
         # If the response was full, walk for the rest.
         if len(nodes) >= 100:
             try:
-                walked, walk_warning = _walk_sprint_issues(ctx, sprint_id)
+                walked, walked_numbers, walk_warning = _walk_sprint_issues(
+                    ctx, sprint_id,
+                )
             except ZhApiError as walk_err:
                 return {
                     "ok": False,
@@ -1846,7 +1896,7 @@ def remove_issues_from_sprint(
                 ):
                     continue
                 num = w.get("number")
-                if isinstance(num, int):
+                if isinstance(num, int) and not isinstance(num, bool):
                     still_attached_numbers.add(num)
             # Same SPEC contract as the recovery branch above: walker
             # warning means partial coverage, so inspected_full is
@@ -1858,32 +1908,48 @@ def remove_issues_from_sprint(
             # post-state. No walk needed; coverage is full.
             inspected_full = True
 
-    succeeded = [n for n in issue_numbers if n not in still_attached_numbers]
-    failed = [n for n in issue_numbers if n in still_attached_numbers]
-
-    # Coverage gate: when `inspected_full` is False (walker bailed on
-    # stuck cursor / iteration cap mid-walk), the partial walk's
-    # `still_attached_numbers` is — by construction — a strict subset
-    # of what's actually attached. Inputs that the walker didn't reach
-    # would currently land in `succeeded` even though we never
-    # confirmed their removal. That's the load-bearing bug from
-    # round-4 finding #2.
+    # Compute succeeded/failed using the round-5 #1 SPEC.
     #
-    # Decision: downgrade `outcome` to "partial" (or "fail" when zero
-    # positives) and set `ok=False`, regardless of what the partial
-    # observations happened to show. Keep `succeeded` populated with
-    # what we DID confirm so the caller has actionable per-issue
-    # information; surface `response_anomaly` describing the coverage
-    # gap so callers know to re-verify before retrying. See the
-    # result-dict docstring above for the full contract.
-    if not inspected_full:
-        # Build (or extend) the anomaly note so callers can act on it
-        # without separately inspecting `pagination_warning`.
+    # When inspected_full is True, our coverage is the full sprint
+    # post-state (either the mutation response had <100 nodes, or we
+    # walked all pages without bailing). In that case any input not in
+    # `still_attached_numbers` is confirmed-removed.
+    #
+    # When inspected_full is False, the partial walk only saw part of
+    # the sprint. Inputs that the walker DIDN'T reach can't be
+    # classified as `succeeded` — we never confirmed their removal.
+    # The honest `succeeded` set is `inputs ∩ walked_numbers -
+    # still_attached_numbers`: inputs the walker actually observed
+    # AND observed as absent from the post-state.
+    if inspected_full:
+        succeeded = [n for n in issue_numbers if n not in still_attached_numbers]
+        failed = [n for n in issue_numbers if n in still_attached_numbers]
+        outcome = _classify_outcome(len(succeeded), len(failed))
+    else:
+        succeeded = [
+            n for n in issue_numbers
+            if n in walked_numbers and n not in still_attached_numbers
+        ]
+        # `failed` for partial coverage: only count inputs the walker
+        # actually saw still-attached. Inputs the walker never
+        # reached are NEITHER succeeded NOR failed — they're
+        # un-verified (reflected in `response_anomaly`'s coverage
+        # note below). This keeps success_count + failed_count <=
+        # len(inputs), so the counts honestly report what we
+        # observed.
+        failed = [
+            n for n in issue_numbers
+            if n in walked_numbers and n in still_attached_numbers
+        ]
+        unverified_count = len(issue_numbers) - len(succeeded) - len(failed)
         coverage_note = (
             f"Post-state coverage incomplete (inspected_full=False, "
             f"walker bailed: {pagination_warning or 'unknown reason'}); "
             f"verified {len(succeeded)} of {len(issue_numbers)} input(s) "
-            f"as removed, the remainder may or may not have landed. "
+            f"as removed; "
+            f"{unverified_count} input(s) un-verified — the walker "
+            f"never reached them, so we cannot say whether the "
+            f"mutation took effect. "
             f"Re-verify with `zh sprint show '{actual_sprint_name or sprint_name}'`."
         )
         if response_anomaly:
@@ -1891,10 +1957,8 @@ def remove_issues_from_sprint(
         else:
             response_anomaly = coverage_note
         # outcome: "partial" when we confirmed at least one removal,
-        # "fail" when we confirmed none.
+        # "fail" otherwise.
         outcome = "partial" if succeeded else "fail"
-    else:
-        outcome = _classify_outcome(len(succeeded), len(failed))
 
     return {
         "ok": outcome == "ok",

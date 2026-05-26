@@ -3004,16 +3004,32 @@ zh_sprint_issues_fetch_all() {
         cursor=$(jq -n --arg c "$end_cursor" '$c')
     done
 
-    # Output: a JSON object the caller can downcast into nodes + a
-    # `pagination_bailed` reason and `null_node` flag. The default
-    # caller (`cmd_sprint`, read-only) ignores the extra fields. The
-    # mutation caller (`cmd_sprint_remove`) inspects them to decide
-    # whether to claim a confirmed success.
+    # Output: a JSON object the caller can downcast into nodes +
+    # `pagination_bailed` reason + `null_node` flag + `walked_nums`.
+    # The default caller (`cmd_sprint`, read-only) uses just nodes.
+    # The mutation caller (`cmd_sprint_remove`) inspects the others
+    # to decide whether to claim a confirmed success.
+    #
+    # `walked_nums` is the pre-repo-filter list of issue numbers the
+    # walker actually iterated. Load-bearing for the round-5 #1/#2
+    # succeeded-inflation fix: cmd_sprint_remove uses
+    # `inputs ∩ walked_nums - still_attached` for `succeeded` instead
+    # of `inputs - still_attached`, so an input the walker never
+    # reached can't be falsely classified as removed.
+    local walked_nums
+    walked_nums=$(echo "$all_nodes" | jq -c '[.[] | .issue.number | select(. != null)]')
+
     jq -n \
         --argjson nodes "$all_nodes" \
         --arg pagination_bailed "$pagination_bailed" \
         --argjson null_node "$null_node" \
-        '{nodes: $nodes, pagination_bailed: $pagination_bailed, null_node: $null_node}'
+        --argjson walked_nums "$walked_nums" \
+        '{
+           nodes: $nodes,
+           pagination_bailed: $pagination_bailed,
+           null_node: $null_node,
+           walked_nums: $walked_nums
+         }'
 }
 
 cmd_sprint() {
@@ -3528,6 +3544,8 @@ Examples:
     owner_lc="${owner_repo%%/*}"
     repo_lc="${owner_repo##*/}"
 
+    # `still_attached_nums_csv` — issue numbers in our repo that
+    # remain in the sprint post-mutation. Repo-filtered.
     local still_attached_nums_csv
     still_attached_nums_csv=$(echo "$post_state" | jq -r \
         --arg owner "$owner_lc" \
@@ -3541,16 +3559,57 @@ Examples:
            | .issue.number
          ] | map(tostring) | join(",")')
 
+    # `walked_nums_csv` — pre-repo-filter list of issue numbers the
+    # walker iterated. Load-bearing for round-5 #2: when the walker
+    # bails mid-flight, an input the walker didn't reach is NOT in
+    # `walked_nums`, so it can't be classified as succeeded (which
+    # would inflate the count and lie to the user). Honest SPEC
+    # mirrors the Python side (zh_graphql_ops round-5 #1).
+    local walked_nums_csv
+    walked_nums_csv=$(echo "$post_state" | jq -r '(.walked_nums // [.nodes[].issue.number]) | map(tostring) | join(",")')
+
     local input_nums_csv
     input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
 
     local succeeded failed
-    succeeded=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
-        '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
-         [$in[] | select(. as $n | $att | all(. != $n))] | join(",")')
-    failed=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
-        '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
-         [$in[] | select(. as $n | $att | any(. == $n))] | join(",")')
+    if [[ -z "$pagination_bailed" ]]; then
+        # Full coverage: walker observed the entire post-state (either
+        # the response was <100 nodes OR we walked all pages). Naive
+        # `inputs - still_attached` is correct.
+        succeeded=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
+             [$in[] | select(. as $n | $att | all(. != $n))] | join(",")')
+        failed=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
+             [$in[] | select(. as $n | $att | any(. == $n))] | join(",")')
+    else
+        # Partial coverage: walker bailed before observing the whole
+        # sprint. Honest SPEC:
+        #   succeeded = inputs ∩ walked - still_attached
+        #   failed    = inputs ∩ walked ∩ still_attached
+        #   un-verified inputs (not in walked) are neither — they're
+        #     surfaced as a count in the bail diagnostic.
+        succeeded=$(jq -nr \
+            --arg inputs "$input_nums_csv" \
+            --arg walked "$walked_nums_csv" \
+            --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in
+             | ($walked | split(",")) as $w
+             | ($attached | split(",")) as $att
+             | [$in[] | select(. as $n | $w | any(. == $n))
+                       | select(. as $n | $att | all(. != $n))]
+             | join(",")')
+        failed=$(jq -nr \
+            --arg inputs "$input_nums_csv" \
+            --arg walked "$walked_nums_csv" \
+            --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in
+             | ($walked | split(",")) as $w
+             | ($attached | split(",")) as $att
+             | [$in[] | select(. as $n | $w | any(. == $n))
+                       | select(. as $n | $att | any(. == $n))]
+             | join(",")')
+    fi
 
     local total_input
     total_input=$(echo "$input_nums_csv" | awk -F',' '{print NF}')
@@ -3558,19 +3617,16 @@ Examples:
     success_count=$(echo "$succeeded" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
     local failed_count
     failed_count=$(echo "$failed" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+    local unverified_count=$((total_input - success_count - failed_count))
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
         if [[ -n "$pagination_bailed" ]]; then
-            # Coverage-incomplete: the walk bailed mid-flight, so any
-            # input not in the still-attached set was either removed
-            # OR un-verified. Downgrade the message so the user
-            # doesn't read a clean "Removed" as a confirmed outcome.
-            # Mirrors the Python `inspected_full=False` SPEC.
-            # (Round-4 #3.)
-            warn "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}' (post-state coverage incomplete — re-verify): ${succeeded//,/, }"
-            warn "  Walker bailed: ${pagination_bailed}. Some inputs may not have been confirmed."
-            warn "  Re-verify with 'zh sprint show \"${sprint_actual_name}\"'."
+            # Coverage-incomplete: even our confirmed `succeeded` set
+            # is partial — un-verified inputs may or may not have
+            # been removed. Downgrade the message so the user doesn't
+            # read a clean "Removed" as a confirmed outcome.
+            warn "Confirmed removal of ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
         else
             success "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
         fi
@@ -3578,15 +3634,43 @@ Examples:
     if [[ "$failed_count" -gt 0 ]]; then
         warn "${failed_count} still in sprint (API rejected the removal): ${failed//,/, }"
     fi
+    # Round-5 #11: bail diagnostic must surface independent of
+    # `success_count`. Previously it was gated inside the success
+    # branch, so a fully-failed batch with walker-bailed coverage
+    # would never see the diagnostic.
+    if [[ -n "$pagination_bailed" ]]; then
+        warn "Post-state coverage incomplete — re-verify."
+        warn "  Walker bailed: ${pagination_bailed}."
+        if [[ "$unverified_count" -gt 0 ]]; then
+            warn "  ${unverified_count}/${total_input} input(s) un-verified (walker never reached them)."
+        fi
+        warn "  Re-verify with 'zh sprint show \"${sprint_actual_name}\"'."
+    fi
 
-    # Exit non-zero on any partial/fail/coverage-incomplete state so
-    # scripted callers see the problem. exit 2 for coverage-
-    # incomplete to differentiate from "real failure" (exit 1).
+    # Exit codes (round-5 #5):
+    #
+    #   0 — clean success, no failures, full coverage
+    #   1 — real failure: at least one input still attached, OR
+    #       zero confirmed positives. "Definitely wrong" takes
+    #       precedence over coverage warnings.
+    #   2 — coverage incomplete only (no real failures, walker
+    #       bailed mid-walk). "Re-verify before retrying."
+    #
+    # The order matters: `failed_count > 0` is checked BEFORE
+    # `pagination_bailed`, so a real failure beats a coverage
+    # warning. Scripted callers reading the exit code get the more
+    # actionable signal.
+    if [[ "$failed_count" -gt 0 ]]; then
+        exit 1
+    fi
+    if [[ "$success_count" -eq 0 ]] && [[ -z "$pagination_bailed" ]]; then
+        # Zero positives with FULL coverage = real failure. Zero
+        # positives with PARTIAL coverage is a coverage problem
+        # (exit 2, below), not a real failure.
+        exit 1
+    fi
     if [[ -n "$pagination_bailed" ]]; then
         exit 2
-    fi
-    if [[ "$failed_count" -gt 0 ]] || [[ "$success_count" -eq 0 ]]; then
-        exit 1
     fi
 }
 
