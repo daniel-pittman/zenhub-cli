@@ -129,9 +129,37 @@ def _bootstrap_venv() -> None:
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
 
 
-_bootstrap_venv()
+# Test-mode escape hatch: setting ZH_MCP_SKIP_BOOTSTRAP=1 in the
+# environment skips the venv bootstrap AND substitutes a minimal
+# `FastMCP` stub for the import below. This lets the pytest suite
+# exercise the guard logic and result-dict shapes in MCP tools
+# without pulling in mcp / torch / transformers / numpy. Production
+# (the actual MCP server transport) must NEVER set this — without
+# the real FastMCP, the server doesn't serve.
+_MCP_SKIP_BOOTSTRAP = os.environ.get("ZH_MCP_SKIP_BOOTSTRAP", "") == "1"
 
-from mcp.server.fastmcp import FastMCP
+if not _MCP_SKIP_BOOTSTRAP:
+    _bootstrap_venv()
+    from mcp.server.fastmcp import FastMCP
+else:
+    # Minimal no-op stub. `@mcp.tool()` returns the function unchanged
+    # so tests can call the wrapped tool directly. The stub class is
+    # callable as `FastMCP("name")` and exposes a `.run()` that just
+    # raises (we don't want a test accidentally launching a server).
+    class FastMCP:  # type: ignore[no-redef]
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def tool(self, *args, **kwargs):  # noqa: ARG002
+            def _decorator(fn):
+                return fn
+            return _decorator
+
+        def run(self) -> None:
+            raise RuntimeError(
+                "FastMCP stub: ZH_MCP_SKIP_BOOTSTRAP is set. The MCP "
+                "server cannot run in this mode; it's for unit tests only."
+            )
 
 # =============================================================================
 # Paths and configuration
@@ -1535,7 +1563,24 @@ def sprint_show(sprint_name: str, repo_path: str = "") -> dict:
             stderr: str
     """
     if not sprint_name or not str(sprint_name).strip():
-        return {"ok": False, "stderr": "sprint_name must be non-empty"}
+        # Full result shape with stderr — strict MCP callers shouldn't
+        # KeyError on documented keys after the guard. Review #9.
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "state": None,
+            "start_at": None,
+            "end_at": None,
+            "completed_points": 0.0,
+            "total_points": 0.0,
+            "closed_issues_count": 0,
+            "description": None,
+            "issue_count": 0,
+            "issues": [],
+            "pagination_warning": None,
+            "stderr": "sprint_name must be non-empty",
+        }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "sprint_id": None, "sprint_name": sprint_name,
@@ -1624,10 +1669,33 @@ def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
             failed: list[int] — API did not return links for these
             stderr: str
     """
+    # Full result shape on the empty-input guards so strict MCP callers
+    # don't KeyError on documented keys after a guard rejection.
+    # Review #9.
     if not issue_numbers:
-        return {"ok": False, "stderr": "issue_numbers must be non-empty"}
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "stderr": "issue_numbers must be non-empty",
+        }
     if not sprint_name or not str(sprint_name).strip():
-        return {"ok": False, "stderr": "sprint_name must be non-empty"}
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "stderr": "sprint_name must be non-empty",
+        }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "sprint_id": None, "sprint_name": sprint_name,
