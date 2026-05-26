@@ -3296,6 +3296,19 @@ Example: zh subissue add 42 100 101"
     fi
 
     local child_nums=("$@")
+    local stripped_parent="${parent_num#\#}"
+
+    # Argument-format validation up-front so typos surface before any git or
+    # network round-trip (matches the posture in cmd_subissue_remove).
+    if ! [[ "$stripped_parent" =~ ^[0-9]+$ ]]; then
+        error "Invalid parent issue number: ${parent_num}"
+    fi
+    for raw_num in "${child_nums[@]}"; do
+        local stripped="${raw_num#\#}"
+        if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${raw_num}"
+        fi
+    done
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -3303,7 +3316,7 @@ Example: zh subissue add 42 100 101"
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
-    info "Adding ${#child_nums[@]} sub-issue(s) to parent #${parent_num#\#}..."
+    info "Adding ${#child_nums[@]} sub-issue(s) to parent #${stripped_parent}..."
 
     # Resolve parent and children separately. The parent ID goes into parentId
     # (scalar); the child IDs go into childIssueIds (list).
@@ -3319,11 +3332,16 @@ Example: zh subissue add 42 100 101"
         --argjson child_ids "$child_ids_json" \
         '{input: {parentId: $parent_id, childIssueIds: $child_ids}}')
 
+    # Project failedIssues fully so we can name which children were rejected,
+    # rather than the prior "{failedIssues: [...]}" opaque dump.
     local mutation='
     mutation($input: AddSubIssuesInput!) {
         addSubIssues(input: $input) {
             successCount
-            failedIssues
+            failedIssues {
+                number
+                repository { ownerName name }
+            }
             githubErrors
         }
     }'
@@ -3333,26 +3351,68 @@ Example: zh subissue add 42 100 101"
 
     local success_count failed_count
     success_count=$(echo "$response" | jq -r '.data.addSubIssues.successCount // 0')
-    failed_count=$(echo "$response" | jq -r '.data.addSubIssues.failedIssues | length // 0')
+    failed_count=$(echo "$response" | jq -r '(.data.addSubIssues.failedIssues // []) | length')
 
-    # Build a "#100, #101" style summary
-    local summary
-    summary=$(printf '#%s, ' "${child_nums[@]/#\#/}")
-    summary="${summary%, }"
+    # Derive the actual added/failed sets from the API response. The naive
+    # "summary = printf #N from inputs" approach we used to do here named
+    # children as "Added" even when the API rejected them — see release-
+    # review finding #5. Instead, take the failed-children numbers from the
+    # mutation payload, subtract them from the input list, and call the
+    # remainder the added set.
+    local failed_nums_csv added_nums_csv
+    failed_nums_csv=$(echo "$response" | jq -r \
+        '(.data.addSubIssues.failedIssues // []) | map("#" + (.number|tostring)) | join(", ")')
+
+    # Input children minus failed children = added children. We compute this
+    # in shell rather than asking the API because addSubIssues only returns
+    # failedIssues (not the inverse).
+    local added_nums_csv_parts=""
+    for raw_num in "${child_nums[@]}"; do
+        local stripped="${raw_num#\#}"
+        local was_failed
+        was_failed=$(echo "$response" | jq -r --argjson n "$stripped" \
+            '[(.data.addSubIssues.failedIssues // [])[] | .number] | any(. == $n)')
+        if [[ "$was_failed" != "true" ]]; then
+            added_nums_csv_parts+="#${stripped}, "
+        fi
+    done
+    added_nums_csv="${added_nums_csv_parts%, }"
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Added ${success_count} sub-issue(s) to #${parent_num#\#}: ${summary}"
+        success "Added ${success_count} sub-issue(s) to #${stripped_parent}: ${added_nums_csv}"
     fi
     if [[ "$failed_count" -gt 0 ]]; then
-        local failed_json
-        failed_json=$(echo "$response" | jq -c '.data.addSubIssues.failedIssues')
-        warn "${failed_count} failed: ${failed_json}"
+        warn "${failed_count} failed: ${failed_nums_csv}"
+        local gh_errors
+        gh_errors=$(echo "$response" | jq -c '.data.addSubIssues.githubErrors // {}')
+        if [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
+            warn "  githubErrors: ${gh_errors}"
+        fi
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
         # Some ZenHub mutations silently no-op when the child already has the
         # same parent. Surface that rather than claiming false success.
         warn "No sub-issues added — already linked or no-op"
+    fi
+
+    # Machine-readable summary line for MCP consumers. Always emitted; format
+    # is stable and parser-friendly:
+    #   RESULT: ok|partial|fail success=N failed=N added=#a,#b failed=#c
+    local outcome
+    if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
+        outcome="partial"
+    elif [[ "$failed_count" -gt 0 ]]; then
+        outcome="fail"
+    else
+        outcome="ok"
+    fi
+    echo "RESULT:add outcome=${outcome} success=${success_count} failed=${failed_count} added=${added_nums_csv} failed_nums=${failed_nums_csv}"
+
+    # Exit non-zero on any failure so the MCP wrapper's subprocess.ok flips
+    # off — and so shell consumers (set -e callers) notice partial failures.
+    if [[ "$failed_count" -gt 0 ]]; then
+        exit 1
     fi
 }
 
@@ -3394,10 +3454,11 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
 
     # For each named child, fetch its current parent and confirm it matches
     # the user-supplied parent number. We do this in one query per child
-    # rather than batching because (a) the schema doesn't expose a
-    # "issuesByInfo" multi-lookup, and (b) failing fast on the first mismatch
-    # is the right UX — the user typed the wrong number; finishing the loop
-    # to find more failures isn't useful.
+    # rather than batching because the schema doesn't expose a multi-lookup
+    # issuesByInfo. All validation failures (not-found, no-parent,
+    # wrong-parent) accumulate into $mismatches and surface as a single
+    # consolidated error after the loop — failing mid-loop would drop any
+    # findings recorded earlier in the same batch.
     local child_id_list="[]"
     local mismatches=""
     for raw_num in "${child_nums[@]}"; do
@@ -3410,6 +3471,10 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
                 parentIssue {
                     number
                 }
+                repository {
+                    ownerName
+                    name
+                }
             }
         }'
 
@@ -3420,18 +3485,36 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
         local lookup_response
         lookup_response=$(zh_graphql "$lookup_query" "$lookup_vars")
 
-        local child_id actual_parent
+        local child_id actual_parent child_owner child_repo
         child_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.id // empty')
         actual_parent=$(echo "$lookup_response" | jq -r '.data.issueByInfo.parentIssue.number // empty')
+        child_owner=$(echo "$lookup_response" | jq -r '.data.issueByInfo.repository.ownerName // empty')
+        child_repo=$(echo "$lookup_response" | jq -r '.data.issueByInfo.repository.name // empty')
 
+        # Funnel all validation failures (not-found, cross-repo, no-parent,
+        # wrong-parent) into the same accumulator. Erroring out mid-loop on
+        # "not found" would drop any findings recorded earlier — the user
+        # would have to retry to learn about them. Consolidate-then-report
+        # is the documented UX intent in the comment above.
         if [[ -z "$child_id" ]]; then
-            error "Issue #${stripped} not found in this repository"
-        fi
-
-        if [[ -z "$actual_parent" ]]; then
+            mismatches+="  #${stripped}: not found in this repository
+"
+        # Defense-in-depth against the multi-repo workspace surprise: if the
+        # API resolved the issue but the child's repository differs from the
+        # checkout we ran from, the parent-match check below could pass by
+        # coincidence (same issue number in repo A AND repo B, both with
+        # parentIssue.number == stripped_parent) and unlink the wrong child.
+        # Reject with a clear "cd or pass --repo" hint instead.
+        elif [[ -n "$child_owner" ]] && [[ "${child_owner}/${child_repo}" != "$owner_repo" ]]; then
+            mismatches+="  #${stripped}: lives in ${child_owner}/${child_repo}, but you're working from ${owner_repo} (cross-repo sub-issues not supported)
+"
+        elif [[ -z "$actual_parent" ]]; then
             mismatches+="  #${stripped}: has no parent (not a sub-issue)
 "
-        elif [[ "$actual_parent" != "$stripped_parent" ]]; then
+        # Arithmetic comparison with forced base-10 so '0042' typed by the
+        # user compares equal to '42' returned by the API, AND so '08'/'09'
+        # don't trigger bash's octal parser.
+        elif (( 10#$actual_parent != 10#$stripped_parent )); then
             mismatches+="  #${stripped}: actual parent is #${actual_parent}, not #${stripped_parent}
 "
         else
@@ -3454,11 +3537,17 @@ parent relationship before retrying."
     mutation_vars=$(jq -n --argjson child_ids "$child_id_list" \
         '{input: {childIssueIds: $child_ids}}')
 
+    # Project failedIssues fully so we can name which children the API
+    # rejected; the prior opaque dump made partial-failure reporting
+    # ambiguous (see release-review finding #1).
     local mutation='
     mutation($input: RemoveSubIssuesInput!) {
         removeSubIssues(input: $input) {
             successCount
-            failedIssues
+            failedIssues {
+                number
+                repository { ownerName name }
+            }
             githubErrors
         }
     }'
@@ -3468,20 +3557,38 @@ parent relationship before retrying."
 
     local success_count failed_count
     success_count=$(echo "$response" | jq -r '.data.removeSubIssues.successCount // 0')
-    failed_count=$(echo "$response" | jq -r '.data.removeSubIssues.failedIssues | length // 0')
+    failed_count=$(echo "$response" | jq -r '(.data.removeSubIssues.failedIssues // []) | length')
 
-    local summary
-    summary=$(printf '#%s, ' "${child_nums[@]/#\#/}")
-    summary="${summary%, }"
+    # Derive removed / failed sets from the API response, not from the raw
+    # input list. See release-review finding #5: the prior summary named
+    # every input as "Removed" regardless of outcome.
+    local failed_nums_csv removed_nums_csv
+    failed_nums_csv=$(echo "$response" | jq -r \
+        '(.data.removeSubIssues.failedIssues // []) | map("#" + (.number|tostring)) | join(", ")')
+
+    local removed_nums_csv_parts=""
+    for raw_num in "${child_nums[@]}"; do
+        local stripped="${raw_num#\#}"
+        local was_failed
+        was_failed=$(echo "$response" | jq -r --argjson n "$stripped" \
+            '[(.data.removeSubIssues.failedIssues // [])[] | .number] | any(. == $n)')
+        if [[ "$was_failed" != "true" ]]; then
+            removed_nums_csv_parts+="#${stripped}, "
+        fi
+    done
+    removed_nums_csv="${removed_nums_csv_parts%, }"
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${summary}"
+        success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${removed_nums_csv}"
     fi
     if [[ "$failed_count" -gt 0 ]]; then
-        local failed_json
-        failed_json=$(echo "$response" | jq -c '.data.removeSubIssues.failedIssues')
-        warn "${failed_count} failed: ${failed_json}"
+        warn "${failed_count} failed: ${failed_nums_csv}"
+        local gh_errors
+        gh_errors=$(echo "$response" | jq -c '.data.removeSubIssues.githubErrors // {}')
+        if [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
+            warn "  githubErrors: ${gh_errors}"
+        fi
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
         # We pre-validated every child belongs to this parent, so a zero
@@ -3491,6 +3598,23 @@ parent relationship before retrying."
         warn "No sub-issues removed — response showed successCount=0 with no failures.
 This is unexpected after pre-flight validation succeeded; check the parent
 state with 'zh subissue list ${stripped_parent}'."
+    fi
+
+    # Machine-readable summary for MCP consumers (stable format):
+    #   RESULT:remove outcome=ok|partial|fail success=N failed=N removed=#a,#b failed_nums=#c
+    local outcome
+    if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
+        outcome="partial"
+    elif [[ "$failed_count" -gt 0 ]]; then
+        outcome="fail"
+    else
+        outcome="ok"
+    fi
+    echo "RESULT:remove outcome=${outcome} success=${success_count} failed=${failed_count} removed=${removed_nums_csv} failed_nums=${failed_nums_csv}"
+
+    # Exit non-zero on any failure so MCP / scripted callers notice.
+    if [[ "$failed_count" -gt 0 ]]; then
+        exit 1
     fi
 }
 
@@ -3540,12 +3664,28 @@ zh_subissue_fetch_all() {
     }'
 
     local cursor="null"
+    local prev_cursor=""
+    local iterations=0
     local all_nodes="[]"
     local total_count=0
     local parent_title=""
     local first_page=true
 
     while :; do
+        # Stuck-cursor / runaway-pagination defenses:
+        #   1. If the API returns the same endCursor we just used (server bug
+        #      or regression on hasNextPage), we'd loop forever fetching the
+        #      same page. Detect and bail.
+        #   2. Hard iteration cap as a belt-and-suspenders backstop. 200
+        #      pages × 100 children = 20,000 sub-issues, well above any
+        #      realistic parent. If we hit it, something is wrong upstream
+        #      and we should fail loudly rather than spin.
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Pagination iteration cap (200) hit on parent — returning partial result"
+            break
+        fi
+
         local variables
         variables=$(jq -n \
             --arg repo_id "$repo_id" \
@@ -3583,6 +3723,14 @@ zh_subissue_fetch_all() {
         if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
             break
         fi
+
+        # Stuck-cursor check: a well-behaved connection always advances
+        # endCursor when hasNextPage=true. If it doesn't, abort.
+        if [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]]; then
+            warn "Pagination cursor did not advance (endCursor=${end_cursor:0:16}…) — returning partial result"
+            break
+        fi
+        prev_cursor="$end_cursor"
 
         cursor=$(jq -n --arg c "$end_cursor" '$c')
     done
@@ -3624,11 +3772,20 @@ zh_subissue_fetch_ids_only() {
     }'
 
     local cursor="null"
+    local prev_cursor=""
+    local iterations=0
     local all_nodes="[]"
     local total_count=0
     local first_page=true
 
     while :; do
+        # Same stuck-cursor / iteration-cap defense as zh_subissue_fetch_all.
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Pagination iteration cap (200) hit on parent — returning partial result"
+            break
+        fi
+
         local variables
         variables=$(jq -n \
             --arg repo_id "$repo_id" \
@@ -3664,6 +3821,12 @@ zh_subissue_fetch_ids_only() {
             break
         fi
 
+        if [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]]; then
+            warn "Pagination cursor did not advance (endCursor=${end_cursor:0:16}…) — returning partial result"
+            break
+        fi
+        prev_cursor="$end_cursor"
+
         cursor=$(jq -n --arg c "$end_cursor" '$c')
     done
 
@@ -3674,14 +3837,43 @@ zh_subissue_fetch_ids_only() {
 }
 
 cmd_subissue_list() {
-    local parent_num="${1:-}"
+    # Two output modes:
+    #
+    #   default — human-formatted table (the historical behaviour).
+    #   --machine — TSV stream of untruncated, separator-safe rows preceded by
+    #               a HEADER line and a single CHILD line per child. This is
+    #               what the MCP server consumes so it doesn't have to parse
+    #               the truncated visual rows. Stable contract; see the
+    #               format spec below.
+    local machine_mode=false
+    local parent_num=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --machine)
+                machine_mode=true
+                shift
+                ;;
+            *)
+                if [[ -z "$parent_num" ]]; then
+                    parent_num="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
 
     if [[ -z "$parent_num" ]]; then
-        error "Usage: zh subissue list <parent#>
+        error "Usage: zh subissue list [--machine] <parent#>
 Example: zh subissue list 42"
     fi
 
     parent_num="${parent_num#\#}"
+
+    # Argument-format validation up-front (same posture as remove).
+    if ! [[ "$parent_num" =~ ^[0-9]+$ ]]; then
+        error "Invalid parent issue number: ${parent_num}"
+    fi
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -3704,15 +3896,69 @@ Example: zh subissue list 42"
     child_count=$(echo "$children_json" | jq -r '.totalCount // 0')
     fetched_count=$(echo "$children_json" | jq -r '.nodes | length')
 
+    # ---- Machine-mode output ----
+    #
+    # Format (TAB-separated, one record per line; no decoration):
+    #
+    #   HEADER<TAB>parent_number<TAB>parent_title<TAB>total_count<TAB>fetched_count
+    #   CHILD<TAB>number<TAB>state<TAB>pipeline<TAB>assignees_csv<TAB>title<TAB>owner<TAB>repo
+    #   ...
+    #
+    # Notes:
+    #   - Title and pipeline are NOT truncated.
+    #   - State is the literal "OPEN" or "CLOSED" from the API.
+    #   - assignees_csv is comma-separated logins; the literal "unassigned"
+    #     when empty.
+    #   - pipeline is "—" when unset.
+    #   - owner/repo are the repository the child issue lives in (matters in
+    #     multi-repo workspaces). When that doesn't match the cwd repo, the
+    #     child can't be operated on via this CLI from this checkout.
+    #   - U+2502 ("│") may appear in any text field; consumers MUST NOT
+    #     interpret it as a separator. The TAB-delimited layout is stable.
+    if [[ "$machine_mode" == "true" ]]; then
+        printf "HEADER\t%s\t%s\t%s\t%s\n" \
+            "$parent_num" "$parent_title" "$child_count" "$fetched_count"
+
+        # Use ASCII NUL to round-trip through the shell loop safely — any
+        # field could contain newlines (rare but possible in titles). Using
+        # `jq -rj` with NUL separators and a `read -d ''` loop avoids the
+        # IFS-stripping pitfall of a tab-only read.
+        if [[ "$fetched_count" -gt 0 ]]; then
+            echo "$children_json" | jq -r '.nodes[] |
+                [
+                    "CHILD",
+                    (.number|tostring),
+                    .state,
+                    (.pipelineIssue.pipeline.name // "—"),
+                    ([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end),
+                    (.title // ""),
+                    (.repository.ownerName // ""),
+                    (.repository.name // "")
+                ] | @tsv'
+        fi
+        return
+    fi
+
+    # ---- Human-mode output (unchanged surface) ----
+
     echo ""
     echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
     echo ""
     echo -e "  ${CYAN}Children:${NC} ${child_count}"
     echo ""
 
-    if [[ "$child_count" -eq 0 ]]; then
-        echo "  No sub-issues"
-        echo ""
+    # Gate the empty-parent early-return on `fetched_count`, not `child_count`.
+    # If the API ever returns totalCount=0 with a non-empty nodes list (the
+    # exact regression the divergence warning below is meant to surface), the
+    # early-return would otherwise pre-empt the warning and silently report
+    # "No sub-issues" while data sat in the response.
+    if [[ "$fetched_count" -eq 0 ]]; then
+        if [[ "$child_count" -ne 0 ]]; then
+            warn "API reported ${child_count} children but returned 0 nodes (pagination drift)"
+        else
+            echo "  No sub-issues"
+            echo ""
+        fi
         return
     fi
 
@@ -3762,9 +4008,20 @@ resolved to the first/last sibling on the client side."
     fi
 
     # Argument-only validation up-front, before any network round-trips:
-    # 'after' and 'before' require a third positional, and the sibling can't
-    # be the child being moved. Doing these checks here rather than inside
-    # the case below saves wasted API calls and surfaces typos faster.
+    # numeric format, position keyword, sibling-required-for-after/before,
+    # and self-anchor guard. Doing these checks here rather than inside the
+    # case below surfaces typos before we touch the API.
+    local stripped_child="${child_num#\#}"
+    if ! [[ "$stripped_child" =~ ^[0-9]+$ ]]; then
+        error "Invalid child issue number: ${child_num}"
+    fi
+    local stripped_sib=""
+    if [[ -n "$sibling_num" ]]; then
+        stripped_sib="${sibling_num#\#}"
+        if ! [[ "$stripped_sib" =~ ^[0-9]+$ ]]; then
+            error "Invalid sibling issue number: ${sibling_num}"
+        fi
+    fi
     case "$position" in
         top|first|bottom|last)
             ;;
@@ -3776,9 +4033,10 @@ Example: zh subissue reorder ${child_num} ${position} 101"
             # Reject self-anchor: passing the same number for child and
             # sibling would send `afterId == childIssueId` to the API, which
             # is at best a no-op and at worst undefined behavior. Compare
-            # stripped values so `#100` vs `100` doesn't sneak through.
-            if [[ "${child_num#\#}" == "${sibling_num#\#}" ]]; then
-                error "Cannot anchor #${child_num#\#} against itself.
+            # arithmetically with forced base-10 so '0100' vs '100' doesn't
+            # sneak through and '08'/'09' don't trip bash's octal parser.
+            if (( 10#$stripped_child == 10#$stripped_sib )); then
+                error "Cannot anchor #${stripped_child} against itself.
 '${position}' requires a different sibling issue number."
             fi
             ;;
@@ -3788,7 +4046,7 @@ Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
             ;;
     esac
 
-    child_num="${child_num#\#}"
+    child_num="$stripped_child"
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -3809,6 +4067,10 @@ Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
                 id
                 number
             }
+            repository {
+                ownerName
+                name
+            }
         }
     }'
 
@@ -3819,14 +4081,25 @@ Use 'top', 'bottom', 'after <sibling#>', or 'before <sibling#>'."
     local lookup_response
     lookup_response=$(zh_graphql "$lookup_query" "$lookup_vars")
 
-    local child_id child_title parent_id parent_num
+    local child_id child_title parent_id parent_num child_owner child_repo
     child_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.id // empty')
     child_title=$(echo "$lookup_response" | jq -r '.data.issueByInfo.title // ""')
     parent_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.parentIssue.id // empty')
     parent_num=$(echo "$lookup_response" | jq -r '.data.issueByInfo.parentIssue.number // empty')
+    child_owner=$(echo "$lookup_response" | jq -r '.data.issueByInfo.repository.ownerName // empty')
+    child_repo=$(echo "$lookup_response" | jq -r '.data.issueByInfo.repository.name // empty')
 
     if [[ -z "$child_id" ]]; then
         error "Issue #${child_num} not found"
+    fi
+    # Cross-repo defense: if a coincidentally-numbered sub-issue exists in
+    # repo A while the real target lives in repo B, the API resolves issue
+    # by (repoId, number) and silently picks the wrong one. Compare the
+    # resolved repository to the checkout repo and refuse if they differ.
+    if [[ -n "$child_owner" ]] && [[ "${child_owner}/${child_repo}" != "$owner_repo" ]]; then
+        error "Issue #${child_num} lives in ${child_owner}/${child_repo}, but you're working from ${owner_repo}.
+Cross-repo sub-issue operations are not supported by this CLI — cd into a
+checkout of ${child_owner}/${child_repo} and re-run."
     fi
     if [[ -z "$parent_id" ]]; then
         error "Issue #${child_num} has no parent — cannot reorder a non-sub-issue.
@@ -3863,13 +4136,15 @@ Use 'zh subissue add <parent#> ${child_num}' first."
                 jq -r --arg cid "$child_id" \
                 '[.nodes[] | select(.id != $cid)][0].id // empty')
             if [[ -z "$first_sib_id" ]]; then
-                # Already only-child or nothing to anchor against. Leave both
-                # null — the API treats that as "move to top".
-                position_desc="top (only child)"
-            else
-                before_id="\"${first_sib_id}\""
-                position_desc="top"
+                # Only child — there is nothing to reorder against. Skip the
+                # mutation entirely rather than firing a vacuous reorder
+                # whose ✓ output would suggest something happened.
+                echo ""
+                warn "#${child_num} is the only sub-issue of #${parent_num} — nothing to reorder."
+                return 0
             fi
+            before_id="\"${first_sib_id}\""
+            position_desc="top"
             ;;
         bottom|last)
             local last_sib_id
@@ -3877,11 +4152,12 @@ Use 'zh subissue add <parent#> ${child_num}' first."
                 jq -r --arg cid "$child_id" \
                 '[.nodes[] | select(.id != $cid)][-1].id // empty')
             if [[ -z "$last_sib_id" ]]; then
-                position_desc="bottom (only child)"
-            else
-                after_id="\"${last_sib_id}\""
-                position_desc="bottom"
+                echo ""
+                warn "#${child_num} is the only sub-issue of #${parent_num} — nothing to reorder."
+                return 0
             fi
+            after_id="\"${last_sib_id}\""
+            position_desc="bottom"
             ;;
         after)
             sibling_num="${sibling_num#\#}"
