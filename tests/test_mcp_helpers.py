@@ -647,9 +647,53 @@ def test_venv_build_lock_acquires_and_releases(tmp_path):
 
 
 def test_venv_build_lock_creates_parent_dir(tmp_path):
-    # Even when the parent doesn't exist yet, the lock context creates
-    # it so subsequent acquisitions don't fail.
+    # When grandparent exists, the lock context creates exactly one
+    # new parent level via `_ensure_safe_parent`, so subsequent
+    # acquisitions don't fail.
     venv_dir = tmp_path / "new-parent" / "venv"
     assert not venv_dir.parent.exists()
     with mcp_server._venv_build_lock(venv_dir):
         assert venv_dir.parent.is_dir()
+
+
+def test_venv_build_lock_refuses_typo_paths_before_mkdir(tmp_path):
+    # PR #15 round-1 CRITICAL: the lock used to call mkdir(parents=True)
+    # before `_ensure_safe_parent` could fire, so a typo'd path like
+    # `~/something-typo/sub/venv` would silently create the whole tree.
+    # The lock now calls _ensure_safe_parent FIRST. Verify by pointing
+    # at a deep path where the grandparent doesn't exist — entering
+    # the context must raise without creating anything.
+    venv_dir = tmp_path / "deep" / "nested" / "tree" / "venv"
+    with pytest.raises(RuntimeError, match="ancestor"):
+        with mcp_server._venv_build_lock(venv_dir):
+            pass  # should not reach this
+    # Nothing got auto-created on disk — the safety check fired early.
+    assert not (tmp_path / "deep").exists()
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 round-1 review — _safe_rmtree ignore_errors mode
+# Cleanup-path callers (inside _build_venv except blocks) need
+# best-effort semantics: a cleanup failure shouldn't mask the original
+# build error.
+# -----------------------------------------------------------------------------
+
+
+def test_safe_rmtree_ignore_errors_swallows_failures(tmp_path):
+    # _safe_rmtree on a symlink whose unlink fails — ignore_errors=True
+    # swallows. Use a non-existent path to provoke a clean FileNotFoundError
+    # on the symlink unlink (closest portable approximation).
+    bogus = tmp_path / "does-not-exist"
+    # No-op for a missing path — no raise either way.
+    mcp_server._safe_rmtree(bogus, ignore_errors=True)
+
+
+def test_safe_rmtree_default_mode_raises(tmp_path):
+    # Without ignore_errors, errors propagate (so production callers
+    # that DO want to know about cleanup failures still see them).
+    bogus = tmp_path / "regular-file"
+    bogus.write_text("file, not a dir")
+    # rmtree on a non-dir non-symlink raises NotADirectoryError on
+    # POSIX (an OSError subclass).
+    with pytest.raises(OSError):
+        mcp_server._safe_rmtree(bogus)

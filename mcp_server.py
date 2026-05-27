@@ -337,37 +337,62 @@ def _ensure_safe_parent(venv_dir: Path) -> None:
     parent.mkdir()  # single new level only
 
 
-def _safe_rmtree(path: Path) -> None:
+def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
     """Robust rmtree that handles symlinks + EACCES gracefully.
 
     Plain `shutil.rmtree` raises on symlinked dirs (`OSError: Cannot
     call rmtree on a symbolic link`) and on permission errors mid-walk
-    (e.g. root-owned `__pycache__/*.pyc` from a prior `sudo` invocation
-    that the current user can't unlink). Both have been observed in
-    practice during the PR #13 review series. This wrapper:
+    (e.g. a user-owned `__pycache__/` with mode 000 from an aborted
+    install, or a parent dir whose write+execute bits were dropped
+    by another tool). This wrapper:
       - unlinks symlinks instead of recursing (preserves the target)
-      - retries individual files with chmod 0o700 on PermissionError
-      - re-raises if a retry still fails
+      - on `PermissionError` during a walk, chmods BOTH the failing
+        path AND its parent (unlink permission is parent-driven on
+        POSIX, not file-mode-driven) and retries
+      - re-raises if a retry still fails, unless `ignore_errors=True`
+
+    NOTE: a root-owned file the current user can't `chmod` is not
+    recoverable here (the chmod itself raises `PermissionError`); we
+    fall through and re-raise. The caller in that case must clean up
+    via `sudo rm -rf` manually. Cleanup-path callers (inside
+    `_build_venv` except blocks) pass `ignore_errors=True` so a
+    failed cleanup doesn't mask the original failure.
     """
-    if path.is_symlink():
-        # Don't follow the symlink and rmtree the target! Just remove
-        # the link itself.
-        path.unlink()
-        return
+    try:
+        if path.is_symlink():
+            # Don't follow the symlink and rmtree the target! Just
+            # remove the link itself.
+            path.unlink()
+            return
 
-    def _on_error(func, p, exc_info):
-        # `onerror` (not `onexc`) for Python 3.10 / 3.11 compatibility.
-        exc_type = exc_info[0]
-        if exc_type is PermissionError or issubclass(exc_type, PermissionError):
-            try:
-                os.chmod(p, 0o700)
-                func(p)
-                return
-            except OSError:
-                pass
-        raise exc_info[1]
+        def _on_error(func, p, exc_info):
+            # `onerror` (not `onexc`) for Python 3.10 / 3.11 compat.
+            exc_type = exc_info[0]
+            # Defensive `is not None` guard: some `shutil.rmtree`
+            # internals can pass `(None, ..., ...)` for non-OSError
+            # cases, and `issubclass(None, ...)` would TypeError-mask
+            # the real exception.
+            if exc_type is not None and issubclass(exc_type, PermissionError):
+                # Permission to unlink depends on the PARENT dir's
+                # write+execute bits, not on the file's mode. Try
+                # chmod-ing the parent first, then the file itself
+                # (in case it's a sub-dir we need to recurse into).
+                try:
+                    os.chmod(os.path.dirname(p), 0o700)
+                except OSError:
+                    pass
+                try:
+                    os.chmod(p, 0o700)
+                    func(p)
+                    return
+                except OSError:
+                    pass
+            raise exc_info[1]
 
-    shutil.rmtree(path, onerror=_on_error)
+        shutil.rmtree(path, onerror=_on_error)
+    except OSError:
+        if not ignore_errors:
+            raise
 
 
 def _build_venv(venv_dir: Path, deps_hash: str) -> None:
@@ -448,7 +473,7 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
         # second Ctrl-C during rmtree), the sentinel on disk still
         # marks the dir as ours, so the next launch can recover
         # without manual intervention.
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        _safe_rmtree(venv_dir, ignore_errors=True)
         raise
     except (subprocess.TimeoutExpired,
             subprocess.CalledProcessError,
@@ -456,7 +481,7 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
         # Build crashed mid-flight — clean up so the next launch's
         # _looks_like_zh_venv sees a missing path (safe to rebuild)
         # instead of needing the sentinel recovery path.
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        _safe_rmtree(venv_dir, ignore_errors=True)
         if isinstance(exc, subprocess.TimeoutExpired):
             reason = (f"timed out after {exc.timeout}s "
                       f"({exc.cmd[0] if exc.cmd else '?'} ...)")
@@ -482,7 +507,7 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
     except (subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
             OSError) as exc:
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        _safe_rmtree(venv_dir, ignore_errors=True)
         raise RuntimeError(
             f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
             f"import all declared deps ({', '.join(_VENV_DEPS)}). "
@@ -498,8 +523,14 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
     os.replace(tmp_marker, marker)
     # Sentinel last — the build is fully certified before we declare
     # it complete. A crash here leaves the marker (good) AND the
-    # sentinel (also good — next launch will rebuild). Harmless either way.
-    sentinel.unlink(missing_ok=True)
+    # sentinel (also harmless — next launch will see the marker and
+    # treat the venv as valid). Swallow non-FileNotFoundError too
+    # (PermissionError, AV-scanner race) — the marker is the source
+    # of truth at this point; the sentinel is cosmetic cleanup.
+    try:
+        sentinel.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 @contextmanager
@@ -515,8 +546,15 @@ def _venv_build_lock(venv_dir: Path):
     cheaply on POSIX. Callers should re-check `_venv_is_valid` AFTER
     acquiring the lock — another process may have completed the
     rebuild while we were waiting.
+
+    Calls `_ensure_safe_parent` BEFORE creating the lock file so a
+    typo'd `ZH_MCP_VENV` doesn't materialize an unintended ancestor
+    tree just to host the lockfile. The lock file lands at
+    `venv_dir.parent / _BOOTSTRAP_LOCK` — guaranteeing the parent
+    exists as a directory is the safety guarantee that `_build_venv`
+    later depends on.
     """
-    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_safe_parent(venv_dir)
     lock_path = venv_dir.parent / _BOOTSTRAP_LOCK
     # Open with O_CREAT so the lock file appears the first time; keep
     # it open across the lock window so the fd stays valid.
@@ -639,7 +677,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # the next issue's header. Tab support is defensive — `zh` currently
 # emits spaces, but if a future formatting pass switches to tabs the
 # parser should degrade gracefully (skip the line) instead of mis-parse.
-_ISSUE_HEADER_RE = re.compile(r"^[ \t]{0,3}#\d+\s*│")
+_ISSUE_HEADER_RE = re.compile(r"^[ \t]{0,3}#\d+[ \t]*│")
 
 
 # =============================================================================
