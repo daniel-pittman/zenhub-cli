@@ -41,5 +41,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Python syntax check (MCP server + similarity engine)
-        run: python -m py_compile mcp_server.py similarity.py
+      - name: Python syntax check (MCP server, GraphQL client + similarity)
+        run: python -m py_compile mcp_server.py zh_api.py zh_graphql_ops.py similarity.py
+
+      # Install pytest only (the tests mock the network entirely, so they
+      # do NOT need mcp / sentence-transformers / torch / numpy at test
+      # time — keeps CI fast and avoids pulling ~1GB of wheels per row of
+      # the matrix). The bootstrap-installed deps are exercised at MCP
+      # runtime, not here.
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run pytest
+        run: python -m pytest tests/ -v

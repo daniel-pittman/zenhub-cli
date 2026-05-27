@@ -181,15 +181,46 @@ def _seconds_since(iso: Optional[str]) -> float:
 # -----------------------------------------------------------------------------
 
 
+# Repo names on GitHub can contain dots ("docs.github.io",
+# "my.tool", "internal.docs").
+#
+# The prefix `(?:git@github\.com:|https?://github\.com/)` is the
+# canonical form, unified with `zh_api._GH_URL_RE` and the bash
+# regex in `zh:get_repo_info`. The source URL always comes from
+# `git remote get-url origin` (or the `ZH_REPO` config override),
+# which produces either `git@github.com:owner/repo[.git]` (ssh) or
+# `https://github.com/owner/repo[.git]` (https). Schemes like
+# `ssh://git@github.com/...`, `git://...`, and `git+ssh://...` are
+# accepted by some git clients but are NOT what `git remote get-url`
+# emits, so the regex rejects them to keep the three parser
+# locations in lockstep. Round-4 finding #5.
+_GITHUB_URL_RE = re.compile(
+    # `^` anchor (round-5 #6) rejects garbage prefixes. Matches the
+    # zh_api._GH_URL_RE form exactly.
+    r"^(?:git@github\.com:|https?://github\.com/)"
+    r"([^/]+)/([^/]+?)(?:\.git)?/?$"
+)
+
+
 def repo_from_cwd(cwd: str) -> str:
     """Derive `owner/repo` from a git checkout's origin remote.
 
     Supports both https and ssh remote URL forms.
     Raises RuntimeError on failure.
+
+    Uses `git remote get-url origin` rather than `git config --get
+    remote.origin.url` — the former honors `url.<x>.insteadOf`
+    rewriting that the user may have configured globally (typical
+    for corporate-network mirrors or push/pull splits). The latter
+    returns the raw config value, which can disagree with what
+    `git fetch` / `git push` actually use. `zh_api.get_owner_repo_
+    from_git` already uses `git remote get-url`; aligning here so
+    the similarity cache and the MCP context resolution see the
+    same effective remote. Round-5 #7.
     """
     try:
         url = subprocess.check_output(
-            ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
             text=True,
             stderr=subprocess.PIPE,
         ).strip()
@@ -197,7 +228,7 @@ def repo_from_cwd(cwd: str) -> str:
         raise RuntimeError(
             f"Cannot derive repo from {cwd}: {e.stderr.strip() or 'not a git checkout'}"
         )
-    m = re.search(r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?/?$", url)
+    m = _GITHUB_URL_RE.search(url)
     if not m:
         raise RuntimeError(f"Cannot parse GitHub repo from URL: {url}")
     return f"{m.group(1)}/{m.group(2)}"

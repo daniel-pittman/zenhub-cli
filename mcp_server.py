@@ -129,9 +129,37 @@ def _bootstrap_venv() -> None:
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
 
 
-_bootstrap_venv()
+# Test-mode escape hatch: setting ZH_MCP_SKIP_BOOTSTRAP=1 in the
+# environment skips the venv bootstrap AND substitutes a minimal
+# `FastMCP` stub for the import below. This lets the pytest suite
+# exercise the guard logic and result-dict shapes in MCP tools
+# without pulling in mcp / torch / transformers / numpy. Production
+# (the actual MCP server transport) must NEVER set this — without
+# the real FastMCP, the server doesn't serve.
+_MCP_SKIP_BOOTSTRAP = os.environ.get("ZH_MCP_SKIP_BOOTSTRAP", "") == "1"
 
-from mcp.server.fastmcp import FastMCP
+if not _MCP_SKIP_BOOTSTRAP:
+    _bootstrap_venv()
+    from mcp.server.fastmcp import FastMCP
+else:
+    # Minimal no-op stub. `@mcp.tool()` returns the function unchanged
+    # so tests can call the wrapped tool directly. The stub class is
+    # callable as `FastMCP("name")` and exposes a `.run()` that just
+    # raises (we don't want a test accidentally launching a server).
+    class FastMCP:  # type: ignore[no-redef]
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def tool(self, *args, **kwargs):  # noqa: ARG002
+            def _decorator(fn):
+                return fn
+            return _decorator
+
+        def run(self) -> None:
+            raise RuntimeError(
+                "FastMCP stub: ZH_MCP_SKIP_BOOTSTRAP is set. The MCP "
+                "server cannot run in this mode; it's for unit tests only."
+            )
 
 # =============================================================================
 # Paths and configuration
@@ -139,6 +167,13 @@ from mcp.server.fastmcp import FastMCP
 
 HERE = Path(__file__).resolve().parent
 ZH_BIN = Path(os.environ.get("ZH_BIN_PATH", str(HERE / "zh")))
+
+# Make sibling modules (zh_api.py, zh_graphql_ops.py, similarity.py)
+# importable when the MCP server is launched via the bootstrapped venv
+# from any cwd. sys.path may not include __file__'s directory in that
+# case.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 # ANSI color code regex — zh emits colored output for terminals; strip for MCP.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -162,29 +197,78 @@ def _resolve_cwd(repo_path: str = "") -> str:
 
 
 def _run_zh(args: list[str], *, cwd: str | None = None,
-            stdin: str | None = None) -> dict:
-    """Invoke zh as a subprocess; return structured result."""
+            stdin: str | None = None, timeout: float = 60.0) -> dict:
+    """Invoke zh as a subprocess; return structured result.
+
+    `timeout` is a soft cap on the whole invocation. ZenHub GraphQL
+    queries typically return in < 5s; we cap at 60s to avoid the MCP
+    server hanging if the API is unresponsive — review note.
+    """
     if not ZH_BIN.exists():
+        # Round-8 #3: align with timeout / success branches — `stderr`
+        # and `stderr_plain` carry the same content, just with vs.
+        # without ANSI escapes. This message is plain ASCII so the
+        # two are identical, but callers comparing the fields (or
+        # reading `stderr_plain` exclusively) must see the diagnostic.
+        msg = f"zh binary not found at {ZH_BIN}"
         return {
             "ok": False,
             "exit_code": -1,
             "stdout": "",
-            "stderr": f"zh binary not found at {ZH_BIN}",
+            "stderr": msg,
             "stdout_plain": "",
+            "stderr_plain": msg,
         }
-    result = subprocess.run(
-        [str(ZH_BIN)] + args,
-        capture_output=True,
-        text=True,
-        input=stdin,
-        cwd=cwd,
-    )
+    try:
+        result = subprocess.run(
+            [str(ZH_BIN)] + args,
+            capture_output=True,
+            text=True,
+            input=stdin,
+            cwd=cwd,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        # Round-6 #15: also strip ANSI from stderr_plain. MCP
+        # callers reading stderr would otherwise see raw `\x1b[...m`
+        # escape codes embedded in error messages. Same symmetric
+        # fix applies to the success-return path below.
+        #
+        # Round-7 #5: align `stderr` and `stderr_plain` so they
+        # describe the same subprocess state, just with vs without
+        # ANSI escapes. Pre-fix `stderr` was the synthetic timeout
+        # message only, while `stderr_plain` preferred the captured
+        # `e.stderr` (when non-empty). The two diverged — callers
+        # reading `stderr` lost any diagnostic the subprocess had
+        # emitted before timing out. Now both fields contain the
+        # captured diagnostic (when present) AND the synthetic
+        # timeout suffix.
+        captured_stderr = e.stderr or ""
+        synthetic = (
+            f"zh subprocess timed out after {timeout}s (args={args!r})"
+        )
+        combined_stderr = (
+            f"{captured_stderr}\n{synthetic}"
+            if captured_stderr else synthetic
+        )
+        return {
+            "ok": False,
+            "exit_code": -1,
+            "stdout": e.stdout or "",
+            "stderr": combined_stderr,
+            "stdout_plain": _ANSI_RE.sub("", e.stdout or ""),
+            "stderr_plain": _ANSI_RE.sub("", combined_stderr),
+        }
     return {
         "ok": result.returncode == 0,
         "exit_code": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
         "stdout_plain": _ANSI_RE.sub("", result.stdout),
+        # Round-6 #15: symmetric ANSI strip on stderr — MCP callers
+        # surfacing tool errors should see human-readable text, not
+        # escape codes.
+        "stderr_plain": _ANSI_RE.sub("", result.stderr),
     }
 
 
@@ -243,226 +327,10 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
     return issues
 
 
-def _parse_subissue_listing(plain: str) -> dict:
-    """Parse `zh subissue list --machine <parent#>` output into structured form.
-
-    The `--machine` flag emits a stable TAB-separated record stream:
-
-        HEADER\tparent_number\tparent_title\ttotal_count\tfetched_count
-        CHILD\tnumber\tstate\tpipeline\tassignees_csv\ttitle\towner\trepo
-
-    Fields are NOT truncated and the layout is immune to U+2502 ("│")
-    appearing in any text field — fix for release-review findings #3 + #13
-    (visual columns were truncated and the separator collided with title
-    text). State is the literal "OPEN" or "CLOSED" from the API rather
-    than being inferred from a leading "✓" — fix for finding #2.
-
-    Returns:
-        {
-            "parent_title": str,
-            "total_count": int,
-            "fetched_count": int,
-            "children": [
-                {"number": int, "title": str, "state": str,
-                 "pipeline": str | None, "assignees": [str],
-                 "owner": str | None, "repo": str | None},
-                ...
-            ],
-        }
-
-    Defensive — any non-MACHINE-format line is ignored. If the caller passes
-    legacy non-machine output (e.g. an older `zh` build), parsing simply
-    yields an empty result and the caller falls back to `raw`.
-    """
-    out = {
-        "parent_title": "",
-        "total_count": 0,
-        "fetched_count": 0,
-        "children": [],
-    }
-
-    for line in plain.splitlines():
-        parts = line.split("\t")
-        if not parts:
-            continue
-        tag = parts[0]
-        if tag == "HEADER" and len(parts) >= 5:
-            try:
-                out["parent_title"] = parts[2]
-                out["total_count"] = int(parts[3])
-                # parts[4] is fetched_count as reported by bash; we recompute
-                # below from the actual CHILD-line count for cross-validation.
-            except ValueError:
-                pass
-        elif tag == "CHILD" and len(parts) >= 8:
-            try:
-                number = int(parts[1])
-            except ValueError:
-                continue
-            state = parts[2]
-            pipeline_raw = parts[3]
-            pipeline = None if pipeline_raw == "—" else pipeline_raw
-            assignees_raw = parts[4]
-            if assignees_raw == "unassigned":
-                assignees: list[str] = []
-            else:
-                assignees = [a for a in assignees_raw.split(",") if a]
-            title = parts[5]
-            owner = parts[6] or None
-            repo = parts[7] or None
-            out["children"].append({
-                "number": number,
-                "title": title,
-                "state": state,
-                "pipeline": pipeline,
-                "assignees": assignees,
-                "owner": owner,
-                "repo": repo,
-            })
-
-    out["fetched_count"] = len(out["children"])
-    return out
-
-
-def _parse_subissue_mutation_result(plain: str, verb: str) -> dict:
-    """Parse the RESULT:<verb> machine summary line from `zh subissue add/remove`.
-
-    The bash command always emits exactly one line of the form:
-
-        RESULT:<verb> outcome=ok|partial|fail|noop success=N failed=N \
-            <key>=#a,#b failed_nums=#c
-
-    where <verb> is "add" or "remove" and <key> is "added" or "removed".
-    See cmd_subissue_add / cmd_subissue_remove in `zh`.
-
-    The "noop" outcome is the (success=0, failed=0) case — the API neither
-    added nor rejected anything (e.g. every requested child was already
-    linked to this parent). The wrapper treats it as non-success. See
-    round-3 review finding #2.
-
-    The CSV values inside `<key>=...` and `failed_nums=...` are guaranteed
-    space-free by the bash emitter (round-3 finding #1). The tokeniser
-    here splits on " " — if a space ever shows up inside a CSV value the
-    bare follow-on tokens have no "=" and get silently dropped, producing
-    an undercount. _parse_hashlist tolerates leading/trailing whitespace
-    on each comma-separated token as belt-and-suspenders.
-
-    Returns:
-        {
-            "outcome": "ok" | "partial" | "fail" | "noop" | "unknown",
-            "success_count": int,
-            "failed_count": int,
-            "succeeded_numbers": [int, ...],
-            "failed_numbers": [int, ...],
-        }
-
-    Falls back to `outcome="unknown"` with zero counts if no RESULT line is
-    found — keeps the caller's payload self-consistent even if bash output
-    drifts.
-    """
-    out = {
-        "outcome": "unknown",
-        "success_count": 0,
-        "failed_count": 0,
-        "succeeded_numbers": [],
-        "failed_numbers": [],
-    }
-    prefix = f"RESULT:{verb} "
-    line = next(
-        (ln for ln in plain.splitlines() if ln.startswith(prefix)),
-        None,
-    )
-    if line is None:
-        return out
-
-    # Tokenise key=value pairs from after the verb. The bash emitter
-    # guarantees no spaces inside any value, so splitting on " " is safe.
-    for tok in line[len(prefix):].split(" "):
-        if "=" not in tok:
-            continue
-        k, _, v = tok.partition("=")
-        if k == "outcome":
-            out["outcome"] = v or "unknown"
-        elif k == "success":
-            out["success_count"] = int(v) if v.isdigit() else 0
-        elif k == "failed":
-            out["failed_count"] = int(v) if v.isdigit() else 0
-        elif k in ("added", "removed"):
-            out["succeeded_numbers"] = _parse_hashlist(v)
-        elif k == "failed_nums":
-            out["failed_numbers"] = _parse_hashlist(v)
-    return out
-
-
-def _parse_subissue_reorder_result(plain: str) -> dict:
-    """Parse the RESULT:reorder machine summary line from `zh subissue reorder`.
-
-    Emitted by `cmd_subissue_reorder` in three cases:
-
-        RESULT:reorder outcome=ok    child=#N parent=#M position=top
-        RESULT:reorder outcome=fail  child=#N parent=#M position=after_#K
-        RESULT:reorder outcome=noop  child=#N parent=#M position=top
-
-    "noop" is the only-child case — `child` is the only sub-issue of
-    `parent`, so there is no sibling to anchor against; the bash command
-    skipped the mutation. See round-3 review finding #3.
-
-    The position value is underscore-collapsed by bash (e.g. "after #101"
-    -> "after_#101") because the tokeniser splits on " ".
-
-    Returns:
-        {
-            "outcome": "ok" | "noop" | "fail" | "unknown",
-            "child_number": int | None,
-            "parent_number": int | None,
-            "position": str,             # "top", "bottom", "after_#101", ...
-        }
-    """
-    out: dict = {
-        "outcome": "unknown",
-        "child_number": None,
-        "parent_number": None,
-        "position": "",
-    }
-    prefix = "RESULT:reorder "
-    line = next(
-        (ln for ln in plain.splitlines() if ln.startswith(prefix)),
-        None,
-    )
-    if line is None:
-        return out
-
-    for tok in line[len(prefix):].split(" "):
-        if "=" not in tok:
-            continue
-        k, _, v = tok.partition("=")
-        if k == "outcome":
-            out["outcome"] = v or "unknown"
-        elif k == "child":
-            stripped = v.lstrip("#")
-            if stripped.isdigit():
-                out["child_number"] = int(stripped)
-        elif k == "parent":
-            stripped = v.lstrip("#")
-            if stripped.isdigit():
-                out["parent_number"] = int(stripped)
-        elif k == "position":
-            # Convert the bash-collapsed underscore form back to spaces for
-            # human-readable consumption ("after_#101" -> "after #101").
-            out["position"] = v.replace("_", " ")
-    return out
-
-
-def _parse_hashlist(csv: str) -> list[int]:
-    """Parse '#100,#101,#102' into [100, 101, 102]. Tolerates empty / whitespace."""
-    if not csv:
-        return []
-    out: list[int] = []
-    for tok in csv.split(","):
-        tok = tok.strip().lstrip("#")
-        if tok.isdigit():
-            out.append(int(tok))
-    return out
+# Sub-issue helpers moved to zh_graphql_ops.py — the MCP server now talks
+# directly to ZenHub's GraphQL API for the sub-issue family of tools
+# (list / add / remove / reorder). The bash text contract used in v1.5.0
+# was a recurring source of drift; v1.6.0 retires it entirely.
 
 
 def _parse_new_issue_number(plain: str) -> int | None:
@@ -1320,67 +1188,98 @@ def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
 
 # =============================================================================
 # Sub-issue management (Issue → Sub-issue hierarchy tier)
+#
+# v1.6.0: these tools call ZenHub's GraphQL API directly via zh_graphql_ops.
+# No more text-contract parsing — the layer that drove four rounds of
+# release-review findings on v1.5.0 is gone.
 # =============================================================================
+
+
+def _resolve_ctx(repo_path: str = ""):
+    """Resolve a RepoContext from the cwd; return (ctx, error_dict).
+
+    Exactly one of (ctx, error_dict) is non-None.
+    """
+    from zh_api import resolve_context, ZhApiError  # noqa: PLC0415
+    try:
+        return resolve_context(cwd=_resolve_cwd(repo_path)), None
+    except ZhApiError as e:
+        return None, {"ok": False, "stderr": str(e)}
+    except Exception as e:  # noqa: BLE001 — be loud about unexpected
+        return None, {"ok": False, "stderr": f"context resolution failed: {e}"}
 
 
 @mcp.tool()
 def subissue_list(parent_number: int, repo_path: str = "") -> dict:
     """List sub-issues of a parent issue.
 
-    Invokes `zh subissue list --machine <parent#>` and parses the stable
-    TAB-separated machine stream so the returned `children` array carries
-    untruncated, separator-safe data. Each child dict also includes its
-    owning `owner`/`repo` — useful for multi-repo workspaces where a
-    parent in repo A has sub-issues in repo B that this CLI can't operate
-    on from a single checkout.
-
-    Under normal operation `total_count` (from ZenHub's
-    `zenhubChildIssues.totalCount`) and `fetched_count` (how many CHILD
-    rows the machine stream emitted) agree. A divergence indicates
-    pagination drift in `zh` itself.
+    Calls ZenHub's GraphQL `zenhubChildIssues` connection directly from
+    Python — no bash text contract. Walks pagination with the
+    stuck-cursor + iteration-cap defenses carried over from the bash
+    implementation. Each child dict carries its `repository.owner` and
+    `.name` so callers can spot cross-repo children that can't be
+    operated on from a single git checkout.
 
     Args:
-        parent_number: Issue number of the parent.
-        repo_path: Optional absolute path of a git checkout to run zh from.
+        parent_number: Issue number of the parent (positive int).
+        repo_path: Optional absolute path of a git checkout to run from.
+            Used to derive owner/repo via `git remote get-url origin`.
 
     Returns:
         dict with:
             ok: bool
             parent_number: int
             parent_title: str
-            total_count: int
-            fetched_count: int
-            children: list[dict] where each dict has
+            parent_state: str | None — "OPEN" / "CLOSED"
+            total_count: int — API's zenhubChildIssues.totalCount
+            fetched_count: int — how many CHILD nodes we walked
+            children: list[dict] each with
                 number: int
-                title: str                        — untruncated
+                title: str (untruncated, separator-safe)
                 state: "OPEN" | "CLOSED"
                 pipeline: str | None
-                assignees: list[str]              — full logins, untruncated
-                owner: str | None                 — child's repo owner
-                repo: str | None                  — child's repo name
-            raw: str                              — the full machine-mode CLI output
+                assignees: list[str]
+                repository: {"owner": str, "name": str}
+            pagination_warning: str | None — set if the walk bailed
+                defensively (cursor stuck, iteration cap reached)
             stderr: str
     """
-    r = _run_zh(["subissue", "list", "--machine", str(parent_number)],
-                cwd=_resolve_cwd(repo_path))
-    if r["ok"]:
-        parsed = _parse_subissue_listing(r["stdout_plain"])
-    else:
-        parsed = {
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        # Review finding #8: `parent_state` was missing from the early-
+        # error return shape while the docstring + other returns all
+        # include it. Callers reading `result["parent_state"]` would
+        # KeyError when context resolution fails (no git remote, etc.).
+        return {**err, "parent_number": parent_number,
+                "parent_title": "", "parent_state": None,
+                "total_count": 0, "fetched_count": 0,
+                "children": [], "pagination_warning": None}
+    from zh_graphql_ops import list_sub_issues  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = list_sub_issues(ctx, parent_number)
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "parent_number": parent_number,
             "parent_title": "",
+            "parent_state": None,
             "total_count": 0,
             "fetched_count": 0,
             "children": [],
+            "pagination_warning": None,
+            "stderr": str(e),
         }
     return {
-        "ok": r["ok"],
+        "ok": result.get("ok", False),
         "parent_number": parent_number,
-        "parent_title": parsed["parent_title"],
-        "total_count": parsed["total_count"],
-        "fetched_count": parsed["fetched_count"],
-        "children": parsed["children"],
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "parent_title": result.get("parent_title", ""),
+        "parent_state": result.get("parent_state"),
+        "total_count": result.get("total_count", 0),
+        "fetched_count": result.get("fetched_count", 0),
+        "children": result.get("children", []),
+        "pagination_warning": result.get("pagination_warning"),
+        "stderr": result.get("error") or "",
     }
 
 
@@ -1389,56 +1288,128 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
                           repo_path: str = "") -> dict:
     """Add one or more issues as sub-issues of a parent.
 
-    Parses the `RESULT:add` machine summary line emitted by `zh subissue
-    add` to return the API's *actual* added / failed sets — not the raw
-    input list. On partial failure the bash command exits non-zero, so
-    `ok` will be false; both `added` and `failed` are still populated so
-    callers can act on the partial outcome rather than retrying blindly.
+    Calls ZenHub's `addSubIssues` mutation directly. The API's
+    `replaceParent` defaults to false in our caller, so a child that's
+    already attached to a different parent is surfaced in the API's
+    `failedIssues` array — NOT silently re-parented. The MCP wrapper
+    reports succeeded / failed sets sourced from that response, not from
+    the raw input list (a contract finding the v1.5.0 series ate hard).
 
     `outcome="noop"` is the (success=0, failed=0) case — the API neither
     added nor rejected anything, typically because every requested child
-    was already linked to this parent. `ok` is false in that case so an
-    LLM caller can't confuse it with a successful add. See round-3
-    review finding #2.
+    was already linked to this parent. `ok` is false so an LLM caller
+    cannot confuse it with a successful add.
 
     Args:
         parent_number: Issue number of the parent.
-        child_numbers: List of issue numbers to link as sub-issues
-            (single API call).
-        repo_path: Optional absolute path of a git checkout to run zh from.
+        child_numbers: List of issue numbers to link (single API call).
+        repo_path: Optional absolute path of a git checkout.
 
     Returns:
         dict with:
-            ok: bool                — true iff outcome == "ok"
+            ok: bool — true iff outcome == "ok"
             parent_number: int
-            outcome: "ok" | "partial" | "fail" | "noop" | "unknown"
-            success_count: int      — API-reported successCount
-            failed_count: int       — API-reported failedIssues length
-            added: list[int]        — children the API actually added
-            failed: list[int]       — children the API rejected
-            raw: str
+            outcome: "ok" | "partial" | "fail" | "noop"
+            success_count: int — API-reported successCount
+            failed_count: int — API-reported failedIssues length
+            succeeded: list[int] — children the API actually linked
+            failed: list[dict] — each {number, owner, name}
+            unaccounted: list[int] — inputs the API did not report on
+                in either succeeded or failed. Empty when the inferred
+                succeeded set matches successCount (the trusted path).
+                Populated under divergence (success_count != len(
+                inferred_succeeded)) — succeeded is then empty and
+                `unaccounted` exposes which input numbers the API
+                neither confirmed nor explicitly failed. Pre-flight
+                bails (parent-not-found, child-not-found) populate
+                this with the un-attempted inputs so the conservation
+                invariant holds across all return paths:
+                len(succeeded) + len(failed) + len(unaccounted) ==
+                len(deduped input child_numbers). Order preserves the
+                deduped input order. (round-10 Pattern A)
+            failed_unknown_count: int — count of `failedIssues`
+                entries that lacked a usable issue `number` (null or
+                non-int). Those entries bumped `failed_count` but
+                are NOT in `failed` (no identifier to surface) and
+                are NOT in `unaccounted` (the API DID report on them,
+                just opaquely). When > 0, `partial_success_warning`
+                names the count so the operator knows. (round-10
+                Pattern A / round-9 #10)
+            github_errors: dict | None
+            partial_success_warning: str | None — set when the API's
+                successCount diverges from the inferred succeeded
+                set. Warning text is tailored by outcome shape
+                (round-8 #1): "ok→partial" divergence reads
+                "cannot identify which inputs succeeded"; strict
+                noop divergence reads "strict no-op despite N
+                input(s)"; under-reported fail reads "did not
+                report on N input(s)". In every divergence case
+                `succeeded` is empty because we can't identify
+                which inputs landed. `outcome` is downgraded to
+                "partial" only when it would otherwise have been
+                "ok" — noop and fail keep their stronger semantics.
+                Callers should re-list the parent's children to
+                determine actual state.
             stderr: str
     """
     if not child_numbers:
-        return {"ok": False, "stderr": "child_numbers must be non-empty"}
-    args = ["subissue", "add", str(parent_number)] + [str(n) for n in child_numbers]
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    parsed = _parse_subissue_mutation_result(r["stdout_plain"], verb="add")
+        # Full result shape on the empty-input guard so strict MCP
+        # callers don't KeyError on documented keys after a guard
+        # rejection. Mirrors the sprint-tool fix from `bef3313`.
+        return {
+            "ok": False,
+            "parent_number": parent_number,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "failed_unknown_count": 0,
+            "github_errors": None,
+            "partial_success_warning": None,
+            "stderr": "child_numbers must be non-empty",
+        }
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "parent_number": parent_number, "outcome": "fail",
+                "success_count": 0, "failed_count": 0,
+                "succeeded": [], "failed": [], "unaccounted": [],
+                "failed_unknown_count": 0,
+                "github_errors": None,
+                "partial_success_warning": None}
+    from zh_graphql_ops import add_sub_issues  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = add_sub_issues(ctx, parent_number, list(child_numbers))
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "parent_number": parent_number,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "failed_unknown_count": 0,
+            "github_errors": None,
+            "partial_success_warning": None,
+            "stderr": str(e),
+        }
     return {
-        # `ok` is gated on the parsed outcome rather than r["ok"] alone. The
-        # bash command exits non-zero on partial/fail/noop, so r["ok"] is
-        # also false in those cases — checking outcome directly defends
-        # against a future bash-side regression that keeps the exit code
-        # but loses the RESULT line.
-        "ok": parsed["outcome"] == "ok",
+        "ok": result.get("ok", False),
         "parent_number": parent_number,
-        "outcome": parsed["outcome"],
-        "success_count": parsed["success_count"],
-        "failed_count": parsed["failed_count"],
-        "added": parsed["succeeded_numbers"],
-        "failed": parsed["failed_numbers"],
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "outcome": result.get("outcome", "fail"),
+        "success_count": result.get("success_count", 0),
+        "failed_count": result.get("failed_count", 0),
+        "succeeded": result.get("succeeded", []),
+        "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
+        "failed_unknown_count": result.get("failed_unknown_count", 0),
+        "github_errors": result.get("github_errors"),
+        "partial_success_warning": result.get("partial_success_warning"),
+        "stderr": result.get("error") or "",
     }
 
 
@@ -1448,50 +1419,108 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     """Remove one or more sub-issues from a parent.
 
     Pre-validates that every child currently has `parent_number` as its
-    parent (and that every child lives in the cwd's repo); aborts otherwise.
-    On the bash side the validation surfaces a consolidated mismatch report
-    rather than failing at the first error. Parses the `RESULT:remove`
-    machine summary line so the returned `removed` / `failed` arrays come
-    from the API's actual outcome rather than the raw input list.
+    parent and lives in the cwd's repo; on failure surfaces a
+    consolidated mismatch report rather than bailing at the first error.
 
-    `outcome="noop"` is the (success=0, failed=0) case — the API didn't
-    unlink anything despite pre-flight validation passing (a race, or an
-    API-side oddity). `ok` is false in that case. See round-3 finding #2.
+    `outcome="noop"` (success=0, failed=0 from the API after pre-flight
+    validation passed) is reported with `ok=False` — that combination is
+    an API-side oddity (e.g. a race where someone else unlinked between
+    pre-flight and mutation) and shouldn't look like success.
 
     Args:
-        parent_number: Issue number of the parent. Each child must currently
-            be a sub-issue of this parent — wrong-parent typos are rejected
-            pre-flight.
+        parent_number: Issue number of the parent.
         child_numbers: List of sub-issue numbers to unlink.
-        repo_path: Optional absolute path of a git checkout to run zh from.
+        repo_path: Optional absolute path of a git checkout.
 
     Returns:
         dict with:
-            ok: bool                — true iff outcome == "ok"
+            ok: bool — true iff outcome == "ok"
             parent_number: int
-            outcome: "ok" | "partial" | "fail" | "noop" | "unknown"
-            success_count: int      — API-reported successCount
-            failed_count: int       — API-reported failedIssues length
-            removed: list[int]      — children the API actually unlinked
-            failed: list[int]       — children the API rejected
-            raw: str
+            outcome: "ok" | "partial" | "fail" | "noop"
+            success_count: int
+            failed_count: int
+            succeeded: list[int]
+            failed: list[dict]
+            unaccounted: list[int] — inputs the API did not report on
+                in either succeeded or failed. Empty on the trusted
+                path; populated under divergence OR under pre-flight
+                bails (parent-not-found, validation-failed). Order
+                preserves deduped input order. Conservation invariant:
+                len(succeeded) + len(failed) + len(unaccounted) ==
+                len(deduped input child_numbers). (round-10 Pattern A)
+            failed_unknown_count: int — see subissue_add_children.
+            github_errors: dict | None
+            partial_success_warning: str | None — set when the API's
+                successCount diverges from the inferred succeeded
+                set. Warning text is tailored by outcome shape
+                (round-8 #1) — see subissue_add_children for the
+                three variants. `succeeded` is empty under
+                divergence in all cases. `outcome` is downgraded to
+                "partial" only when it would otherwise have been
+                "ok" (round-7 #1 made the `add` and `remove`
+                guards match); `noop` and `fail` keep their
+                stronger semantics. Callers should re-list the
+                parent's children to determine actual state.
             stderr: str
     """
     if not child_numbers:
-        return {"ok": False, "stderr": "child_numbers must be non-empty"}
-    args = ["subissue", "remove", str(parent_number)] + [str(n) for n in child_numbers]
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    parsed = _parse_subissue_mutation_result(r["stdout_plain"], verb="remove")
+        # Full result shape on the empty-input guard so strict MCP
+        # callers don't KeyError on documented keys after a guard
+        # rejection. Mirrors the sprint-tool fix from `bef3313`.
+        return {
+            "ok": False,
+            "parent_number": parent_number,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "failed_unknown_count": 0,
+            "github_errors": None,
+            "partial_success_warning": None,
+            "stderr": "child_numbers must be non-empty",
+        }
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "parent_number": parent_number, "outcome": "fail",
+                "success_count": 0, "failed_count": 0,
+                "succeeded": [], "failed": [], "unaccounted": [],
+                "failed_unknown_count": 0,
+                "github_errors": None,
+                "partial_success_warning": None}
+    from zh_graphql_ops import remove_sub_issues  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = remove_sub_issues(ctx, parent_number, list(child_numbers))
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "parent_number": parent_number,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "failed_unknown_count": 0,
+            "github_errors": None,
+            "partial_success_warning": None,
+            "stderr": str(e),
+        }
     return {
-        "ok": parsed["outcome"] == "ok",
+        "ok": result.get("ok", False),
         "parent_number": parent_number,
-        "outcome": parsed["outcome"],
-        "success_count": parsed["success_count"],
-        "failed_count": parsed["failed_count"],
-        "removed": parsed["succeeded_numbers"],
-        "failed": parsed["failed_numbers"],
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "outcome": result.get("outcome", "fail"),
+        "success_count": result.get("success_count", 0),
+        "failed_count": result.get("failed_count", 0),
+        "succeeded": result.get("succeeded", []),
+        "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
+        "failed_unknown_count": result.get("failed_unknown_count", 0),
+        "github_errors": result.get("github_errors"),
+        "partial_success_warning": result.get("partial_success_warning"),
+        "stderr": result.get("error") or "",
     }
 
 
@@ -1501,69 +1530,481 @@ def subissue_reorder(child_number: int, position: str,
                      repo_path: str = "") -> dict:
     """Reorder a sub-issue among its siblings.
 
-    Uses sibling-anchored positioning (ZenHub's reprioritizeSubIssue mutation
-    semantics), not integer positions. Supported positions:
+    Calls ZenHub's `reprioritizeSubIssue` mutation directly. Sibling
+    anchoring (top/bottom/after/before) is computed in Python from
+    `zenhubChildIssues` listing — same logic the bash implementation had,
+    just on the MCP side now.
 
-      - "top"               — first sibling
-      - "bottom"            — last sibling
-      - "after"             — requires sibling_number; place right after sibling
-      - "before"            — requires sibling_number; place right before sibling
+    Positions:
+      - "top" / "first"   — first sibling
+      - "bottom" / "last" — last sibling
+      - "after"           — requires sibling_number
+      - "before"          — requires sibling_number
 
-    Parses the `RESULT:reorder` machine summary line emitted by `zh subissue
-    reorder` so callers can distinguish:
-
-      - outcome="ok"   — mutation fired and ZenHub reported success
-      - outcome="noop" — child is the only sub-issue of its parent; nothing
-                        to reorder against. The bash command warned and did
-                        NOT fire the mutation. See round-3 finding #3.
-      - outcome="fail" — the API rejected the reorder.
-      - outcome="unknown" — no RESULT line; bash failed before emitting one.
-
-    `ok` is true only when outcome=="ok"; an only-child reorder no longer
-    looks like a successful reorder to MCP callers.
+    `outcome="noop"` is the only-child case (no sibling to anchor
+    against); the mutation is NOT fired. `ok=False` in that case so the
+    caller cannot confuse it with a successful reorder.
 
     Args:
         child_number: Sub-issue to reposition.
-        position: One of "top", "bottom", "after", "before".
-        sibling_number: Required when position is "after" or "before".
-        repo_path: Optional absolute path of a git checkout to run zh from.
+        position: One of "top" / "first" / "bottom" / "last" /
+            "after" / "before".
+        sibling_number: Required when position is after/before.
+        repo_path: Optional absolute path of a git checkout.
 
     Returns:
         dict with:
-            ok: bool                — true iff outcome == "ok"
+            ok: bool — true iff outcome == "ok"
             child_number: int
-            position: str           — "top" | "bottom" | "after #N" | "before #N"
-            outcome: "ok" | "noop" | "fail" | "unknown"
-            parent_number: int | None  — from the RESULT line, when available
-            raw: str
+            parent_number: int | None — resolved from the child's
+                parentIssue
+            position: str — normalized human form, e.g. "top",
+                "after #101"
+            outcome: "ok" | "noop" | "fail"
             stderr: str
     """
-    pos = position.lower().strip()
-    if pos not in {"top", "bottom", "after", "before"}:
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "child_number": child_number,
+                "parent_number": None, "position": position,
+                "outcome": "fail"}
+    from zh_graphql_ops import reorder_sub_issue  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = reorder_sub_issue(
+            ctx, child_number, position,
+            sibling_number=sibling_number,
+        )
+    except ZhApiError as e:
         return {
             "ok": False,
-            "stderr": f"position must be one of top/bottom/after/before (got: {position!r})",
+            "child_number": child_number,
+            "parent_number": None,
+            "position": position,
+            "outcome": "fail",
+            "stderr": str(e),
         }
-    if pos in {"after", "before"} and sibling_number is None:
-        return {
-            "ok": False,
-            "stderr": f"position {pos!r} requires sibling_number",
-        }
-
-    args = ["subissue", "reorder", str(child_number), pos]
-    if pos in {"after", "before"}:
-        args.append(str(sibling_number))
-
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    parsed = _parse_subissue_reorder_result(r["stdout_plain"])
     return {
-        "ok": parsed["outcome"] == "ok",
+        "ok": result.get("ok", False),
         "child_number": child_number,
-        "position": pos if pos in {"top", "bottom"} else f"{pos} #{sibling_number}",
-        "outcome": parsed["outcome"],
-        "parent_number": parsed["parent_number"],
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "parent_number": result.get("parent_number"),
+        "position": result.get("position", position),
+        "outcome": result.get("outcome", "fail"),
+        "stderr": result.get("error") or "",
+    }
+
+
+# =============================================================================
+# Sprint tools (v1.6.0)
+#
+# Sprint functionality inspired by the design proposed in PR #2 by
+# @jeremiahrose; ported here against the new direct-GraphQL pattern.
+# =============================================================================
+
+
+@mcp.tool()
+def sprint_list(repo_path: str = "", include_closed: bool = False) -> dict:
+    """List sprints in the workspace.
+
+    Args:
+        repo_path: Optional absolute path of a git checkout to derive
+            owner/repo from.
+        include_closed: include CLOSED sprints in the listing. Defaults
+            to OPEN-only.
+
+    Returns:
+        dict with:
+            ok: bool
+            workspace_name: str
+            active_sprint_id: str | None
+            sprints: list[dict] — each with
+                id: str
+                name: str
+                state: "OPEN" | "CLOSED"
+                start_at: ISO8601 datetime string | None
+                end_at: ISO8601 datetime string | None
+                completed_points: float
+                total_points: float
+                closed_issues_count: int
+                is_active: bool
+            stderr: str
+    """
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "workspace_name": "", "active_sprint_id": None,
+                "sprints": [], "pagination_warning": None}
+    from zh_graphql_ops import list_sprints  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = list_sprints(ctx, include_closed=include_closed)
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "workspace_name": "",
+            "active_sprint_id": None,
+            "sprints": [],
+            "pagination_warning": None,
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "workspace_name": result.get("workspace_name", ""),
+        "active_sprint_id": result.get("active_sprint_id"),
+        "sprints": result.get("sprints", []),
+        "pagination_warning": result.get("pagination_warning"),
+        "stderr": "",
+    }
+
+
+@mcp.tool()
+def sprint_show(sprint_name: str, repo_path: str = "") -> dict:
+    """Get full detail + issues for a sprint named `sprint_name`.
+
+    `sprint_name` accepts "current" or "active" as aliases for the
+    workspace's active sprint. Exact matches are case-insensitive.
+
+    Args:
+        sprint_name: Sprint name (or "current"/"active").
+        repo_path: Optional absolute path of a git checkout.
+
+    Returns:
+        dict with:
+            ok: bool
+            sprint_id: str | None
+            sprint_name: str
+            state: "OPEN" | "CLOSED" | None
+            start_at: ISO8601 string | None
+            end_at: ISO8601 string | None
+            completed_points: float
+            total_points: float
+            closed_issues_count: int
+            description: str | None
+            issue_count: int
+            issues: list[dict] — each with
+                number: int
+                title: str
+                state: "OPEN" | "CLOSED"
+                html_url: str
+                estimate: number | None
+                assignees: list[str]
+                pipeline: str | None
+                repository: {"owner": str, "name": str}
+            stderr: str
+    """
+    if not sprint_name or not str(sprint_name).strip():
+        # Full result shape with stderr — strict MCP callers shouldn't
+        # KeyError on documented keys after the guard. Review #9.
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "state": None,
+            "start_at": None,
+            "end_at": None,
+            "completed_points": 0.0,
+            "total_points": 0.0,
+            "closed_issues_count": 0,
+            "description": None,
+            "issue_count": 0,
+            "issues": [],
+            "pagination_warning": None,
+            "stderr": "sprint_name must be non-empty",
+        }
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "sprint_id": None, "sprint_name": sprint_name,
+                "state": None, "start_at": None, "end_at": None,
+                "completed_points": 0.0, "total_points": 0.0,
+                "closed_issues_count": 0, "description": None,
+                "issue_count": 0, "issues": [],
+                "pagination_warning": None}
+    from zh_graphql_ops import get_sprint_detail  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = get_sprint_detail(ctx, sprint_name)
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "state": None,
+            "start_at": None,
+            "end_at": None,
+            "completed_points": 0.0,
+            "total_points": 0.0,
+            "closed_issues_count": 0,
+            "description": None,
+            "issue_count": 0,
+            "issues": [],
+            "pagination_warning": None,
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "sprint_id": result.get("sprint_id"),
+        "sprint_name": result.get("sprint_name", sprint_name),
+        "state": result.get("state"),
+        "start_at": result.get("start_at"),
+        "end_at": result.get("end_at"),
+        "completed_points": result.get("completed_points", 0.0),
+        "total_points": result.get("total_points", 0.0),
+        "closed_issues_count": result.get("closed_issues_count", 0),
+        "description": result.get("description"),
+        "issue_count": result.get("issue_count", 0),
+        "issues": result.get("issues", []),
+        "pagination_warning": result.get("pagination_warning"),
+        "stderr": result.get("error") or "",
+    }
+
+
+@mcp.tool()
+def sprint_current(repo_path: str = "") -> dict:
+    """Get full detail + issues for the workspace's active sprint.
+
+    Convenience wrapper for `sprint_show("current")`. Returns the same
+    shape; `ok=False` with a clear `stderr` if no active sprint exists.
+    """
+    return sprint_show("current", repo_path=repo_path)
+
+
+@mcp.tool()
+def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
+                      repo_path: str = "") -> dict:
+    """Add one or more issues to a sprint.
+
+    Partial-failure handling mirrors the sub-issue family: the API's
+    `addIssuesToSprints` returns the list of SprintIssue links it
+    actually created. Issues absent from that list are inferred-failed
+    (the GraphQL surface doesn't say WHY a link didn't form — usually
+    the issue was already in the sprint, archived, or otherwise
+    ineligible). `succeeded` / `failed` are split from the response,
+    never from the raw input.
+
+    Args:
+        sprint_name: Sprint name to target. `current` / `active` are
+            aliases for the workspace's active sprint.
+        issue_numbers: List of issue numbers in the cwd's repo.
+        repo_path: Optional git checkout for repo + workspace context.
+
+    Returns:
+        dict with:
+            ok: bool — true iff outcome == "ok"
+            sprint_id: str | None
+            sprint_name: str
+            outcome: "ok" | "partial" | "fail" | "noop"
+            success_count: int
+            failed_count: int
+            succeeded: list[int] — API confirmed these were linked
+            failed: list[int] — API did not return links for these
+            unaccounted: list[int] — canonical mutation-tool key
+                (round-10 Pattern A). Empty on the trusted path
+                (succeeded + failed exhaustively partition the input
+                set). Populated on pre-flight bails (sprint-not-found,
+                issue-not-found) with the un-attempted inputs so the
+                conservation invariant holds:
+                    len(succeeded) + len(failed) + len(unaccounted)
+                        == len(deduped input issue_numbers).
+            partial_success_warning: str | None — canonical
+                mutation-tool key. Currently always None for
+                add_issues_to_sprint (no divergence-detection
+                surface here); reserved for future use.
+            stderr: str
+    """
+    # Full result shape on the empty-input guards so strict MCP callers
+    # don't KeyError on documented keys after a guard rejection.
+    # Review #9.
+    if not issue_numbers:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "partial_success_warning": None,
+            "stderr": "issue_numbers must be non-empty",
+        }
+    if not sprint_name or not str(sprint_name).strip():
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "partial_success_warning": None,
+            "stderr": "sprint_name must be non-empty",
+        }
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "sprint_id": None, "sprint_name": sprint_name,
+                "outcome": "fail", "success_count": 0, "failed_count": 0,
+                "succeeded": [], "failed": [],
+                "unaccounted": [], "partial_success_warning": None}
+    from zh_graphql_ops import add_issues_to_sprint  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = add_issues_to_sprint(ctx, sprint_name, list(issue_numbers))
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "partial_success_warning": None,
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "sprint_id": result.get("sprint_id"),
+        "sprint_name": result.get("sprint_name", sprint_name),
+        "outcome": result.get("outcome", "fail"),
+        "success_count": result.get("success_count", 0),
+        "failed_count": result.get("failed_count", 0),
+        "succeeded": result.get("succeeded", []),
+        "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
+        "partial_success_warning": result.get("partial_success_warning"),
+        "stderr": result.get("error") or "",
+    }
+
+
+@mcp.tool()
+def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
+                         repo_path: str = "") -> dict:
+    """Remove one or more issues from a sprint.
+
+    Partial-failure handling: the API returns the sprint's post-
+    mutation state. We compare the input numbers against the sprint's
+    post-state `sprintIssues`; anything STILL attached after the
+    mutation is inferred-failed. For sprints with >100 issues, OR
+    when the mutation response omits the target sprint entirely, we
+    walk the sprint directly to determine the authoritative post-
+    state. Each post-state issue is filtered by repository so a
+    sibling repo's same-numbered issue can't mis-classify our
+    removal.
+
+    Returns the same shape as `sprint_add_issues`, plus:
+      - `inspected_full`: bool — True when we walked every page (or
+        the response was complete on its own).
+      - `pagination_warning`: str | None — surfaced when the follow-
+        up walk bailed defensively (stuck cursor / iteration cap).
+      - `response_anomaly`: str | None — surfaced when the mutation
+        response omitted or returned an empty `sprints` array, OR
+        when the post-state walk only covered part of the sprint
+        (in which case `response_anomaly` is extended with a
+        coverage note pointing at a re-verification command).
+
+    Coverage semantics: when `inspected_full=False` the outcome is
+    DOWNGRADED to `partial` (or `fail` when zero positives
+    confirmed). `succeeded` lists ONLY inputs the partial walk
+    actually observed AND observed as absent from the post-state
+    (round-5 #1: previously inputs the walker never reached were
+    incorrectly counted as succeeded). `failed` lists inputs the
+    walker observed still-attached. Inputs the walker never
+    reached are NEITHER succeeded NOR failed — they're un-verified,
+    surfaced in BOTH the `unaccounted` structured field (round-10
+    Pattern A / round-9 #6) AND `response_anomaly` text, with the
+    text's count derived from the field (no arithmetic drift).
+    Re-verify with `zh sprint show '<name>'`.
+
+    The conservation invariant holds across every return path:
+        len(succeeded) + len(failed) + len(unaccounted)
+            == len(deduped input issue_numbers)
+    """
+    if not issue_numbers:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
+            "partial_success_warning": None,
+            "stderr": "issue_numbers must be non-empty",
+        }
+    if not sprint_name or not str(sprint_name).strip():
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
+            "partial_success_warning": None,
+            "stderr": "sprint_name must be non-empty",
+        }
+    ctx, err = _resolve_ctx(repo_path)
+    if err is not None:
+        return {**err, "sprint_id": None, "sprint_name": sprint_name,
+                "outcome": "fail", "success_count": 0, "failed_count": 0,
+                "succeeded": [], "failed": [],
+                "unaccounted": [],
+                "inspected_full": False,
+                "pagination_warning": None,
+                "response_anomaly": None,
+                "partial_success_warning": None}
+    from zh_graphql_ops import remove_issues_from_sprint  # noqa: PLC0415
+    from zh_api import ZhApiError  # noqa: PLC0415
+    try:
+        result = remove_issues_from_sprint(
+            ctx, sprint_name, list(issue_numbers)
+        )
+    except ZhApiError as e:
+        return {
+            "ok": False,
+            "sprint_id": None,
+            "sprint_name": sprint_name,
+            "outcome": "fail",
+            "success_count": 0,
+            "failed_count": 0,
+            "succeeded": [],
+            "failed": [],
+            "unaccounted": [],
+            "inspected_full": False,
+            "pagination_warning": None,
+            "response_anomaly": None,
+            "partial_success_warning": None,
+            "stderr": str(e),
+        }
+    return {
+        "ok": result.get("ok", False),
+        "sprint_id": result.get("sprint_id"),
+        "sprint_name": result.get("sprint_name", sprint_name),
+        "outcome": result.get("outcome", "fail"),
+        "success_count": result.get("success_count", 0),
+        "failed_count": result.get("failed_count", 0),
+        "succeeded": result.get("succeeded", []),
+        "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
+        "inspected_full": result.get("inspected_full", False),
+        "pagination_warning": result.get("pagination_warning"),
+        "response_anomaly": result.get("response_anomaly"),
+        "partial_success_warning": result.get("partial_success_warning"),
+        "stderr": result.get("error") or "",
     }
 
 

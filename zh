@@ -61,17 +61,78 @@ success() {
 
 # Load configuration
 load_config() {
-    # Check for config file
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck source=/dev/null
-        source "$CONFIG_FILE"
-    fi
+    # Round-6 #14: precedence must be env > config (to match Python
+    # `resolve_context` round-3 #11 SPEC).
+    #
+    # The pre-fix idiom `source $CONFIG_FILE` overwrote any
+    # environment-set values with config-file values — config-wins.
+    # That was inverted vs the Python side, which read env first
+    # and only fell back to config. A user with `export ZH_REPO=
+    # acme/widgets` and a stale config file would see Python pick
+    # `acme/widgets` while bash silently used the config value.
+    #
+    # Fix: source each config file in a SUBSHELL, capture the
+    # variables we care about, then apply them only when the
+    # caller's env is unset. The subshell isolates the source so
+    # the file's full set of side effects doesn't leak into our
+    # process. Quoted-value handling stays correct because bash
+    # parses the file with its own rules in the subshell.
+    local config_zh_token=""
+    local config_zh_rest_token=""
+    local config_zh_repo=""
+    local config_zh_workspace=""
 
-    # Check for local .env file
-    if [[ -f ".env" ]]; then
-        # shellcheck source=/dev/null
-        source ".env"
-    fi
+    _load_config_from() {
+        local src="$1"
+        [[ -f "$src" ]] || return 0
+        # Subshell isolates the source: unset our target vars first
+        # so the subshell starts with them empty, then source the
+        # file and emit each captured value on its OWN line so the
+        # outer reader can pick them by line position. `read -r` with
+        # tab-delimited values collapses consecutive tabs (empty
+        # fields disappear), so line-per-value is the robust shape.
+        local sourced
+        sourced=$(
+            unset ZH_TOKEN ZH_REST_TOKEN ZH_REPO ZH_WORKSPACE
+            # shellcheck disable=SC1090
+            source "$src" 2>/dev/null
+            printf '%s\n' \
+                "${ZH_TOKEN:-}" \
+                "${ZH_REST_TOKEN:-}" \
+                "${ZH_REPO:-}" \
+                "${ZH_WORKSPACE:-}"
+        )
+        # Parse line-by-line; empty lines stay as empty values.
+        local line idx=0
+        local t="" r="" p="" w=""
+        while IFS= read -r line; do
+            case "$idx" in
+                0) t="$line" ;;
+                1) r="$line" ;;
+                2) p="$line" ;;
+                3) w="$line" ;;
+            esac
+            idx=$((idx + 1))
+        done <<< "$sourced"
+        # First-wins across the two config sources: only set if not
+        # already set by an earlier source (or env, see apply step).
+        [[ -z "$config_zh_token" ]] && config_zh_token="$t"
+        [[ -z "$config_zh_rest_token" ]] && config_zh_rest_token="$r"
+        [[ -z "$config_zh_repo" ]] && config_zh_repo="$p"
+        [[ -z "$config_zh_workspace" ]] && config_zh_workspace="$w"
+    }
+
+    _load_config_from "$CONFIG_FILE"
+    _load_config_from ".env"
+    unset -f _load_config_from
+
+    # Apply config values ONLY where the corresponding env var is
+    # unset/empty. Env wins; config is fallback. Matches Python's
+    # resolve_context precedence.
+    ZH_TOKEN="${ZH_TOKEN:-$config_zh_token}"
+    ZH_REST_TOKEN="${ZH_REST_TOKEN:-$config_zh_rest_token}"
+    ZH_REPO="${ZH_REPO:-$config_zh_repo}"
+    ZH_WORKSPACE="${ZH_WORKSPACE:-$config_zh_workspace}"
 
     # Validate required config
     if [[ -z "${ZH_TOKEN:-}" ]]; then
@@ -107,27 +168,62 @@ zh_graphql() {
     echo "$response"
 }
 
-# Get GitHub repo info from current directory
+# Get GitHub owner/repo. Resolution order:
+#   1. ZH_REPO_OVERRIDE — set by the `-r` / `--repo` global flag
+#   2. ZH_REPO — config-file value (read by load_config)
+#   3. git remote get-url origin in the current directory
+#
+# The first two paths are explicit; the third is the historical default
+# and is what every command does when nothing's overridden.
 get_repo_info() {
+    if [[ -n "${ZH_REPO_OVERRIDE:-}" ]]; then
+        echo "$ZH_REPO_OVERRIDE"
+        return
+    fi
+    if [[ -n "${ZH_REPO:-}" ]]; then
+        echo "$ZH_REPO"
+        return
+    fi
+
     local remote_url
     remote_url=$(git remote get-url origin 2>/dev/null || echo "")
 
     if [[ -z "$remote_url" ]]; then
-        error "Not in a git repository with a GitHub remote.
+        error "No repository specified.
 
-This command must be run from within a git repository that:
-  1. Has a GitHub remote configured (origin)
-  2. Is connected to a ZenHub workspace
+Either:
+  - Use -r owner/repo (or --repo) to target a specific repository
+  - Set ZH_REPO=owner/repo in ${CONFIG_FILE}
+  - Run from within a git repository with a GitHub remote (origin)
 
-To fix:
-  - cd into your project directory
-  - Ensure 'git remote -v' shows a GitHub URL"
+For multi-workspace repos, also see -w / --workspace and ZH_WORKSPACE."
     fi
 
-    # Parse owner/repo from various URL formats
-    local repo_path
-    if [[ "$remote_url" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
-        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    # Parse owner/repo from various URL formats.
+    #
+    # Repo names on GitHub can contain dots (e.g. "docs.github.io",
+    # "my.tool", "internal.docs"). The repo group used to be `[^/.]+`
+    # which silently failed to match those.
+    #
+    # The prefix anchors strictly on either `git@github.com:` (ssh)
+    # or `https?://github.com/` (https) — the two forms `git remote
+    # get-url origin` emits in practice. Schemes like `ssh://`,
+    # `git://`, and `git+ssh://` are accepted by some git clients
+    # but not produced by `git remote get-url`, so we reject them to
+    # keep this regex in lockstep with the Python parsers in
+    # `zh_api._GH_URL_RE` and `similarity._GITHUB_URL_RE`.
+    # Round-4 finding #5.
+    #
+    # Bash extended regex doesn't support non-greedy quantifiers, so
+    # we trim any trailing `/` from the URL up-front and match
+    # greedily on `[^/]+`, then strip the optional `.git` suffix
+    # from the captured repo name.
+    local trimmed_url="${remote_url%/}"
+    if [[ "$trimmed_url" =~ ^(git@github\.com:|https?://github\.com/)([^/]+)/([^/]+)$ ]]; then
+        local owner="${BASH_REMATCH[2]}"
+        local repo="${BASH_REMATCH[3]}"
+        repo="${repo%.git}"
+        echo "${owner}/${repo}"
     else
         error "Could not parse GitHub repository from remote URL: $remote_url"
     fi
@@ -171,7 +267,87 @@ get_repo_id() {
     echo "$repo_id"
 }
 
-# Get workspace ID for a repository (using GitHub ID)
+# Hard cap on workspace-list pagination iterations. 50 pages × 50 nodes
+# = 2,500 workspaces, vastly more than any plausible per-repo count, so
+# the cap only ever fires on a server-side stuck-cursor bug.
+ZH_WORKSPACE_PAGINATION_CAP=50
+
+# Walk every page of `workspacesConnection` for a repo and emit a single
+# JSON array of `{id, name}` nodes on stdout. Same stuck-cursor +
+# iteration-cap defenses as the sub-issue and sprint walkers.
+#
+# Argument: gh_id (GitHub numeric repo id).
+zh_workspaces_fetch_all() {
+    local gh_id="$1"
+
+    local query='
+    query($ghIds: [Int!]!, $after: String) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            id
+            workspacesConnection(first: 50, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes { id name }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt "$ZH_WORKSPACE_PAGINATION_CAP" ]]; then
+            warn "Workspace pagination iteration cap (${ZH_WORKSPACE_PAGINATION_CAP}) reached"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --argjson gh_id "$gh_id" --argjson after "$cursor" \
+            '{ghIds: [$gh_id], after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        # Round-6 #8: `select(. != null)` strips null page entries
+        # at aggregation, matching the other three walkers.
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '[(.data.repositoriesByGhId[0].workspacesConnection.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Workspace pagination cursor not advancing — bailing"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    echo "$all_nodes"
+}
+
+# Get workspace ID for a repository (using GitHub ID).
+#
+# Workspace selection precedence:
+#   1. ZH_WORKSPACE_NAME (set by `-w` / `--workspace` global flag) — exact
+#      case-insensitive match against the workspace name. Errors with the
+#      list of available workspaces if there's no match.
+#   2. ZH_WORKSPACE (config-file value) — same resolution as above.
+#   3. First workspace returned by the API (historical default).
+#
+# (1) and (2) are merged via ZH_WORKSPACE_NAME -> ZH_WORKSPACE precedence
+# below. The Python `resolve_context` follows the same chain.
+#
+# Walks every page of `workspacesConnection` via zh_workspaces_fetch_all
+# so name resolution finds workspaces beyond position 50.
 get_workspace_id() {
     local owner_repo="$1"
 
@@ -183,32 +359,39 @@ get_workspace_id() {
         error "Could not get GitHub repo ID for: $owner_repo"
     fi
 
-    local query='
-    query($ghIds: [Int!]!) {
-        repositoriesByGhId(ghIds: $ghIds) {
-            id
-            name
-            workspacesConnection {
-                nodes {
-                    id
-                    name
-                }
-            }
-        }
-    }'
+    local workspace_nodes
+    workspace_nodes=$(zh_workspaces_fetch_all "$gh_id")
 
-    local variables
-    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
+    local node_count
+    node_count=$(echo "$workspace_nodes" | jq 'length')
 
-    local response
-    response=$(zh_graphql "$query" "$variables")
-
-    # Get first workspace
-    local workspace_id
-    workspace_id=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[0].id // empty')
-
-    if [[ -z "$workspace_id" ]]; then
+    if [[ "$node_count" -eq 0 ]]; then
         error "No workspace found for this repository"
+    fi
+
+    # Resolve effective name: flag-set override beats env/config value
+    local effective_name="${ZH_WORKSPACE_NAME:-${ZH_WORKSPACE:-}}"
+
+    local workspace_id
+    if [[ -n "$effective_name" ]]; then
+        # Exact match on the workspace name (case-insensitive).
+        workspace_id=$(echo "$workspace_nodes" | jq -r --arg name "$effective_name" \
+            '[.[] | select((.name | ascii_downcase) == ($name | ascii_downcase))] | .[0].id // empty')
+
+        if [[ -z "$workspace_id" ]]; then
+            echo -e "${RED}Error:${NC} Workspace '${effective_name}' not found for ${owner_repo}." >&2
+            echo "" >&2
+            echo "Available workspaces:" >&2
+            echo "$workspace_nodes" | jq -r '.[] | "  - \(.name)"' >&2
+            exit 1
+        fi
+    else
+        # Default: first workspace. Historical behaviour, preserved when
+        # neither -w nor ZH_WORKSPACE is set.
+        workspace_id=$(echo "$workspace_nodes" | jq -r '.[0].id // empty')
+        if [[ -z "$workspace_id" ]]; then
+            error "No workspace found for this repository"
+        fi
     fi
 
     echo "$workspace_id"
@@ -233,7 +416,17 @@ cmd_help() {
 zh - ZenHub CLI Tool
 
 USAGE:
-    zh <command> [options]
+    zh [-r owner/repo] [-w workspace] <command> [options]
+
+GLOBAL OPTIONS (peeled off before the subcommand):
+    -r, --repo <owner/repo>   Target a specific GitHub repository instead
+                              of the one inferred from `git remote get-url
+                              origin`. Can also be set via ZH_REPO in the
+                              config file.
+    -w, --workspace <name>    Target a specific workspace by name
+                              (case-insensitive). If unset, the first
+                              workspace returned by the API wins.
+                              Can also be set via ZH_WORKSPACE.
 
 COMMANDS:
     issue <number>          View issue details
@@ -350,16 +543,47 @@ COMMANDS:
                            Example: zh subissue reorder 100 after 101
                            (aliases: sub, child, children)
 
+    sprints [--all]        List sprints in workspace
+                           Shows open sprints by default; ● marks the active sprint
+                           Example: zh sprints
+                           Example: zh sprints --all
+                           (alias: sp)
+
+    sprint <name> [opts]   View sprint details and issues
+                           Special names: 'current' or 'active' for the active sprint
+                           Options:
+                             --no-urls    Compact output (no per-issue URLs)
+                           Example: zh sprint "Sprint 5"
+                           Example: zh sprint current
+                           Example: zh sprint              # (defaults to current)
+
+    sprint add <name> <issue#> [<issue#> ...]
+                           Add one or more issues to a sprint
+                           Example: zh sprint add "Sprint 5" 42 43
+                           Example: zh sprint add current 42
+                           (top-level alias: sa)
+
+    sprint remove <name> <issue#> [<issue#> ...]
+                           Remove one or more issues from a sprint
+                           Example: zh sprint remove "Sprint 5" 42
+                           Example: zh sprint rm current 42 43
+                           (top-level alias: sr)
+
     help                    Show this help message
 
 CONFIGURATION:
     Create ~/.config/zh/config with:
         ZH_TOKEN=your_graphql_token
         ZH_REST_TOKEN=your_rest_token
+        ZH_REPO=owner/repo              (optional — default repository)
+        ZH_WORKSPACE="My Workspace"     (optional — default workspace name)
 
     Generate tokens at:
         GraphQL: https://app.zenhub.com/settings/tokens
         REST:    https://app.zenhub.com/dashboard/tokens
+
+    -r / --repo and -w / --workspace global flags override the config
+    values for a single invocation.
 
 ALIASES:
     issue: i, show
@@ -393,6 +617,12 @@ EXAMPLES:
     zh epic list                    # List all epics
     zh epic show 12345              # Show epic + child issues
     zh epic add 12345 369 370       # Add issues to epic
+    zh sprints                      # List open sprints
+    zh sprint current               # View active sprint + issues
+    zh sprint "Sprint 5"            # View specific sprint
+    zh sprint add current 42 43    # Add issues to active sprint
+    zh sprint remove "Sprint 5" 42 # Remove issue from sprint
+    zh sa current 42                # Top-level alias for sprint add
 EOF
 }
 
@@ -411,32 +641,28 @@ cmd_workspaces() {
         error "Could not get GitHub repo ID for: $owner_repo"
     fi
 
-    local query='
-    query($ghIds: [Int!]!) {
-        repositoriesByGhId(ghIds: $ghIds) {
-            id
-            name
-            workspacesConnection {
-                nodes {
-                    id
-                    name
-                }
-            }
-        }
-    }'
+    # Walk every page of workspacesConnection so the listing is complete
+    # for repos connected to >50 workspaces. Same walker the resolver
+    # uses, so what you see here is what the rest of the CLI sees.
+    local workspace_nodes
+    workspace_nodes=$(zh_workspaces_fetch_all "$gh_id")
 
-    local variables
-    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    # Resolve the active workspace per the same precedence get_workspace_id
+    # uses, so the listing marks the one the rest of the CLI would target.
+    local active_name="${ZH_WORKSPACE_NAME:-${ZH_WORKSPACE:-}}"
 
     echo ""
     echo -e "${BOLD}Workspaces:${NC}"
+    if [[ -n "$active_name" ]]; then
+        echo -e "  ${CYAN}(targeting:${NC} ${active_name}${CYAN})${NC}"
+    else
+        echo -e "  ${CYAN}(targeting: first returned by API)${NC}"
+    fi
     echo ""
 
-    echo "$response" | jq -r '.data.repositoriesByGhId[0].workspacesConnection.nodes[] |
-        "  \(.name)\n    ID: \(.id)\n"'
+    echo "$workspace_nodes" | jq -r --arg active "$active_name" '.[] |
+        (if ($active != "" and (.name | ascii_downcase) == ($active | ascii_downcase)) then "● " else "  " end) +
+        "\(.name)\n    ID: \(.id)\n"'
 }
 
 cmd_pipelines() {
@@ -2524,6 +2750,1117 @@ Examples:
 # as the "epic#" the user types — it is stable and ZenHub-assigned. We re-encode
 # it into the full GID before sending API requests.
 
+# =============================================================================
+# Sprint commands (v1.6.0)
+#
+# Inspired by the design proposed in PR #2 by @jeremiahrose. v1.6.0 ships
+# read-only sprint visibility (list / show / current); sprint membership
+# mutations (sprint-add / sprint-remove) are deferred to a follow-up.
+# =============================================================================
+
+# Pagination cap for sprint walks (50 pages × 50 nodes = 2500 sprints,
+# vastly more than any realistic workspace). Belt-and-suspenders against
+# a server-side cursor bug.
+ZH_SPRINT_PAGINATION_CAP=50
+
+# Walk every page of `workspace.sprints` and emit one combined JSON
+# document on stdout. Output shape matches a single-page response so
+# downstream jq filters don't need to know the listing was paginated.
+#
+#   { workspace_name, active_sprint_id, nodes: [...] }
+#
+# `state_filter` is optional; pass "OPEN" to filter to open sprints,
+# anything else to fetch all.
+zh_sprints_fetch_all() {
+    local workspace_id="$1"
+    local state_filter="${2:-}"
+
+    local query
+    if [[ "$state_filter" == "OPEN" ]]; then
+        query='
+        query($workspaceId: ID!, $after: String) {
+            workspace(id: $workspaceId) {
+                name
+                activeSprint { id }
+                sprints(first: 50, after: $after, filters: { state: { eq: OPEN } }) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        id
+                        name
+                        state
+                        startAt
+                        endAt
+                        completedPoints
+                        totalPoints
+                        closedIssuesCount
+                    }
+                }
+            }
+        }'
+    else
+        query='
+        query($workspaceId: ID!, $after: String) {
+            workspace(id: $workspaceId) {
+                name
+                activeSprint { id }
+                sprints(first: 50, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        id
+                        name
+                        state
+                        startAt
+                        endAt
+                        completedPoints
+                        totalPoints
+                        closedIssuesCount
+                    }
+                }
+            }
+        }'
+    fi
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+    local workspace_name=""
+    local active_sprint_id=""
+    local first_page=true
+    # Round-6 #11: emit a `pagination_bailed` sentinel so callers
+    # like zh_resolve_sprint_id can downgrade their "not found"
+    # messaging when the walk was incomplete.
+    local pagination_bailed=""
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt "$ZH_SPRINT_PAGINATION_CAP" ]]; then
+            warn "Sprint pagination iteration cap (${ZH_SPRINT_PAGINATION_CAP}) reached"
+            pagination_bailed="iteration_cap"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --arg workspace_id "$workspace_id" --argjson after "$cursor" \
+            '{workspaceId: $workspace_id, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        # Defensive null-workspace detection. `data.workspace = null`
+        # signals a deleted / ACL-revoked workspace, distinct from an
+        # empty-but-real workspace (which returns a non-null Workspace
+        # with `sprints.nodes = []`). Pre-fix the jq `// fallback`
+        # forms below silently collapsed null → empty, indistinguishable
+        # from real empty. Matches the SPEC of the Python `list_sprints`
+        # walker.
+        local workspace_kind
+        workspace_kind=$(echo "$response" | jq -r '.data.workspace | type')
+        if [[ "$workspace_kind" == "null" ]]; then
+            error "Workspace '${workspace_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
+        if [[ "$first_page" == "true" ]]; then
+            workspace_name=$(echo "$response" | jq -r '.data.workspace.name // ""')
+            active_sprint_id=$(echo "$response" | jq -r '.data.workspace.activeSprint.id // empty')
+            first_page=false
+        fi
+
+        # `select(. != null)` skips null page entries (same SPEC the
+        # Python walker enforces); the `// []` keeps the whole array
+        # access null-safe.
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '[(.data.workspace.sprints.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.workspace.sprints.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.workspace.sprints.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Sprint pagination cursor not advancing — bailing"
+            pagination_bailed="stuck_cursor"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n \
+        --arg workspace_name "$workspace_name" \
+        --arg active_sprint_id "$active_sprint_id" \
+        --argjson nodes "$all_nodes" \
+        --arg pagination_bailed "$pagination_bailed" \
+        '{workspace_name: $workspace_name, active_sprint_id: $active_sprint_id, nodes: $nodes, pagination_bailed: $pagination_bailed}'
+}
+
+cmd_sprints() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local show_all=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a)
+                show_all=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    info "Getting sprints..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local sprints_json
+    if [[ "$show_all" == "true" ]]; then
+        sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
+    else
+        sprints_json=$(zh_sprints_fetch_all "$workspace_id" "OPEN")
+    fi
+
+    local workspace_name active_sprint_id count
+    workspace_name=$(echo "$sprints_json" | jq -r '.workspace_name')
+    active_sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
+    count=$(echo "$sprints_json" | jq '.nodes | length')
+
+    echo ""
+    if [[ "$show_all" == "true" ]]; then
+        echo -e "${BOLD}Sprints in ${workspace_name}${NC} (${count} total)"
+    else
+        echo -e "${BOLD}Sprints in ${workspace_name}${NC} (${count} open)"
+    fi
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  No sprints found"
+    else
+        echo "$sprints_json" | jq -r --arg active_id "$active_sprint_id" '.nodes[] |
+            "\(.id)" as $id |
+            "\(.startAt[:10] // "?")" as $start |
+            "\(.endAt[:10] // "?")" as $end |
+            "  \(if $id == $active_id then "● " else "  " end)\(.name)\n    \(.state) │ \($start) → \($end) │ \(.completedPoints // 0)/\(.totalPoints // 0) pts │ \(.closedIssuesCount) closed\n"'
+    fi
+
+    echo -e "${CYAN}Tip:${NC} Use 'zh sprint <name>' to view issues in a sprint"
+    if [[ "$show_all" != "true" ]]; then
+        echo -e "${CYAN}Tip:${NC} Use --all to include closed sprints"
+    fi
+    echo ""
+}
+
+# Walk every page of a sprint's `sprintIssues` connection and emit a
+# combined JSON document. Shape matches a single-page response so
+# downstream jq filters don't need to know it was paginated.
+#
+#   { nodes: [ { issue: {...} }, ... ] }
+zh_sprint_issues_fetch_all() {
+    # Arguments:
+    #   $1 — sprint_id
+    #   $2 — soft_null flag (optional). Default "" calls `error` on a
+    #        null-node response, which exits the process with a clear
+    #        message. Passing "1" makes the walker SOFT-FAIL on null
+    #        node: it stops walking and returns an empty-nodes JSON
+    #        document with `null_node: true` so callers downstream of
+    #        a mutation can present a "mutation may have landed; post-
+    #        state could not be confirmed" message instead of
+    #        crashing mid-recovery. (Round-4 finding #1.)
+    #   $3 — owner_repo (optional). When supplied, `walked_nums` is
+    #        repo-filtered: only issue numbers belonging to this
+    #        owner/repo land in the emitted walked_nums array.
+    #        Mirrors the Python round-6 #1 fix — without this filter,
+    #        cross-repo same-number issues in a multi-repo sprint
+    #        trivially satisfied "walked AND not still-attached" and
+    #        inflated cmd_sprint_remove's confirmed-removal set.
+    #        Default unset = no repo filtering (back-compat for
+    #        cmd_sprint which doesn't need it). Round-6 #2.
+    local sprint_id="$1"
+    local soft_null="${2:-}"
+    local owner_repo_filter="${3:-}"
+
+    # Pagination-warning sentinel, similar to soft-null. Empty by
+    # default; set when the walk bails on stuck cursor / iteration
+    # cap so callers can downgrade their success messaging the same
+    # way the Python `inspected_full=False` branch does.
+    # (Round-4 finding #3.)
+    local pagination_bailed=""
+
+    local query='
+    query($sprintId: ID!, $after: String) {
+        node(id: $sprintId) {
+            ... on Sprint {
+                sprintIssues(first: 100, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        issue {
+                            number
+                            title
+                            state
+                            htmlUrl
+                            estimate { value }
+                            assignees { nodes { login } }
+                            repository { ownerName name }
+                            pipelineIssues { nodes { pipeline { name } } }
+                        }
+                    }
+                }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+    local null_node="false"
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Sprint-issues pagination iteration cap (200) reached"
+            pagination_bailed="iteration_cap"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --arg sprint_id "$sprint_id" --argjson after "$cursor" \
+            '{sprintId: $sprint_id, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        # Detect null node before treating empty `nodes` as authoritative.
+        # GraphQL returns `data.node = null` when the sprint is deleted,
+        # ACL-revoked, or otherwise inaccessible. Pre-fix the walker
+        # silently emitted an empty result, which downstream callers
+        # treated as "real empty sprint" — masking the failure.
+        #
+        # When called from cmd_sprint_remove (mutation has already
+        # fired), we soft-fail: emit a sentinel JSON the caller uses
+        # to print a "post-state could not be confirmed" message
+        # rather than crashing the whole process. (Round-4 #1.)
+        local node_kind
+        node_kind=$(echo "$response" | jq -r '.data.node | type')
+        if [[ "$node_kind" == "null" ]]; then
+            if [[ "$soft_null" == "1" ]]; then
+                null_node="true"
+                break
+            fi
+            error "Sprint '${sprint_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
+        # `select(. != null)` strips null page entries before
+        # aggregating. The Python walker now skips null wrappers
+        # (round-4 #4); this is the bash mirror. Without it,
+        # downstream `.nodes[].issue` would emit phantom `null`
+        # lines for each null wrapper.
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '[(.data.node.sprintIssues.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.node.sprintIssues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.node.sprintIssues.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Sprint-issues pagination cursor not advancing — bailing"
+            pagination_bailed="stuck_cursor"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    # Output: a JSON object the caller can downcast into nodes +
+    # `pagination_bailed` reason + `null_node` flag + `walked_nums`.
+    # The default caller (`cmd_sprint`, read-only) uses just nodes.
+    # The mutation caller (`cmd_sprint_remove`) inspects the others
+    # to decide whether to claim a confirmed success.
+    #
+    # `walked_nums` is the list of issue numbers the walker iterated.
+    # Load-bearing for the round-5 #1/#2 succeeded-inflation fix:
+    # cmd_sprint_remove uses `inputs ∩ walked_nums - still_attached`
+    # for `succeeded` instead of `inputs - still_attached`, so an
+    # input the walker never reached can't be falsely classified as
+    # removed.
+    #
+    # Round-6 #2: when an owner_repo filter is supplied, restrict
+    # walked_nums to issues in that repo. A cross-repo same-number
+    # issue is "walked" but its absence from still_attached (which
+    # IS repo-filtered) doesn't mean OUR same-numbered issue was
+    # removed — they're different issues. Restricting walked_nums
+    # to our repo keeps the set comparable to still_attached.
+    local walked_nums
+    if [[ -n "$owner_repo_filter" ]]; then
+        local owner_lc="${owner_repo_filter%%/*}"
+        local repo_lc="${owner_repo_filter##*/}"
+        walked_nums=$(echo "$all_nodes" | jq -c \
+            --arg owner "$owner_lc" \
+            --arg repo "$repo_lc" \
+            '[.[]
+              | select(
+                  ((.issue.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+                  and ((.issue.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
+                )
+              | .issue.number
+              | select(. != null)]')
+    else
+        walked_nums=$(echo "$all_nodes" | jq -c '[.[] | .issue.number | select(. != null)]')
+    fi
+
+    jq -n \
+        --argjson nodes "$all_nodes" \
+        --arg pagination_bailed "$pagination_bailed" \
+        --argjson null_node "$null_node" \
+        --argjson walked_nums "$walked_nums" \
+        '{
+           nodes: $nodes,
+           pagination_bailed: $pagination_bailed,
+           null_node: $null_node,
+           walked_nums: $walked_nums
+         }'
+}
+
+cmd_sprint() {
+    load_config
+
+    local sprint_name=""
+    local show_urls=true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-urls)
+                show_urls=false
+                shift
+                ;;
+            *)
+                if [[ -z "$sprint_name" ]]; then
+                    sprint_name="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$sprint_name" ]]; then
+        error "Usage: zh sprint <name> [--no-urls]
+
+View issues in a sprint.
+
+Examples:
+  zh sprint \"Sprint 5\"
+  zh sprint current          # View active sprint
+  zh sprint current --no-urls"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    info "Getting sprint details..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # Resolve sprint id by name (case-insensitive) or current/active.
+    # Walk every page of sprints so a workspace with >50 sprints can
+    # still resolve older names (review finding #5).
+    local sprints_json
+    sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
+
+    local sprint_id
+    if [[ "$sprint_name" == "current" ]] || [[ "$sprint_name" == "active" ]]; then
+        sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
+        if [[ -z "$sprint_id" ]]; then
+            error "No active sprint found"
+        fi
+        sprint_name=$(echo "$sprints_json" | jq -r --arg id "$sprint_id" '.nodes[] | select(.id == $id) | .name' | head -1)
+    else
+        sprint_id=$(echo "$sprints_json" | jq -r --arg name "$sprint_name" \
+            '.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+
+        if [[ -z "$sprint_id" ]]; then
+            echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            echo "" >&2
+            echo "Available sprints:" >&2
+            echo "$sprints_json" | jq -r '.nodes[] | "  - \(.name) (\(.state))"' >&2
+            exit 1
+        fi
+    fi
+
+    # Fetch sprint header (single page) + paginated sprintIssues.
+    local detail_query='
+    query($sprintId: ID!) {
+        node(id: $sprintId) {
+            ... on Sprint {
+                id
+                name
+                description
+                state
+                startAt
+                endAt
+                completedPoints
+                totalPoints
+                closedIssuesCount
+            }
+        }
+    }'
+
+    local detail_vars
+    detail_vars=$(jq -n --arg sprint_id "$sprint_id" '{sprintId: $sprint_id}')
+
+    local detail_response
+    detail_response=$(zh_graphql "$detail_query" "$detail_vars")
+
+    local issues_json
+    issues_json=$(zh_sprint_issues_fetch_all "$sprint_id")
+
+    # Round-6 #13: the read-only sprint view used to silently
+    # truncate the issues list under partial coverage. Now mirror
+    # cmd_sprint_remove's footer — surface the bail reason so the
+    # user knows the listing was incomplete.
+    local sprint_pagination_bailed
+    sprint_pagination_bailed=$(echo "$issues_json" | jq -r '.pagination_bailed // ""')
+
+    local sprint_state start_at end_at completed_pts total_pts closed_count description
+    sprint_state=$(echo "$detail_response" | jq -r '.data.node.state // "UNKNOWN"')
+    start_at=$(echo "$detail_response" | jq -r '.data.node.startAt[:10] // "?"')
+    end_at=$(echo "$detail_response" | jq -r '.data.node.endAt[:10] // "?"')
+    completed_pts=$(echo "$detail_response" | jq -r '.data.node.completedPoints // 0')
+    total_pts=$(echo "$detail_response" | jq -r '.data.node.totalPoints // 0')
+    closed_count=$(echo "$detail_response" | jq -r '.data.node.closedIssuesCount // 0')
+    description=$(echo "$detail_response" | jq -r '.data.node.description // empty')
+
+    local issue_count
+    issue_count=$(echo "$issues_json" | jq '.nodes | length')
+
+    echo ""
+    # `printf '%s\n'` instead of `echo -e` so backslash sequences in the
+    # sprint name (user-controlled) aren't interpreted. Review #12.
+    printf "${BOLD}Sprint: %s${NC}\n" "$sprint_name"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}     ${sprint_state}"
+    echo -e "  ${CYAN}Period:${NC}    ${start_at} → ${end_at}"
+    echo -e "  ${CYAN}Points:${NC}    ${completed_pts}/${total_pts} completed"
+    echo -e "  ${CYAN}Closed:${NC}    ${closed_count} issues"
+    if [[ -n "$description" ]]; then
+        # Same printf treatment for the description — it's user-typed
+        # in ZenHub and may contain backslash sequences (review #12).
+        printf "  ${CYAN}Description:${NC} %s\n" "$description"
+    fi
+    echo ""
+    echo -e "${BOLD}Issues (${issue_count}):${NC}"
+    echo ""
+
+    if [[ "$issue_count" -eq 0 ]]; then
+        echo "  No issues in this sprint"
+    else
+        if [[ "$show_urls" == "true" ]]; then
+            echo "$issues_json" | jq -r '.nodes[].issue |
+                "\(.state)" as $state |
+                "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(.pipelineIssues.nodes[0].pipeline.name // "—")\n    \(if $state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.htmlUrl)\n"'
+        else
+            echo "$issues_json" | jq -r '.nodes[].issue |
+                "\(.state)" as $state |
+                "  #\(.number)  \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(if $state == "CLOSED" then "✓ " else "  " end)\(.title)"'
+        fi
+    fi
+    echo ""
+
+    # Round-6 #13: footer warning when the issues walk was
+    # partial. Exit 2 so scripted callers can branch on it.
+    if [[ -n "$sprint_pagination_bailed" ]]; then
+        warn "Showing the first ${issue_count} issue(s) only — pagination incomplete: ${sprint_pagination_bailed}."
+        warn "  Re-run 'zh sprint show \"${sprint_name}\"' to retry the listing."
+        exit 2
+    fi
+}
+
+cmd_sprint_current() {
+    cmd_sprint "current" "$@"
+}
+
+# Internal: resolve a sprint name (or current/active) to its GraphQL id.
+# Emits "<id>\t<name>" on stdout on success; calls `error` on failure
+# (which exits non-zero). Walks every page of sprints so a workspace
+# with >50 sprints can still resolve older names.
+zh_resolve_sprint_id() {
+    local workspace_id="$1"
+    local sprint_name="$2"
+
+    local sprints_json
+    sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
+
+    # Round-6 #11: when the sprints listing bailed mid-walk, a
+    # "not found" message is misleading — the sprint may exist on
+    # an unreached page. Tell the user.
+    local listing_bailed
+    listing_bailed=$(echo "$sprints_json" | jq -r '.pagination_bailed // ""')
+
+    local sprint_id sprint_actual_name
+    if [[ "$sprint_name" == "current" || "$sprint_name" == "active" ]]; then
+        sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
+        if [[ -z "$sprint_id" ]]; then
+            error "No active sprint found"
+        fi
+        sprint_actual_name=$(echo "$sprints_json" | jq -r --arg id "$sprint_id" \
+            '.nodes[] | select(.id == $id) | .name' | head -1)
+    else
+        sprint_id=$(echo "$sprints_json" | jq -r --arg name "$sprint_name" \
+            '.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .id' | head -1)
+        sprint_actual_name=$(echo "$sprints_json" | jq -r --arg name "$sprint_name" \
+            '.nodes[] | select((.name | ascii_downcase) == ($name | ascii_downcase)) | .name' | head -1)
+
+        if [[ -z "$sprint_id" ]]; then
+            echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            if [[ -n "$listing_bailed" ]]; then
+                echo "" >&2
+                echo "  Listing was incomplete due to: ${listing_bailed}." >&2
+                echo "  The sprint may exist on an unreached page; try re-running." >&2
+            fi
+            echo "" >&2
+            echo "Available sprints:" >&2
+            echo "$sprints_json" | jq -r '.nodes[] | "  - \(.name) (\(.state))"' >&2
+            exit 1
+        fi
+    fi
+
+    printf '%s\t%s\n' "$sprint_id" "$sprint_actual_name"
+}
+
+# Resolve every issue number (in the cwd's repo) to its GraphQL id.
+# Emits one line per issue on stdout: "<id>\t<number>\t<title>".
+# Errors out (non-zero exit) listing every not-found number rather than
+# stopping at the first one — same accumulator pattern as
+# cmd_subissue_remove's pre-flight.
+zh_resolve_issue_ids_for_sprint() {
+    local repo_id="$1"
+    shift
+    local nums=("$@")
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            title
+        }
+    }'
+
+    local results=""
+    local missing=""
+    local num stripped issue_response issue_id issue_title
+    # Conditional expansion to keep bash 3.2 + set -u happy when nums
+    # happens to be empty (caller normally validates $# > 0 but
+    # defensive layering matches round-3 #5).
+    for num in ${nums[@]+"${nums[@]}"}; do
+        stripped="${num#\#}"
+        if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${num}"
+        fi
+
+        local variables
+        variables=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
+            '{repoId: $repo_id, issueNumber: $n}')
+
+        issue_response=$(zh_graphql "$query" "$variables")
+        issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+        issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title // ""')
+
+        if [[ -z "$issue_id" ]]; then
+            missing="${missing} #${stripped}"
+        else
+            # Tab-separated to keep the title intact even if it has
+            # spaces.
+            results+="${issue_id}	${stripped}	${issue_title}"$'\n'
+        fi
+    done
+
+    if [[ -n "$missing" ]]; then
+        error "Issue(s) not found in this repository:${missing}"
+    fi
+
+    printf '%s' "$results"
+}
+
+cmd_sprint_add() {
+    load_config
+
+    local sprint_name="${1:-}"
+    shift || true
+
+    if [[ -z "$sprint_name" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh sprint add <sprint_name> <issue#> [<issue#> ...]
+
+Add one or more issues to a sprint.
+
+Examples:
+  zh sprint add \"Sprint 5\" 42
+  zh sprint add current 42 43 44       # Add to active sprint
+  zh sprint add active 42              # 'active' is an alias for current"
+    fi
+
+    # Dedup the input numbers (preserving first-occurrence order) so a
+    # repeated arg can't inflate the success count when the API
+    # returns one link per unique issue. Mirrors the Python boundary
+    # dedup in add_issues_to_sprint. Uses a plain-array contains-check
+    # rather than an associative array so it stays portable to the
+    # bash 3.2 that ships on macOS.
+    # Bash 3.2 (stock /bin/bash on macOS) errors under `set -u` when
+    # an empty array is expanded as "${arr[@]}" — the first iteration
+    # of the for-loop below sees `inputs` empty and trips on
+    # `inputs[@]: unbound variable`. The `${arr[@]+"${arr[@]}"}` form
+    # makes the expansion conditional: it produces nothing when the
+    # array is unset/empty, so the inner loop is a no-op on the first
+    # iteration. Bash 4.4+ fixed this behaviour but the script ships
+    # to macOS too.
+    local -a inputs=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in ${inputs[@]+"${inputs[@]}"}; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            inputs+=("$stripped_arg")
+        fi
+    done
+    set -- ${inputs[@]+"${inputs[@]}"}
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Resolving sprint '${sprint_name}'..."
+    local sprint_resolved sprint_id sprint_actual_name
+    sprint_resolved=$(zh_resolve_sprint_id "$workspace_id" "$sprint_name")
+    sprint_id=$(echo "$sprint_resolved" | cut -f1)
+    sprint_actual_name=$(echo "$sprint_resolved" | cut -f2)
+
+    info "Resolving ${#} issue(s)..."
+    local issues_resolved
+    issues_resolved=$(zh_resolve_issue_ids_for_sprint "$repo_id" "$@")
+
+    # Build JSON array of issue ids from the tab-separated result.
+    local issue_ids_json
+    issue_ids_json=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 1 {print $1}' | jq -R . | jq -s .)
+
+    # Fire the mutation. Ask for sprintIssues back so we can detect
+    # partial failures (the API doesn't return failedIssues for this
+    # mutation — anything not in the response inferred-failed).
+    # Project repository on each link so we can filter by repo before
+    # crediting numbers — sibling repos can share issue numbers in a
+    # multi-repo workspace.
+    local mutation='
+    mutation($input: AddIssuesToSprintsInput!) {
+        addIssuesToSprints(input: $input) {
+            sprintIssues {
+                issue {
+                    number
+                    repository { ownerName name }
+                }
+                sprint { id }
+            }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg sprint_id "$sprint_id" --argjson issue_ids "$issue_ids_json" \
+        '{input: {sprintIds: [$sprint_id], issueIds: $issue_ids}}')
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    # Detect which input numbers came back as links. Filter by sprint id
+    # AND by repo so a sibling repo's same-numbered issue can't credit
+    # as our success in a multi-repo workspace.
+    local owner_lc repo_lc
+    owner_lc="${owner_repo%%/*}"
+    repo_lc="${owner_repo##*/}"
+
+    local returned_nums_csv
+    returned_nums_csv=$(echo "$response" | jq -r \
+        --arg sid "$sprint_id" \
+        --arg owner "$owner_lc" \
+        --arg repo "$repo_lc" \
+        '[
+           .data.addIssuesToSprints.sprintIssues[]
+           | select(.sprint.id == $sid)
+           | select(
+               ((.issue.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+               and ((.issue.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
+             )
+           | .issue.number
+         ] | map(tostring) | join(",")')
+
+    local input_nums_csv
+    input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
+
+    # Split inputs into succeeded / failed by membership.
+    local succeeded failed
+    succeeded=$(jq -nr --arg inputs "$input_nums_csv" --arg returned "$returned_nums_csv" \
+        '($inputs | split(",")) as $in | ($returned | split(",")) as $out |
+         [$in[] | select(. as $n | $out | any(. == $n))] | join(",")')
+    failed=$(jq -nr --arg inputs "$input_nums_csv" --arg returned "$returned_nums_csv" \
+        '($inputs | split(",")) as $in | ($returned | split(",")) as $out |
+         [$in[] | select(. as $n | $out | all(. != $n))] | join(",")')
+
+    local total_input
+    total_input=$(echo "$input_nums_csv" | awk -F',' '{print NF}')
+    local success_count
+    success_count=$(echo "$succeeded" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+    local failed_count
+    failed_count=$(echo "$failed" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+
+    echo ""
+    if [[ "$success_count" -gt 0 ]]; then
+        success "Added ${success_count}/${total_input} issue(s) to sprint '${sprint_actual_name}': ${succeeded//,/, }"
+    fi
+    if [[ "$failed_count" -gt 0 ]]; then
+        warn "${failed_count} not linked (already in sprint, archived, or rejected by API): ${failed//,/, }"
+    fi
+
+    # Exit non-zero on partial / fail so scripted callers notice.
+    if [[ "$failed_count" -gt 0 ]] || [[ "$success_count" -eq 0 ]]; then
+        exit 1
+    fi
+}
+
+cmd_sprint_remove() {
+    load_config
+
+    local sprint_name="${1:-}"
+    shift || true
+
+    if [[ -z "$sprint_name" ]] || [[ $# -eq 0 ]]; then
+        error "Usage: zh sprint remove <sprint_name> <issue#> [<issue#> ...]
+
+Remove one or more issues from a sprint.
+
+Examples:
+  zh sprint remove \"Sprint 5\" 42
+  zh sprint remove current 42 43       # Remove from active sprint
+  zh sprint rm active 42               # 'rm' is an alias for remove"
+    fi
+
+    # Dedup input numbers (first-occurrence order) so a repeated arg
+    # can't be over-counted. Mirrors the Python boundary dedup in
+    # remove_issues_from_sprint. Plain-array contains-check for
+    # bash 3.2 portability (no associative arrays).
+    # Bash 3.2 (stock /bin/bash on macOS) errors under `set -u` when
+    # an empty array is expanded as "${arr[@]}" — the first iteration
+    # of the for-loop below sees `inputs` empty and trips on
+    # `inputs[@]: unbound variable`. The `${arr[@]+"${arr[@]}"}` form
+    # makes the expansion conditional: it produces nothing when the
+    # array is unset/empty, so the inner loop is a no-op on the first
+    # iteration. Bash 4.4+ fixed this behaviour but the script ships
+    # to macOS too.
+    local -a inputs=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in ${inputs[@]+"${inputs[@]}"}; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            inputs+=("$stripped_arg")
+        fi
+    done
+    set -- ${inputs[@]+"${inputs[@]}"}
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Resolving sprint '${sprint_name}'..."
+    local sprint_resolved sprint_id sprint_actual_name
+    sprint_resolved=$(zh_resolve_sprint_id "$workspace_id" "$sprint_name")
+    sprint_id=$(echo "$sprint_resolved" | cut -f1)
+    sprint_actual_name=$(echo "$sprint_resolved" | cut -f2)
+
+    info "Resolving ${#} issue(s)..."
+    local issues_resolved
+    issues_resolved=$(zh_resolve_issue_ids_for_sprint "$repo_id" "$@")
+
+    local issue_ids_json
+    issue_ids_json=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 1 {print $1}' | jq -R . | jq -s .)
+
+    # The mutation returns the sprint's post-state. Anything STILL
+    # attached after the call is inferred-failed. We ask for the full
+    # post-state via a paginated walk, since the response cap of 100
+    # would otherwise mis-classify removed-but-on-page-2 issues as
+    # still-attached.
+    local mutation='
+    mutation($input: RemoveIssuesFromSprintsInput!) {
+        removeIssuesFromSprints(input: $input) {
+            sprints { id }
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg sprint_id "$sprint_id" --argjson issue_ids "$issue_ids_json" \
+        '{input: {sprintIds: [$sprint_id], issueIds: $issue_ids}}')
+
+    zh_graphql "$mutation" "$mutation_vars" > /dev/null
+
+    # Post-state walk to determine which inputs are still in the sprint.
+    # zh_sprint_issues_fetch_all already projects repository per issue,
+    # so we can filter by repo here — sibling repos can share issue
+    # numbers in a multi-repo workspace and we must not mis-classify
+    # our removal as failed because some other repo's same-numbered
+    # issue is still in the sprint.
+    #
+    # We pass soft_null=1 because the mutation has already fired by
+    # this point. If the post-state walk hits a null node (sprint
+    # deleted / ACL-revoked between mutation and walk — rare but
+    # possible), we want a structured "could not confirm" message
+    # rather than `error`-exiting and leaving the user with no
+    # indication the mutation may have already taken effect.
+    # (Round-4 #1.)
+    local post_state
+    # Pass owner_repo so the walker repo-filters `walked_nums` in
+    # the JSON output. Without this, a sibling-repo same-number
+    # issue lands in walked_nums but NOT in still_attached_nums_csv
+    # (which is already repo-filtered), so the SPEC's
+    # `succeeded = inputs ∩ walked - still_attached` would
+    # incorrectly classify the input as removed. Round-6 #2.
+    post_state=$(zh_sprint_issues_fetch_all "$sprint_id" "1" "$owner_repo")
+
+    # Pull out the soft-fail sentinels the walker may have set.
+    local null_node pagination_bailed
+    null_node=$(echo "$post_state" | jq -r '.null_node // false')
+    pagination_bailed=$(echo "$post_state" | jq -r '.pagination_bailed // ""')
+
+    if [[ "$null_node" == "true" ]]; then
+        # Mutation already fired; post-state can't be confirmed. Tell
+        # the user clearly and exit with a distinct non-zero code so
+        # scripted callers notice. Recovery: a separate
+        # `zh sprint show '<name>'` call (which will itself error on
+        # the null sprint, but at least the user knows what happened).
+        echo ""
+        warn "Mutation landed (removeIssuesFromSprints succeeded), but post-state could not be confirmed:"
+        warn "  Sprint '${sprint_actual_name}' resolved to null in the post-state walk"
+        warn "  (sprint was deleted / ACL-revoked / otherwise inaccessible between mutation and walk)"
+        warn "Re-verify with 'zh sprints --all' to see the current state."
+        exit 2
+    fi
+
+    local owner_lc repo_lc
+    owner_lc="${owner_repo%%/*}"
+    repo_lc="${owner_repo##*/}"
+
+    # `still_attached_nums_csv` — issue numbers in our repo that
+    # remain in the sprint post-mutation. Repo-filtered.
+    local still_attached_nums_csv
+    still_attached_nums_csv=$(echo "$post_state" | jq -r \
+        --arg owner "$owner_lc" \
+        --arg repo "$repo_lc" \
+        '[
+           .nodes[]
+           | select(
+               ((.issue.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+               and ((.issue.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
+             )
+           | .issue.number
+         ] | map(tostring) | join(",")')
+
+    # `walked_nums_csv` — list of issue numbers the walker iterated,
+    # already POST-REPO-FILTER because `cmd_sprint_remove` invoked
+    # `zh_sprint_issues_fetch_all "$sprint_id" "1" "$owner_repo"` —
+    # the third arg made the walker repo-filter `walked_nums` before
+    # emitting it. Load-bearing for round-5 #2 / round-6 #2: when
+    # the walker bails mid-flight, an input the walker didn't reach
+    # in OUR repo is NOT in `walked_nums`, so it can't be classified
+    # as succeeded (which would inflate the count and lie to the
+    # user). Honest SPEC mirrors the Python side (zh_graphql_ops
+    # round-6 #1: post-repo-filter walked_numbers).
+    #
+    # Round-7 #6: drop the legacy `// [.nodes[].issue.number]`
+    # fallback. That fallback was pre-repo-filter and would
+    # re-introduce round-6 #2 silently if the walker ever stopped
+    # emitting `walked_nums`. The walker always emits it; treat its
+    # absence as a structural bug rather than masking it. Read-only
+    # callers of the walker (`cmd_sprint`) don't compute
+    # `walked_nums_csv` at all, so the fallback was dead in
+    # practice.
+    #
+    # Round-8 #6: change the missing-field handler from `error`
+    # (exit 1, "re-run") to `warn` + `exit 2`. The mutation has
+    # already fired at zh:3633 — bailing with "re-run if it
+    # persists" lies to scripted callers about whether the change
+    # landed. Mirror the null-node soft-fail pattern at zh:3663-3675:
+    # tell the user the mutation succeeded but post-state can't be
+    # confirmed, and exit with the same distinct non-zero code
+    # (2) so callers can disambiguate "real failure" from
+    # "coverage incomplete, re-verify."
+    #
+    # Round-8 #13 folded in: tighten the jq emit to distinguish
+    # "missing/non-array" (structural bug) from "empty array"
+    # (legitimate zero-walk under e.g. a fresh empty sprint). The
+    # pre-fix `if .walked_nums then ...` short-circuited on the
+    # empty list `[]` because jq treats `[]` as falsy in `if`,
+    # mis-classifying empty as missing. Use a type check instead.
+    # The jq emit distinguishes:
+    #   walked_nums: []   -> ""           (legitimate zero-walk; e.g.
+    #                                       sprint emptied by our own
+    #                                       successful removal)
+    #   walked_nums absent or non-array -> "__MISSING__"
+    #                                       (structural bug; walker
+    #                                        must emit the field as an
+    #                                        array on every call)
+    # Only the sentinel branch is the structural-bug case. An empty
+    # CSV is the normal "nothing left in the sprint" outcome and must
+    # fall through to the regular success path so the user sees
+    # "Removed N/N issue(s)", not a spurious "internal bug" warning.
+    # The `2>/dev/null || echo "__MISSING__"` recovery covers jq itself
+    # failing (since `set -euo pipefail` does not propagate through
+    # command substitution without `shopt -s inherit_errexit`, which we
+    # don't enable here).
+    local walked_nums_csv
+    walked_nums_csv=$(echo "$post_state" | jq -r 'if (.walked_nums | type) == "array" then (.walked_nums | map(tostring) | join(",")) else "__MISSING__" end' 2>/dev/null || echo "__MISSING__")
+    if [[ "$walked_nums_csv" == "__MISSING__" ]]; then
+        echo ""
+        warn "Mutation landed (removeIssuesFromSprints succeeded), but post-state could not be confirmed:"
+        warn "  Walker output is missing the 'walked_nums' field (internal bug)"
+        warn "Re-verify with 'zh sprint show \"${sprint_actual_name}\"' to see the current state."
+        exit 2
+    fi
+
+    local input_nums_csv
+    input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
+
+    local succeeded failed
+    if [[ -z "$pagination_bailed" ]]; then
+        # Full coverage: walker observed the entire post-state (either
+        # the response was <100 nodes OR we walked all pages). Naive
+        # `inputs - still_attached` is correct.
+        succeeded=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
+             [$in[] | select(. as $n | $att | all(. != $n))] | join(",")')
+        failed=$(jq -nr --arg inputs "$input_nums_csv" --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in | ($attached | split(",")) as $att |
+             [$in[] | select(. as $n | $att | any(. == $n))] | join(",")')
+    else
+        # Partial coverage: walker bailed before observing the whole
+        # sprint. Honest SPEC:
+        #   succeeded = inputs ∩ walked - still_attached
+        #   failed    = inputs ∩ walked ∩ still_attached
+        #   un-verified inputs (not in walked) are neither — they're
+        #     surfaced as a count in the bail diagnostic.
+        succeeded=$(jq -nr \
+            --arg inputs "$input_nums_csv" \
+            --arg walked "$walked_nums_csv" \
+            --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in
+             | ($walked | split(",")) as $w
+             | ($attached | split(",")) as $att
+             | [$in[] | select(. as $n | $w | any(. == $n))
+                       | select(. as $n | $att | all(. != $n))]
+             | join(",")')
+        failed=$(jq -nr \
+            --arg inputs "$input_nums_csv" \
+            --arg walked "$walked_nums_csv" \
+            --arg attached "$still_attached_nums_csv" \
+            '($inputs | split(",")) as $in
+             | ($walked | split(",")) as $w
+             | ($attached | split(",")) as $att
+             | [$in[] | select(. as $n | $w | any(. == $n))
+                       | select(. as $n | $att | any(. == $n))]
+             | join(",")')
+    fi
+
+    local total_input
+    total_input=$(echo "$input_nums_csv" | awk -F',' '{print NF}')
+    local success_count
+    success_count=$(echo "$succeeded" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+    local failed_count
+    failed_count=$(echo "$failed" | awk -F',' '{if ($0 == "") {print 0} else {print NF}}')
+    local unverified_count=$((total_input - success_count - failed_count))
+
+    echo ""
+    if [[ "$success_count" -gt 0 ]]; then
+        if [[ -n "$pagination_bailed" ]]; then
+            # Coverage-incomplete: even our confirmed `succeeded` set
+            # is partial — un-verified inputs may or may not have
+            # been removed. Downgrade the message so the user doesn't
+            # read a clean "Removed" as a confirmed outcome.
+            warn "Confirmed removal of ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
+        else
+            success "Removed ${success_count}/${total_input} issue(s) from sprint '${sprint_actual_name}': ${succeeded//,/, }"
+        fi
+    fi
+    if [[ "$failed_count" -gt 0 ]]; then
+        warn "${failed_count} still in sprint (API rejected the removal): ${failed//,/, }"
+    fi
+    # Round-5 #11: bail diagnostic must surface independent of
+    # `success_count`. Previously it was gated inside the success
+    # branch, so a fully-failed batch with walker-bailed coverage
+    # would never see the diagnostic.
+    if [[ -n "$pagination_bailed" ]]; then
+        warn "Post-state coverage incomplete — re-verify."
+        warn "  Walker bailed: ${pagination_bailed}."
+        if [[ "$unverified_count" -gt 0 ]]; then
+            warn "  ${unverified_count}/${total_input} input(s) un-verified (walker never reached them)."
+        fi
+        warn "  Re-verify with 'zh sprint show \"${sprint_actual_name}\"'."
+    fi
+
+    # Exit codes (round-5 #5):
+    #
+    #   0 — clean success, no failures, full coverage
+    #   1 — real failure: at least one input still attached, OR
+    #       zero confirmed positives. "Definitely wrong" takes
+    #       precedence over coverage warnings.
+    #   2 — coverage incomplete only (no real failures, walker
+    #       bailed mid-walk). "Re-verify before retrying."
+    #
+    # The order matters: `failed_count > 0` is checked BEFORE
+    # `pagination_bailed`, so a real failure beats a coverage
+    # warning. Scripted callers reading the exit code get the more
+    # actionable signal.
+    if [[ "$failed_count" -gt 0 ]]; then
+        exit 1
+    fi
+    if [[ "$success_count" -eq 0 ]] && [[ -z "$pagination_bailed" ]]; then
+        # Zero positives with FULL coverage = real failure. Zero
+        # positives with PARTIAL coverage is a coverage problem
+        # (exit 2, below), not a real failure.
+        exit 1
+    fi
+    if [[ -n "$pagination_bailed" ]]; then
+        exit 2
+    fi
+}
+
 # Encode a numeric epic ID into its GraphQL global-ID form.
 zh_epic_encode_id() {
     local epic_num="$1"
@@ -2916,7 +4253,7 @@ zh_resolve_issue_ids() {
     local issue_nums=("$@")
 
     local ids="[]"
-    for num in "${issue_nums[@]}"; do
+    for num in ${issue_nums[@]+"${issue_nums[@]}"}; do
         local stripped="${num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${num}"
@@ -3295,7 +4632,26 @@ cmd_subissue_add() {
 Example: zh subissue add 42 100 101"
     fi
 
-    local child_nums=("$@")
+    # Dedup input numbers (first-occurrence order) so a repeated arg
+    # can't inflate the success count when the API returns one link
+    # per unique issue. Same SPEC as the sprint mutations and the
+    # Python add_sub_issues boundary dedup.
+    local -a child_nums=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in ${child_nums[@]+"${child_nums[@]}"}; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            child_nums+=("$stripped_arg")
+        fi
+    done
+
     local stripped_parent="${parent_num#\#}"
 
     # Argument-format validation up-front so typos surface before any git or
@@ -3303,7 +4659,7 @@ Example: zh subissue add 42 100 101"
     if ! [[ "$stripped_parent" =~ ^[0-9]+$ ]]; then
         error "Invalid parent issue number: ${parent_num}"
     fi
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${raw_num}"
@@ -3324,7 +4680,7 @@ Example: zh subissue add 42 100 101"
     parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
 
     local child_ids_json
-    child_ids_json=$(zh_resolve_issue_ids "$repo_id" "${child_nums[@]}")
+    child_ids_json=$(zh_resolve_issue_ids "$repo_id" ${child_nums[@]+"${child_nums[@]}"})
 
     local mutation_vars
     mutation_vars=$(jq -n \
@@ -3371,11 +4727,11 @@ Example: zh subissue add 42 100 101"
     failed_nums_csv=$(echo "$response" | jq -r \
         '(.data.addSubIssues.failedIssues // []) | map("#" + (.number|tostring)) | join(",")')
 
-    # Input children minus failed children = added children. We compute this
-    # in shell rather than asking the API because addSubIssues only returns
+    # Input children minus failed children = inferred-added children.
+    # Compute it in shell because addSubIssues only returns
     # failedIssues (not the inverse).
     local added_nums_csv_parts=""
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         local was_failed
         was_failed=$(echo "$response" | jq -r --argjson n "$stripped" \
@@ -3386,15 +4742,33 @@ Example: zh subissue add 42 100 101"
     done
     added_nums_csv="${added_nums_csv_parts%,}"
 
-    # Pretty form for human output — same CSVs with a ", " join. Keep these
-    # strictly separate from the RESULT-line CSVs (no space) above.
+    # Round-6 #4 — divergence guard. The Python side
+    # (zh_graphql_ops.add_sub_issues) refuses to identify which inputs
+    # succeeded when `success_count != (total_inputs - failed_count)`.
+    # Pre-fix bash printed "Added 1 sub-issue(s) to #42: #100, #101,
+    # #102" — claiming all three landed because none appeared in
+    # failedIssues. SPEC: when the count diverges, do NOT name the
+    # inferred-added children; tell the user to re-list.
+    local total_inputs="${#child_nums[@]}"
+    local inferred_added_count=$((total_inputs - failed_count))
+    local divergence=false
+    if [[ "$success_count" != "$inferred_added_count" ]]; then
+        divergence=true
+    fi
+
+    # Pretty form for human output. `added_nums_pretty` is suppressed
+    # under divergence so we don't lie about which inputs landed.
     local failed_nums_pretty added_nums_pretty
     failed_nums_pretty="${failed_nums_csv//,/, }"
     added_nums_pretty="${added_nums_csv//,/, }"
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Added ${success_count} sub-issue(s) to #${stripped_parent}: ${added_nums_pretty}"
+        if [[ "$divergence" == "true" ]]; then
+            warn "Added ${success_count}/${total_inputs} sub-issue(s) to #${stripped_parent} (cannot identify which — re-run 'zh subissue list ${stripped_parent}' to verify)"
+        else
+            success "Added ${success_count} sub-issue(s) to #${stripped_parent}: ${added_nums_pretty}"
+        fi
     fi
     if [[ "$failed_count" -gt 0 ]]; then
         warn "${failed_count} failed: ${failed_nums_pretty}"
@@ -3403,25 +4777,38 @@ Example: zh subissue add 42 100 101"
         if [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
             warn "  githubErrors: ${gh_errors}"
         fi
+        # Round-10 Pattern C (round-9 #4): surface the fail-divergence
+        # case — API reported failures but didn't account for every
+        # input. Mirrors the Python `partial_success_warning` fail
+        # variant.
+        local unaccounted_count=$((total_inputs - failed_count - success_count))
+        if [[ "$unaccounted_count" -gt 0 ]]; then
+            warn "  ${unaccounted_count} input(s) un-reported (neither succeeded nor in failedIssues). Re-list to confirm."
+        fi
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
-        # Some ZenHub mutations silently no-op when the child already has the
-        # same parent. Surface that rather than claiming false success.
-        warn "No sub-issues added — already linked or no-op"
+        # Some ZenHub mutations silently no-op when the child already
+        # has the same parent. Round-10 Pattern C (round-9 #4): name
+        # the strict-noop-divergence shape distinctly so the operator
+        # knows to re-list. cmd_subissue_add requires total_inputs >= 1,
+        # so this is always a strict no-op despite N inputs.
+        warn "No sub-issues added — API returned strict no-op (successCount=0, failedIssues=[]) despite ${total_inputs} input(s). Re-list to confirm."
     fi
 
-    # Machine-readable summary line for MCP consumers. Always emitted; format
-    # is stable and parser-friendly. CSV values are space-free (see comment
-    # at the failed_nums_csv assignment above) so the parser's space-split
-    # tokenisation can't accidentally split a single CSV across tokens.
+    # v1.6.0 removed the `RESULT:add` machine-summary line. The sole
+    # consumer (the MCP server) now calls the GraphQL mutation directly
+    # and reads successCount / failedIssues from the JSON response.
     #
-    #   RESULT:add outcome=ok|partial|fail|noop success=N failed=N \
-    #       added=#a,#b failed_nums=#c
+    # We still classify the outcome here for the exit-code contract that
+    # scripted callers (humans + CI) rely on. Precedence (round-5 #5):
+    # real failure > coverage/divergence warning > success.
     #
-    # "noop" is the (success=0, failed=0) case — the API neither added nor
-    # rejected anything, typically because every requested child was already
-    # linked to this parent. Treat as a non-success so the wrapper's `ok`
-    # doesn't claim a link was made. See round-3 review finding #2.
+    # Round-10 Pattern C (round-9 #5): align exit-code semantics with
+    # cmd_sprint_remove (canonical 0/1/2 convention). Divergence-only
+    # partial means "the API claimed N succeeded but we can't identify
+    # which inputs" — that's coverage-incomplete (re-verify with
+    # `zh subissue list`), not a real failure. Exit 2 disambiguates
+    # this from `failed_count > 0` (real rejections).
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -3429,16 +4816,21 @@ Example: zh subissue add 42 100 101"
         outcome="fail"
     elif [[ "$success_count" -eq 0 ]]; then
         outcome="noop"
+    elif [[ "$divergence" == "true" ]]; then
+        # Round-6 #4: signal must match data. ok→partial when we
+        # can't identify which inputs landed.
+        outcome="partial"
     else
         outcome="ok"
     fi
-    echo "RESULT:add outcome=${outcome} success=${success_count} failed=${failed_count} added=${added_nums_csv} failed_nums=${failed_nums_csv}"
-
-    # Exit non-zero on partial, fail, or noop so MCP / scripted callers all
-    # notice. The wrapper additionally cross-checks outcome=="ok", but the
-    # exit code is the first signal a `set -e` caller sees.
-    if [[ "$outcome" != "ok" ]]; then
-        exit 1
+    if [[ "$outcome" == "ok" ]]; then
+        :  # exit 0 (implicit)
+    elif [[ "$failed_count" -gt 0 ]]; then
+        exit 1  # real failure
+    elif [[ "$outcome" == "noop" ]]; then
+        exit 1  # zero positives = real failure (mirrors cmd_sprint_remove)
+    else
+        exit 2  # divergence-only partial = coverage incomplete
     fi
 }
 
@@ -3457,7 +4849,25 @@ mis-typed parent numbers — otherwise 'remove 9999 100' would happily
 unlink #100 from its real parent while reporting 'removed from #9999'."
     fi
 
-    local child_nums=("$@")
+    # Dedup input numbers (first-occurrence order) so a repeated arg
+    # can't inflate the success count. Mirrors cmd_subissue_add and
+    # the Python remove_sub_issues boundary dedup.
+    local -a child_nums=()
+    local raw_num stripped_arg seen_num
+    for raw_num in "$@"; do
+        stripped_arg="${raw_num#\#}"
+        local already_seen=false
+        for seen_num in ${child_nums[@]+"${child_nums[@]}"}; do
+            if [[ "$seen_num" == "$stripped_arg" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            child_nums+=("$stripped_arg")
+        fi
+    done
+
     local stripped_parent="${parent_num#\#}"
 
     # Argument-format validation BEFORE any network or git lookup, so typos
@@ -3465,7 +4875,7 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
     if ! [[ "$stripped_parent" =~ ^[0-9]+$ ]]; then
         error "Invalid parent issue number: ${parent_num}"
     fi
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${raw_num}"
@@ -3487,7 +4897,7 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
     # findings recorded earlier in the same batch.
     local child_id_list="[]"
     local mismatches=""
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
 
         local lookup_query='
@@ -3596,7 +5006,7 @@ parent relationship before retrying."
         '(.data.removeSubIssues.failedIssues // []) | map("#" + (.number|tostring)) | join(",")')
 
     local removed_nums_csv_parts=""
-    for raw_num in "${child_nums[@]}"; do
+    for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
         local stripped="${raw_num#\#}"
         local was_failed
         was_failed=$(echo "$response" | jq -r --argjson n "$stripped" \
@@ -3607,13 +5017,27 @@ parent relationship before retrying."
     done
     removed_nums_csv="${removed_nums_csv_parts%,}"
 
+    # Round-6 #4 mirror — divergence guard. See cmd_subissue_add for
+    # the full rationale; SPEC: when count disagrees with inferred
+    # set, do NOT name the inferred-removed children.
+    local total_inputs="${#child_nums[@]}"
+    local inferred_removed_count=$((total_inputs - failed_count))
+    local divergence=false
+    if [[ "$success_count" != "$inferred_removed_count" ]]; then
+        divergence=true
+    fi
+
     local failed_nums_pretty removed_nums_pretty
     failed_nums_pretty="${failed_nums_csv//,/, }"
     removed_nums_pretty="${removed_nums_csv//,/, }"
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${removed_nums_pretty}"
+        if [[ "$divergence" == "true" ]]; then
+            warn "Removed ${success_count}/${total_inputs} sub-issue(s) from #${stripped_parent} (cannot identify which — re-run 'zh subissue list ${stripped_parent}' to verify)"
+        else
+            success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${removed_nums_pretty}"
+        fi
     fi
     if [[ "$failed_count" -gt 0 ]]; then
         warn "${failed_count} failed: ${failed_nums_pretty}"
@@ -3621,6 +5045,12 @@ parent relationship before retrying."
         gh_errors=$(echo "$response" | jq -c '.data.removeSubIssues.githubErrors // {}')
         if [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
             warn "  githubErrors: ${gh_errors}"
+        fi
+        # Round-10 Pattern C (round-9 #4): symmetric fail-divergence
+        # surface with cmd_subissue_add.
+        local unaccounted_count=$((total_inputs - failed_count - success_count))
+        if [[ "$unaccounted_count" -gt 0 ]]; then
+            warn "  ${unaccounted_count} input(s) un-reported (neither succeeded nor in failedIssues). Re-list to confirm."
         fi
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
@@ -3633,13 +5063,13 @@ This is unexpected after pre-flight validation succeeded; check the parent
 state with 'zh subissue list ${stripped_parent}'."
     fi
 
-    # Machine-readable summary for MCP consumers (stable format). CSV values
-    # are space-free (round-3 finding #1). "noop" surfaces the (0/0) case so
-    # MCP doesn't classify a no-op as a successful removal — see round-3
-    # finding #2.
+    # v1.6.0 removed the `RESULT:remove` machine-summary line. The sole
+    # consumer (the MCP server) now reads successCount / failedIssues
+    # directly from the GraphQL response. Exit-code contract preserved
+    # for scripted callers. Round-6 #4: divergence forces partial.
     #
-    #   RESULT:remove outcome=ok|partial|fail|noop success=N failed=N \
-    #       removed=#a,#b failed_nums=#c
+    # Round-10 Pattern C (round-9 #5): symmetric exit-code update with
+    # cmd_subissue_add — divergence-only partial → exit 2.
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -3647,14 +5077,19 @@ state with 'zh subissue list ${stripped_parent}'."
         outcome="fail"
     elif [[ "$success_count" -eq 0 ]]; then
         outcome="noop"
+    elif [[ "$divergence" == "true" ]]; then
+        outcome="partial"
     else
         outcome="ok"
     fi
-    echo "RESULT:remove outcome=${outcome} success=${success_count} failed=${failed_count} removed=${removed_nums_csv} failed_nums=${failed_nums_csv}"
-
-    # Exit non-zero on partial, fail, or noop (same rationale as cmd_subissue_add).
-    if [[ "$outcome" != "ok" ]]; then
-        exit 1
+    if [[ "$outcome" == "ok" ]]; then
+        :  # exit 0 (implicit)
+    elif [[ "$failed_count" -gt 0 ]]; then
+        exit 1  # real failure
+    elif [[ "$outcome" == "noop" ]]; then
+        exit 1  # zero positives = real failure
+    else
+        exit 2  # divergence-only partial = coverage incomplete
     fi
 }
 
@@ -3751,9 +5186,14 @@ zh_subissue_fetch_all() {
             first_page=false
         fi
 
-        # Append this page's nodes to all_nodes.
+        # Append this page's nodes to all_nodes. `select(. != null)`
+        # strips null page entries — same defensive normalization the
+        # other walkers (zh_workspaces_fetch_all, zh_sprints_fetch_all,
+        # zh_sprint_issues_fetch_all) apply, and the Python
+        # list_sub_issues walker enforces. Round-5 #8 closes the
+        # last walker that missed this filter.
         local page_nodes
-        page_nodes=$(echo "$issue_json" | jq -c '.zenhubChildIssues.nodes // []')
+        page_nodes=$(echo "$issue_json" | jq -c '[(.zenhubChildIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
@@ -3827,12 +5267,18 @@ zh_subissue_fetch_ids_only() {
     local all_nodes="[]"
     local total_count=0
     local first_page=true
+    # Round-6 #10: emit a `pagination_bailed` sentinel mirroring
+    # zh_sprint_issues_fetch_all's pattern, so cmd_subissue_reorder
+    # can refuse top/bottom mutations under partial coverage (same
+    # SPEC as the Python round-6 #5 fix in reorder_sub_issue).
+    local pagination_bailed=""
 
     while :; do
         # Same stuck-cursor / iteration-cap defense as zh_subissue_fetch_all.
         iterations=$((iterations + 1))
         if [[ "$iterations" -gt 200 ]]; then
             warn "Pagination iteration cap (200) hit on parent — returning partial result"
+            pagination_bailed="iteration_cap"
             break
         fi
 
@@ -3859,20 +5305,23 @@ zh_subissue_fetch_ids_only() {
             first_page=false
         fi
 
+        # Round-6 #7: `select(. != null)` strips null page entries
+        # at aggregation, matching the other three walkers. Last
+        # walker without the filter.
         local page_nodes
-        page_nodes=$(echo "$issue_json" | jq -c '.zenhubChildIssues.nodes // []')
+        page_nodes=$(echo "$issue_json" | jq -c '[(.zenhubChildIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
         has_next=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.hasNextPage // false')
         end_cursor=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.endCursor // empty')
 
-        if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
+        if [[ "$has_next" != "true" ]]; then
             break
         fi
-
-        if [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]]; then
-            warn "Pagination cursor did not advance (endCursor=${end_cursor:0:16}…) — returning partial result"
+        if [[ -z "$end_cursor" ]] || ( [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]] ); then
+            warn "Pagination cursor did not advance — returning partial result"
+            pagination_bailed="stuck_cursor"
             break
         fi
         prev_cursor="$end_cursor"
@@ -3883,38 +5332,21 @@ zh_subissue_fetch_ids_only() {
     jq -n \
         --argjson nodes "$all_nodes" \
         --argjson total "$total_count" \
-        '{totalCount: $total, nodes: $nodes}'
+        --arg pagination_bailed "$pagination_bailed" \
+        '{totalCount: $total, nodes: $nodes, pagination_bailed: $pagination_bailed}'
 }
 
 cmd_subissue_list() {
-    # Two output modes:
+    # Human-formatted table listing of a parent's sub-issues.
     #
-    #   default — human-formatted table (the historical behaviour).
-    #   --machine — TSV stream of untruncated, separator-safe rows preceded by
-    #               a HEADER line and a single CHILD line per child. This is
-    #               what the MCP server consumes so it doesn't have to parse
-    #               the truncated visual rows. Stable contract; see the
-    #               format spec below.
-    local machine_mode=false
-    local parent_num=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --machine)
-                machine_mode=true
-                shift
-                ;;
-            *)
-                if [[ -z "$parent_num" ]]; then
-                    parent_num="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
+    # v1.6.0 removed the `--machine` TSV mode. The sole consumer was the
+    # MCP server, which now talks to ZenHub's GraphQL API directly from
+    # Python (see zh_graphql_ops.list_sub_issues). Bash stays focused on
+    # the human-facing rendering.
+    local parent_num="${1:-}"
 
     if [[ -z "$parent_num" ]]; then
-        error "Usage: zh subissue list [--machine] <parent#>
+        error "Usage: zh subissue list <parent#>
 Example: zh subissue list 42"
     fi
 
@@ -3944,55 +5376,16 @@ Example: zh subissue list 42"
     local parent_title child_count fetched_count
     parent_title=$(echo "$children_json" | jq -r '.parentTitle')
     child_count=$(echo "$children_json" | jq -r '.totalCount // 0')
-    fetched_count=$(echo "$children_json" | jq -r '.nodes | length')
 
-    # ---- Machine-mode output ----
-    #
-    # Format (TAB-separated, one record per line; no decoration):
-    #
-    #   HEADER<TAB>parent_number<TAB>parent_title<TAB>total_count<TAB>fetched_count
-    #   CHILD<TAB>number<TAB>state<TAB>pipeline<TAB>assignees_csv<TAB>title<TAB>owner<TAB>repo
-    #   ...
-    #
-    # Notes:
-    #   - Title and pipeline are NOT truncated.
-    #   - State is the literal "OPEN" or "CLOSED" from the API.
-    #   - assignees_csv is comma-separated logins; the literal "unassigned"
-    #     when empty.
-    #   - pipeline is "—" when unset.
-    #   - owner/repo are the repository the child issue lives in (matters in
-    #     multi-repo workspaces). When that doesn't match the cwd repo, the
-    #     child can't be operated on via this CLI from this checkout.
-    #   - U+2502 ("│") may appear in any text field; consumers MUST NOT
-    #     interpret it as a separator. The TAB-delimited layout is stable.
-    if [[ "$machine_mode" == "true" ]]; then
-        # Route the HEADER line through jq's @tsv too, not just the CHILD
-        # rows. A parent title containing a TAB or newline would otherwise
-        # shift the HEADER columns and the MCP parser would silently
-        # mis-attribute total_count / fetched_count (round-3 finding #4).
-        # @tsv escapes tabs/newlines/CRs/backslashes consistently in both
-        # streams so the parser can rely on the same rules everywhere.
-        echo "$children_json" | jq -r --arg parent_num "$parent_num" \
-            --argjson total "$child_count" --argjson fetched "$fetched_count" \
-            '["HEADER", $parent_num, (.parentTitle // ""), ($total|tostring), ($fetched|tostring)] | @tsv'
-
-        if [[ "$fetched_count" -gt 0 ]]; then
-            echo "$children_json" | jq -r '.nodes[] |
-                [
-                    "CHILD",
-                    (.number|tostring),
-                    .state,
-                    (.pipelineIssue.pipeline.name // "—"),
-                    ([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end),
-                    (.title // ""),
-                    (.repository.ownerName // ""),
-                    (.repository.name // "")
-                ] | @tsv'
-        fi
-        return
-    fi
-
-    # ---- Human-mode output (unchanged surface) ----
+    # Normalize once: strip any null page entries up-front so the
+    # count we report and the loop we iterate share the same view of
+    # the data. Round-4 #7: the pre-fix code counted `.nodes | length`
+    # (pre-filter) and iterated `.nodes[] | select(. != null)`
+    # (post-filter), so the divergence warning below could compare
+    # inflated counts against `child_count`.
+    local children_clean
+    children_clean=$(echo "$children_json" | jq -c '[.nodes[] | select(. != null)]')
+    fetched_count=$(echo "$children_clean" | jq -r 'length')
 
     echo ""
     echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
@@ -4015,7 +5408,9 @@ Example: zh subissue list 42"
         return
     fi
 
-    echo "$children_json" | jq -r '.nodes[] |
+    # Iterate the normalized intermediate so the display matches the
+    # count above. Null entries were already filtered out.
+    echo "$children_clean" | jq -r '.[] |
         "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
         while IFS=$'\t' read -r num istate pipeline assignees ititle; do
             local marker="  "
@@ -4171,6 +5566,23 @@ Use 'zh subissue add <parent#> ${child_num}' first."
         error "Could not load siblings of #${child_num} (parent #${parent_num} not found?)"
     fi
 
+    # Round-6 #10: when the sibling walk bailed mid-coverage,
+    # top/bottom anchoring is unsafe — the "first" or "last" sibling
+    # in a partial set isn't the workspace-global first/last, so the
+    # mutation would silently corrupt order. Refuse the mutation for
+    # top/bottom; allow after/before since the user named an
+    # explicit anchor we'll either find or fail on cleanly. Mirrors
+    # the Python round-6 #5 fix in reorder_sub_issue.
+    local sibling_pagination_bailed
+    sibling_pagination_bailed=$(echo "$sibling_ids_json" | jq -r '.pagination_bailed // ""')
+    case "$position" in
+        top|first|bottom|last)
+            if [[ -n "$sibling_pagination_bailed" ]]; then
+                error "Cannot determine sibling order for '${position}' under partial pagination — sub-issue listing bailed: ${sibling_pagination_bailed}. Re-list ('zh subissue list ${parent_num}') and retry once full coverage is available, OR use 'after' / 'before' with an explicit sibling number."
+            fi
+            ;;
+    esac
+
     # Resolve the position keyword to an afterId or beforeId. ZenHub treats
     # `afterId: null` and `beforeId: null` specially:
     #   - afterId only set → place right after that sibling
@@ -4192,15 +5604,8 @@ Use 'zh subissue add <parent#> ${child_num}' first."
                 # Only child — there is nothing to reorder against. Skip the
                 # mutation entirely rather than firing a vacuous reorder
                 # whose ✓ output would suggest something happened.
-                #
-                # Emit a RESULT:reorder noop line so the MCP wrapper can
-                # distinguish "skipped, nothing to do" from a successful
-                # reorder — without it the wrapper sees r["ok"]=true and
-                # an empty raw and reports a successful reorder. See
-                # round-3 review finding #3.
                 echo ""
                 warn "#${child_num} is the only sub-issue of #${parent_num} — nothing to reorder."
-                echo "RESULT:reorder outcome=noop child=#${child_num} parent=#${parent_num} position=top"
                 exit 1
             fi
             before_id="\"${first_sib_id}\""
@@ -4214,7 +5619,6 @@ Use 'zh subissue add <parent#> ${child_num}' first."
             if [[ -z "$last_sib_id" ]]; then
                 echo ""
                 warn "#${child_num} is the only sub-issue of #${parent_num} — nothing to reorder."
-                echo "RESULT:reorder outcome=noop child=#${child_num} parent=#${parent_num} position=bottom"
                 exit 1
             fi
             after_id="\"${last_sib_id}\""
@@ -4302,21 +5706,12 @@ be linked to this parent. Use 'zh subissue list ${parent_num}' to verify."
     if [[ "$ok" != "true" ]]; then
         local gh_errors
         gh_errors=$(echo "$response" | jq -c '.data.reprioritizeSubIssue.githubErrors // null')
-        # Emit a RESULT line before erroring out so MCP / scripted callers
-        # can distinguish API-rejection from other failure modes. The
-        # subsequent `error` call will exit non-zero anyway.
-        echo "RESULT:reorder outcome=fail child=#${child_num} parent=#${parent_num} position=${position_desc// /_}"
         error "Failed to reorder sub-issue #${child_num} (githubErrors: ${gh_errors})"
     fi
 
     echo ""
     success "Reordered sub-issue #${child_num}: ${child_title}"
     echo -e "  Now at ${CYAN}${position_desc}${NC} under parent ${GREEN}#${parent_num}${NC}"
-
-    # Machine-readable summary line for MCP consumers (round-3 finding #3).
-    # Stable format; `position` is space-collapsed because the RESULT-line
-    # parser tokenises on " ".
-    echo "RESULT:reorder outcome=ok child=#${child_num} parent=#${parent_num} position=${position_desc// /_}"
 }
 
 cmd_subissue() {
@@ -4466,8 +5861,91 @@ Run 'zh epic help' for usage information."
 # =============================================================================
 # Main
 # =============================================================================
+#
+# Exit-code convention for mutation-emitting subcommands (round-10
+# Pattern C / round-9 #5):
+#
+#   0 — clean success: outcome == "ok", no warnings, full coverage.
+#   1 — real failure: at least one input rejected by the API
+#        (failed_count > 0), OR zero positives confirmed under
+#        full coverage. "Definitely wrong" takes precedence over
+#        coverage warnings.
+#   2 — coverage incomplete / re-verify: divergence-only partial
+#        (API count disagrees with inferred set), walker bailed
+#        mid-walk, OR post-state can't be confirmed after a
+#        successful mutation. Scripted callers should re-verify
+#        before retrying.
+#
+# `error` (zh utility func, line ~30) exits 1 for pre-mutation
+# validation failures (bad usage, parent-not-found, etc.) — those
+# don't get their own tier because no mutation has fired and the
+# caller can fix and retry without coverage concerns.
+#
+# This convention is observed by: cmd_subissue_add, cmd_subissue_remove,
+# cmd_sprint_add, cmd_sprint_remove.
 
 main() {
+    # Global flag parsing (peel off `-r` / `--repo` and `-w` /
+    # `--workspace` before the subcommand). Config-file defaults are
+    # already in the environment via load_config when the subcommand
+    # body runs, so we seed the override vars from them here for a
+    # uniform consumption point.
+    #
+    # Precedence (highest first):
+    #   1. command-line flag (-r / -w)
+    #   2. ZH_REPO / ZH_WORKSPACE env var (also set by load_config from
+    #      the config file)
+    #   3. git remote / first-workspace inference (in get_repo_info /
+    #      get_workspace_id)
+    #
+    # Note: load_config hasn't run yet at this point — subcommand bodies
+    # call it themselves — so ZH_REPO / ZH_WORKSPACE here only reflect
+    # the SHELL env, not the config file. The config-file path comes
+    # into play later: load_config sources the file, exposing ZH_REPO
+    # and ZH_WORKSPACE; get_repo_info / get_workspace_id then read them
+    # if ZH_REPO_OVERRIDE / ZH_WORKSPACE_NAME aren't set. So the flag
+    # always wins; env wins over config; config wins over inference.
+    ZH_REPO_OVERRIDE="${ZH_REPO_OVERRIDE:-}"
+    ZH_WORKSPACE_NAME="${ZH_WORKSPACE_NAME:-}"
+
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -r|--repo)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires an owner/repo value"
+                fi
+                ZH_REPO_OVERRIDE="$2"
+                shift 2
+                ;;
+            -w|--workspace)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option $1 requires a workspace name"
+                fi
+                ZH_WORKSPACE_NAME="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                args+=("$@")
+                break
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    # Export so subshells / piped invocations also see them
+    export ZH_REPO_OVERRIDE ZH_WORKSPACE_NAME
+    # Conditional expansion for bash 3.2 portability — `set --
+    # "${args[@]}"` on an empty array under `set -u` (which we
+    # set at the top of the script) errors with "args[@]: unbound
+    # variable" on bash 3.2. The fix lets `zh -w foo` with no
+    # subcommand fall through cleanly to the help dispatcher.
+    # Round-5 #9.
+    set -- ${args[@]+"${args[@]}"}
+
     local command="${1:-help}"
     shift || true
 
@@ -4549,6 +6027,40 @@ main() {
             ;;
         subissue|subissues|sub|child|children)
             cmd_subissue "$@"
+            ;;
+        sprints|sp)
+            cmd_sprints "$@"
+            ;;
+        sprint)
+            # `zh sprint` with no args defaults to the active sprint.
+            if [[ $# -eq 0 ]]; then
+                cmd_sprint_current
+            else
+                local first="$1"
+                shift
+                case "$first" in
+                    current|active)
+                        cmd_sprint_current "$@"
+                        ;;
+                    add)
+                        cmd_sprint_add "$@"
+                        ;;
+                    remove|rm)
+                        cmd_sprint_remove "$@"
+                        ;;
+                    *)
+                        cmd_sprint "$first" "$@"
+                        ;;
+                esac
+            fi
+            ;;
+        sa)
+            # Top-level alias for `zh sprint add` (per @jeremiahrose's PR #2)
+            cmd_sprint_add "$@"
+            ;;
+        sr)
+            # Top-level alias for `zh sprint remove`
+            cmd_sprint_remove "$@"
             ;;
         *)
             error "Unknown command: $command

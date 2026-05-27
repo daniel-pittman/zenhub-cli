@@ -50,6 +50,8 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh epic show <epic#>` — show epic detail + child issues
 - `zh subissue list <parent#>` — list sub-issues (children) of a parent issue
 - `zh issue <N>` — also shows `Parent: #<N>` and `Sub-issues: <count>` when present, giving cheap 3-tier hierarchy visibility
+- `zh sprints [--all]` — list sprints in the workspace (● marks the active sprint). `--all` includes closed sprints.
+- `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
 
 ### Write operations (issue lifecycle)
 - `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>` — create issue
@@ -82,6 +84,20 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh subissue list <parent#>` — list a parent's sub-issues with the same format `zh epic show` uses (aliases: `ls`)
 - `zh subissue reorder <child#> <top|bottom|after <sib#>|before <sib#>>` — reorder a sub-issue among its siblings. **Different positioning model from `zh reorder`**: ZenHub's `reprioritizeSubIssue` mutation uses sibling-anchored positioning, not integer positions. (aliases: `order`, `pos`)
 
+### Write operations (sprint membership)
+- `zh sprint add <name|current|active> <issue#> [<issue#> ...]` — add one or more issues to a sprint (single API call). Top-level alias: `zh sa <name> <issue#> [...]`.
+- `zh sprint remove <name|current|active> <issue#> [<issue#> ...]` — remove issues from a sprint. Top-level alias: `zh sr <name> <issue#> [...]`. `remove` aliases: `rm`.
+
+The sprint mutations report per-issue success / failure. The ZenHub API doesn't distinguish reasons (already-in-sprint, archived, ineligible) so `zh` surfaces counts and affected numbers; if anything fails, investigate via `zh sprint <name>` and the issue's history.
+
+### Repository / workspace targeting (global flags)
+- `-r owner/repo` (alias `--repo`) before any subcommand: target a specific GitHub repo instead of the one `git remote get-url origin` resolves.
+- `-w "Workspace Name"` (alias `--workspace`): target a specific workspace by name. Case-insensitive match.
+- Persistent defaults: `ZH_REPO` and `ZH_WORKSPACE` in `~/.config/zh/config` or env.
+- Precedence: flag > env / config > git-remote + first-workspace fallback.
+
+Use `-w` when a repo is connected to multiple workspaces — the historical default of "first workspace returned" is a coin flip.
+
 ### Aliases worth knowing
 - `zh issue` → `i`, `show`
 - `zh mine` → `my`
@@ -92,14 +108,17 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh estimate` → `est`, `points`
 - `zh epic list` → `zh epic ls`; `show` → `view`; `create` → `new`; `remove` → `rm`; `reopen` → `open`; `update` → `edit`, `modify`
 - `zh subissue` → `subissues`, `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
+- `zh sprints` → `sp`; `zh sprint add` → top-level `sa`; `zh sprint remove` → top-level `sr` (and `rm` as inner alias)
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 
-These are exposed by the MCP server (`mcp_server.py`) on top of the `zh` CLI. They wrap `sentence-transformers/all-MiniLM-L6-v2` embeddings over an auto-synced per-repo cache at `~/.config/zh/index/`. Available when the zenhub MCP server is registered with Claude Code — but **not** runnable from the `zh` shell wrapper directly.
+These are exposed by the MCP server (`mcp_server.py`) on top of the `zh` CLI. Available when the zenhub MCP server is registered with Claude Code — but **not** runnable from the `zh` shell wrapper directly.
 
-- **`zh_similar(query, top_k=5, threshold=0.5)`** — semantic search across open issues. Returns top matches with cosine similarity scores. Use this for "is there already a ticket for X?" lookups.
+- **`zh_similar(query, top_k=5, threshold=0.5)`** — semantic search across open issues using `sentence-transformers/all-MiniLM-L6-v2` embeddings over an auto-synced per-repo cache at `~/.config/zh/index/`. Returns top matches with cosine similarity scores. Use this for "is there already a ticket for X?" lookups.
 - **`zh_reindex(full=False)`** — manual cache refresh. Auto-sync runs on a 5-minute TTL on every `zh_similar` call, so this is rarely needed.
 - **Pre-flight duplicate check on `create_issue`** — every `create_issue` call (including yours) automatically runs `check_duplicate(title, body)` before invoking `zh create`. See Hard Rule #5 below for how to handle the response.
+
+> **MCP architecture note (v1.6.0):** the `subissue_*` and `sprint_*` MCP tools talk to ZenHub's GraphQL API directly from Python (via `zh_api.py` / `zh_graphql_ops.py`), returning untruncated structured data with no text-parsing layer. Earlier versions parsed `zh --machine` TSV output; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap the bash `zh` because human-facing rendering already gives them everything they need.
 
 ---
 
