@@ -502,6 +502,24 @@ def add_sub_issues(
         )
 
     outcome = _classify_outcome(success_count, failed_count)
+    # Round-6 #3: round-5 fixed the DATA (succeeded=[] when we can't
+    # identify) but left the SIGNAL stale — `outcome` was still
+    # computed from `success_count` alone, which produces "ok" for a
+    # single-success-with-divergence case. `ok = outcome == "ok"`
+    # then reported True even though `partial_success_warning` was
+    # set. Force partial when the divergence guard fires, so signal
+    # and data agree.
+    #
+    # Guard: only override when outcome was "ok". `noop` (success=0,
+    # failed=0) has its own specific semantics — the divergence
+    # check inferred succeeded=[input] but the API said success=0,
+    # which IS a divergence by the strict length check; however,
+    # the load-bearing signal there is "noop", not "partial". A
+    # "fail" outcome (failed_count>0, success_count=0) also stays
+    # untouched. Round-6 #3 only fixes the case where the API
+    # claims success but we can't identify which inputs landed.
+    if partial_success_warning is not None and outcome == "ok":
+        outcome = "partial"
     return {
         "ok": outcome == "ok",
         "parent_number": parent_number,
@@ -687,6 +705,10 @@ def remove_sub_issues(
         )
 
     outcome = _classify_outcome(success_count, failed_count)
+    # Round-6 #3: force partial when divergence guard fires. See
+    # add_sub_issues for the rationale — signal must match data.
+    if partial_success_warning is not None:
+        outcome = "partial"
     return {
         "ok": outcome == "ok",
         "parent_number": parent_number,
@@ -1280,13 +1302,29 @@ def _walk_sprint_issues(
             # list. Matrix gap from round 4 finding #4.
             if wrapper is None:
                 continue
-            issue = (wrapper or {}).get("issue") or {}
-            # Record EVERY iterated issue number (pre-repo-filter) so
-            # downstream callers can distinguish "walker reached this
-            # input and confirmed its absence" from "walker never
-            # reached this input." Round-5 #1.
+            issue = (wrapper or {}).get("issue")
+            # Round-6 #6: defend against `wrapper = {"issue": null}` —
+            # `(wrapper or {}).get("issue") or {}` (the prior idiom)
+            # coalesced None to `{}` and leaked a phantom
+            # `{number: None, title: ""}` record into get_sprint_detail.
+            # Skip explicitly here, same as the wrapper-None guard above.
+            if issue is None:
+                continue
+            # Record iterated issue numbers IN OUR REPO so downstream
+            # callers can distinguish "walker reached this input and
+            # confirmed its absence" from "walker never reached this
+            # input." Round-5 #1 tracked numbers pre-repo-filter, but
+            # `still_attached_numbers` is post-repo-filter — a
+            # cross-repo same-number trivially satisfied "walked AND
+            # not still-attached" and got reported as `succeeded`
+            # under partial coverage. Round-6 #1 fixes that by
+            # repo-filtering walked_numbers too.
             walked_num = issue.get("number")
-            if isinstance(walked_num, int) and not isinstance(walked_num, bool):
+            if (
+                isinstance(walked_num, int)
+                and not isinstance(walked_num, bool)
+                and repos_match(issue.get("repository"), ctx.owner_repo)
+            ):
                 walked_numbers.add(walked_num)
             assignees = [
                 a.get("login")

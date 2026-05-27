@@ -1258,6 +1258,49 @@ class TestRemoveIssuesFromSprint:
             )
         assert "zh sprint show" in (out["response_anomaly"] or "")
 
+    def test_partial_walk_no_inflation_across_repos(self):
+        """Round-6 #1 SPEC pin: walker `walked_numbers` must be
+        repo-filtered, otherwise a cross-repo same-number issue
+        trivially satisfies "walked AND not still-attached" and gets
+        reported as `succeeded` under partial coverage.
+
+        Setup: walker bails after observing acme/gadgets#42 (sibling
+        repo). Our input is acme/widgets#42. Pre-fix logic:
+          - walked_numbers = {42}            (number-only, pre-fix)
+          - still_attached_numbers = {}      (repo-filtered, empty)
+          - succeeded = inputs ∩ walked - still_attached = {42}  ← WRONG
+        Round-6 fix repo-filters walked_numbers too:
+          - walked_numbers = {}              (no acme/widgets issues seen)
+          - succeeded = ∅                    ← correct
+        """
+        ctx = make_ctx()  # owner_repo="acme/widgets"
+        with patch_ctx_query(ctx, [
+            sprints_page([sprint_node("sprint-7", "Sprint 7")]),
+            issue_by_info_response(42),
+            remove_issues_from_sprints_response(empty_sprints=True),
+            # Walker page contains acme/gadgets#42 (sibling repo,
+            # same number), then bails on stuck cursor before any
+            # acme/widgets pages.
+            sprint_issues_page(
+                [sprint_issue_wrapper(42, owner="acme", repo="gadgets")],
+                has_next=True, end_cursor=None,
+            ),
+        ]):
+            out = zh_graphql_ops.remove_issues_from_sprint(
+                ctx, "Sprint 7", [42],
+            )
+        assert out["inspected_full"] is False
+        assert out["succeeded"] == [], (
+            "Round-6 #1: walked_numbers must be repo-filtered. "
+            "Pre-fix, cross-repo acme/gadgets#42 in walked_numbers "
+            "let our acme/widgets#42 input pass 'walked AND not "
+            "still-attached' and falsely report as removed."
+        )
+        # 42 isn't in walker output for our repo, so it's un-verified
+        assert out["failed"] == []
+        # un-verified count = 1 (our input wasn't reached in our repo)
+        assert "1 input(s) un-verified" in (out["response_anomaly"] or "")
+
 
 # =============================================================================
 # zh_api foundation: _GH_URL_RE

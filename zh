@@ -2905,8 +2905,18 @@ zh_sprint_issues_fetch_all() {
     #        a mutation can present a "mutation may have landed; post-
     #        state could not be confirmed" message instead of
     #        crashing mid-recovery. (Round-4 finding #1.)
+    #   $3 — owner_repo (optional). When supplied, `walked_nums` is
+    #        repo-filtered: only issue numbers belonging to this
+    #        owner/repo land in the emitted walked_nums array.
+    #        Mirrors the Python round-6 #1 fix — without this filter,
+    #        cross-repo same-number issues in a multi-repo sprint
+    #        trivially satisfied "walked AND not still-attached" and
+    #        inflated cmd_sprint_remove's confirmed-removal set.
+    #        Default unset = no repo filtering (back-compat for
+    #        cmd_sprint which doesn't need it). Round-6 #2.
     local sprint_id="$1"
     local soft_null="${2:-}"
+    local owner_repo_filter="${3:-}"
 
     # Pagination-warning sentinel, similar to soft-null. Empty by
     # default; set when the walk bails on stuck cursor / iteration
@@ -3010,14 +3020,36 @@ zh_sprint_issues_fetch_all() {
     # The mutation caller (`cmd_sprint_remove`) inspects the others
     # to decide whether to claim a confirmed success.
     #
-    # `walked_nums` is the pre-repo-filter list of issue numbers the
-    # walker actually iterated. Load-bearing for the round-5 #1/#2
-    # succeeded-inflation fix: cmd_sprint_remove uses
-    # `inputs ∩ walked_nums - still_attached` for `succeeded` instead
-    # of `inputs - still_attached`, so an input the walker never
-    # reached can't be falsely classified as removed.
+    # `walked_nums` is the list of issue numbers the walker iterated.
+    # Load-bearing for the round-5 #1/#2 succeeded-inflation fix:
+    # cmd_sprint_remove uses `inputs ∩ walked_nums - still_attached`
+    # for `succeeded` instead of `inputs - still_attached`, so an
+    # input the walker never reached can't be falsely classified as
+    # removed.
+    #
+    # Round-6 #2: when an owner_repo filter is supplied, restrict
+    # walked_nums to issues in that repo. A cross-repo same-number
+    # issue is "walked" but its absence from still_attached (which
+    # IS repo-filtered) doesn't mean OUR same-numbered issue was
+    # removed — they're different issues. Restricting walked_nums
+    # to our repo keeps the set comparable to still_attached.
     local walked_nums
-    walked_nums=$(echo "$all_nodes" | jq -c '[.[] | .issue.number | select(. != null)]')
+    if [[ -n "$owner_repo_filter" ]]; then
+        local owner_lc="${owner_repo_filter%%/*}"
+        local repo_lc="${owner_repo_filter##*/}"
+        walked_nums=$(echo "$all_nodes" | jq -c \
+            --arg owner "$owner_lc" \
+            --arg repo "$repo_lc" \
+            '[.[]
+              | select(
+                  ((.issue.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+                  and ((.issue.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
+                )
+              | .issue.number
+              | select(. != null)]')
+    else
+        walked_nums=$(echo "$all_nodes" | jq -c '[.[] | .issue.number | select(. != null)]')
+    fi
 
     jq -n \
         --argjson nodes "$all_nodes" \
@@ -3519,7 +3551,13 @@ Examples:
     # indication the mutation may have already taken effect.
     # (Round-4 #1.)
     local post_state
-    post_state=$(zh_sprint_issues_fetch_all "$sprint_id" "1")
+    # Pass owner_repo so the walker repo-filters `walked_nums` in
+    # the JSON output. Without this, a sibling-repo same-number
+    # issue lands in walked_nums but NOT in still_attached_nums_csv
+    # (which is already repo-filtered), so the SPEC's
+    # `succeeded = inputs ∩ walked - still_attached` would
+    # incorrectly classify the input as removed. Round-6 #2.
+    post_state=$(zh_sprint_issues_fetch_all "$sprint_id" "1" "$owner_repo")
 
     # Pull out the soft-fail sentinels the walker may have set.
     local null_node pagination_bailed
@@ -4540,8 +4578,8 @@ Example: zh subissue add 42 100 101"
     failed_nums_csv=$(echo "$response" | jq -r \
         '(.data.addSubIssues.failedIssues // []) | map("#" + (.number|tostring)) | join(",")')
 
-    # Input children minus failed children = added children. We compute this
-    # in shell rather than asking the API because addSubIssues only returns
+    # Input children minus failed children = inferred-added children.
+    # Compute it in shell because addSubIssues only returns
     # failedIssues (not the inverse).
     local added_nums_csv_parts=""
     for raw_num in ${child_nums[@]+"${child_nums[@]}"}; do
@@ -4555,15 +4593,33 @@ Example: zh subissue add 42 100 101"
     done
     added_nums_csv="${added_nums_csv_parts%,}"
 
-    # Pretty form for human output — same CSVs with a ", " join. Keep these
-    # strictly separate from the RESULT-line CSVs (no space) above.
+    # Round-6 #4 — divergence guard. The Python side
+    # (zh_graphql_ops.add_sub_issues) refuses to identify which inputs
+    # succeeded when `success_count != (total_inputs - failed_count)`.
+    # Pre-fix bash printed "Added 1 sub-issue(s) to #42: #100, #101,
+    # #102" — claiming all three landed because none appeared in
+    # failedIssues. SPEC: when the count diverges, do NOT name the
+    # inferred-added children; tell the user to re-list.
+    local total_inputs="${#child_nums[@]}"
+    local inferred_added_count=$((total_inputs - failed_count))
+    local divergence=false
+    if [[ "$success_count" != "$inferred_added_count" ]]; then
+        divergence=true
+    fi
+
+    # Pretty form for human output. `added_nums_pretty` is suppressed
+    # under divergence so we don't lie about which inputs landed.
     local failed_nums_pretty added_nums_pretty
     failed_nums_pretty="${failed_nums_csv//,/, }"
     added_nums_pretty="${added_nums_csv//,/, }"
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Added ${success_count} sub-issue(s) to #${stripped_parent}: ${added_nums_pretty}"
+        if [[ "$divergence" == "true" ]]; then
+            warn "Added ${success_count}/${total_inputs} sub-issue(s) to #${stripped_parent} (cannot identify which — re-run 'zh subissue list ${stripped_parent}' to verify)"
+        else
+            success "Added ${success_count} sub-issue(s) to #${stripped_parent}: ${added_nums_pretty}"
+        fi
     fi
     if [[ "$failed_count" -gt 0 ]]; then
         warn "${failed_count} failed: ${failed_nums_pretty}"
@@ -4584,8 +4640,8 @@ Example: zh subissue add 42 100 101"
     # and reads successCount / failedIssues from the JSON response.
     #
     # We still classify the outcome here for the exit-code contract that
-    # scripted callers (humans + CI) rely on: any non-"ok" outcome exits
-    # non-zero so `set -e` flags it.
+    # scripted callers (humans + CI) rely on. Precedence (round-5 #5):
+    # real failure > coverage/divergence warning > success.
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -4593,6 +4649,10 @@ Example: zh subissue add 42 100 101"
         outcome="fail"
     elif [[ "$success_count" -eq 0 ]]; then
         outcome="noop"
+    elif [[ "$divergence" == "true" ]]; then
+        # Round-6 #4: signal must match data. ok→partial when we
+        # can't identify which inputs landed.
+        outcome="partial"
     else
         outcome="ok"
     fi
@@ -4784,13 +4844,27 @@ parent relationship before retrying."
     done
     removed_nums_csv="${removed_nums_csv_parts%,}"
 
+    # Round-6 #4 mirror — divergence guard. See cmd_subissue_add for
+    # the full rationale; SPEC: when count disagrees with inferred
+    # set, do NOT name the inferred-removed children.
+    local total_inputs="${#child_nums[@]}"
+    local inferred_removed_count=$((total_inputs - failed_count))
+    local divergence=false
+    if [[ "$success_count" != "$inferred_removed_count" ]]; then
+        divergence=true
+    fi
+
     local failed_nums_pretty removed_nums_pretty
     failed_nums_pretty="${failed_nums_csv//,/, }"
     removed_nums_pretty="${removed_nums_csv//,/, }"
 
     echo ""
     if [[ "$success_count" -gt 0 ]]; then
-        success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${removed_nums_pretty}"
+        if [[ "$divergence" == "true" ]]; then
+            warn "Removed ${success_count}/${total_inputs} sub-issue(s) from #${stripped_parent} (cannot identify which — re-run 'zh subissue list ${stripped_parent}' to verify)"
+        else
+            success "Removed ${success_count} sub-issue(s) from #${stripped_parent}: ${removed_nums_pretty}"
+        fi
     fi
     if [[ "$failed_count" -gt 0 ]]; then
         warn "${failed_count} failed: ${failed_nums_pretty}"
@@ -4813,7 +4887,7 @@ state with 'zh subissue list ${stripped_parent}'."
     # v1.6.0 removed the `RESULT:remove` machine-summary line. The sole
     # consumer (the MCP server) now reads successCount / failedIssues
     # directly from the GraphQL response. Exit-code contract preserved
-    # for scripted callers.
+    # for scripted callers. Round-6 #4: divergence forces partial.
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -4821,6 +4895,8 @@ state with 'zh subissue list ${stripped_parent}'."
         outcome="fail"
     elif [[ "$success_count" -eq 0 ]]; then
         outcome="noop"
+    elif [[ "$divergence" == "true" ]]; then
+        outcome="partial"
     else
         outcome="ok"
     fi

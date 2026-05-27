@@ -795,6 +795,19 @@ def test_add_sub_issues_succeeded_divergence_returns_empty_succeeded():
     assert out["succeeded"] == []
     assert out["partial_success_warning"] is not None
     assert "successCount=1" in out["partial_success_warning"]
+    # Round-6 #3: round-5 fixed the data (succeeded=[]) but left the
+    # signal stale. SPEC: when partial_success_warning is set AND
+    # the API said it succeeded, `ok` and `outcome` must agree with
+    # the data — outcome="partial", ok=False.
+    assert out["outcome"] == "partial", (
+        "Round-6 #3: divergence guard fires → outcome must downgrade "
+        "to 'partial', not the API's success_count-derived 'ok'."
+    )
+    assert out["ok"] is False, (
+        "Round-6 #3: ok must agree with `succeeded == []` — it makes "
+        "no sense to report ok=True alongside a warning that we "
+        "couldn't identify what succeeded."
+    )
 
 
 def test_remove_sub_issues_succeeded_divergence_returns_empty_succeeded():
@@ -824,6 +837,9 @@ def test_remove_sub_issues_succeeded_divergence_returns_empty_succeeded():
         out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101])
     assert out["succeeded"] == []
     assert out["partial_success_warning"] is not None
+    # Round-6 #3 mirror — same signal-must-match-data SPEC on remove.
+    assert out["outcome"] == "partial"
+    assert out["ok"] is False
 
 
 def test_add_sub_issues_full_success_when_count_matches():
