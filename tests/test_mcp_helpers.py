@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 import mcp_server
 
 
@@ -78,14 +80,22 @@ def test_default_venv_dir_resolves_relative_xdg(monkeypatch, tmp_path):
 
 def _make_fake_venv(
     base: Path, *, with_python: bool, with_cfg: bool,
-    marker_value: str | None,
+    marker_value: str | None, python_exits: int = 1,
 ) -> Path:
     """Scaffold a synthetic venv-shaped tree without actually running
-    `python -m venv`. Useful for exercising the file-existence checks."""
+    `python -m venv`. Useful for exercising the file-existence checks.
+
+    `python_exits` controls the fake `bin/python3` stub's exit code.
+    Default is 1 (probe FAILS) — so invalid-path tests that never reach
+    the probe stay correct, AND any future happy-path test that wants
+    to exercise probe success has to opt in by passing `python_exits=0`
+    explicitly. Prevents a footgun where a future test silently false-
+    positives because POSIX `sh` runs `exit 0` and ignores `-c <probe>`.
+    """
     (base / "bin").mkdir(parents=True, exist_ok=True)
     if with_python:
         py = base / "bin" / "python3"
-        py.write_text("#!/bin/sh\nexit 0\n")
+        py.write_text(f"#!/bin/sh\nexit {python_exits}\n")
         py.chmod(0o755)
     if with_cfg:
         (base / "pyvenv.cfg").write_text("home = /fake\nversion = 3.11.0\n")
@@ -473,3 +483,173 @@ def test_default_venv_dir_warns_on_whitespace_zh_mcp_venv(monkeypatch, capsys, t
     mcp_server._default_venv_dir()
     err = capsys.readouterr().err
     assert "ZH_MCP_VENV" in err
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 — HOME unset detection (item 6)
+# -----------------------------------------------------------------------------
+
+
+def test_default_venv_dir_raises_when_home_unresolvable(monkeypatch):
+    # macOS / Linux's expanduser falls back to pwd.getpwuid when HOME
+    # is unset, so unsetting alone isn't sufficient to trigger the
+    # detection. Pin the failure mode by pointing XDG_DATA_HOME at a
+    # `~unknown-user-XXX` form that genuinely can't be resolved: per
+    # POSIX, expanduser returns it unchanged, and our detection
+    # catches the leading `~` and raises.
+    monkeypatch.delenv("ZH_MCP_VENV", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", "~no-such-user-zh-test/foo")
+    with pytest.raises(RuntimeError, match="cannot resolve home directory"):
+        mcp_server._default_venv_dir()
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 — Build sentinel acceptance (item 1)
+# Sentinel-only dirs are recognized by _looks_like_zh_venv as ours,
+# enabling self-recovery from a crashed mid-build.
+# -----------------------------------------------------------------------------
+
+
+def test_looks_like_zh_venv_accepts_sentinel_only_dir(tmp_path):
+    # A previous _build_venv crashed after writing the sentinel but
+    # before the marker. The dir has the sentinel + partial venv
+    # contents but NO marker. _looks_like_zh_venv must accept it so
+    # the next launch can clean up and rebuild.
+    (tmp_path / mcp_server._BUILD_SENTINEL).write_text("deps_hash=x\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python3").touch(mode=0o755)
+    (tmp_path / "lib").mkdir()  # partial install detritus
+    assert mcp_server._looks_like_zh_venv(tmp_path)
+
+
+def test_looks_like_zh_venv_still_refuses_foreign_venv_with_no_sentinel(tmp_path):
+    # Foreign venv with pyvenv.cfg but no marker and no sentinel — must
+    # still be refused (item 1 from round-2 must not regress).
+    (tmp_path / "pyvenv.cfg").write_text("home = /fake\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python3").touch(mode=0o755)
+    assert not mcp_server._looks_like_zh_venv(tmp_path)
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 — _ensure_safe_parent (items 3 + 4)
+# -----------------------------------------------------------------------------
+
+
+def test_ensure_safe_parent_accepts_existing_dir(tmp_path):
+    # Parent already exists as a directory — proceed silently.
+    parent = tmp_path / "existing"
+    parent.mkdir()
+    venv_dir = parent / "venv"
+    mcp_server._ensure_safe_parent(venv_dir)  # no raise
+
+
+def test_ensure_safe_parent_creates_one_level(tmp_path):
+    # Grandparent (tmp_path) exists, parent doesn't — create ONE level.
+    venv_dir = tmp_path / "zh" / "venv"
+    mcp_server._ensure_safe_parent(venv_dir)
+    assert (tmp_path / "zh").is_dir()
+
+
+def test_ensure_safe_parent_refuses_deep_ancestor_creation(tmp_path):
+    # Both grandparent AND parent are missing — refuse rather than
+    # auto-create arbitrary tree (typo'd ZH_MCP_VENV protection).
+    venv_dir = tmp_path / "deep" / "nested" / "tree"
+    with pytest.raises(RuntimeError, match="ancestor"):
+        mcp_server._ensure_safe_parent(venv_dir)
+    assert not (tmp_path / "deep").exists()  # nothing was created
+
+
+def test_ensure_safe_parent_refuses_regular_file_parent(tmp_path):
+    # User typo'd ZH_MCP_VENV to point at a file's child path
+    # (e.g. ZH_MCP_VENV=~/.bashrc/foo). `mkdir(exist_ok=True)` would
+    # raise an unhelpful FileExistsError; we raise a clear message.
+    parent_file = tmp_path / "stray-file"
+    parent_file.write_text("not a directory")
+    venv_dir = parent_file / "venv"
+    with pytest.raises(RuntimeError, match="is not a directory"):
+        mcp_server._ensure_safe_parent(venv_dir)
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 — _safe_rmtree (item 5)
+# -----------------------------------------------------------------------------
+
+
+def test_safe_rmtree_unlinks_symlinks_without_following(tmp_path):
+    # _safe_rmtree on a symlink-to-dir must remove the LINK, not
+    # recursively destroy the target (which is some user's real venv).
+    target = tmp_path / "real-venv"
+    target.mkdir()
+    (target / "important.txt").write_text("don't delete me")
+    link = tmp_path / "link-to-venv"
+    link.symlink_to(target)
+    mcp_server._safe_rmtree(link)
+    assert not link.exists()
+    assert target.is_dir()
+    assert (target / "important.txt").read_text() == "don't delete me"
+
+
+def test_safe_rmtree_removes_normal_directory(tmp_path):
+    # Sanity: ordinary recursive delete still works.
+    d = tmp_path / "venv"
+    d.mkdir()
+    (d / "a.txt").write_text("a")
+    (d / "sub").mkdir()
+    (d / "sub" / "b.txt").write_text("b")
+    mcp_server._safe_rmtree(d)
+    assert not d.exists()
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 — Probe split (item 8)
+# Per-launch probe stays light; full probe (post-build) lists every dep.
+# -----------------------------------------------------------------------------
+
+
+def test_per_launch_probe_imports_only_mcp():
+    # Per-launch probe stays at ~1s by importing only `mcp`. The
+    # heavyweight torch / transformers import is reserved for the
+    # post-build full probe.
+    assert mcp_server._venv_per_launch_probe() == "import mcp"
+
+
+def test_full_probe_imports_every_dep():
+    probe = mcp_server._venv_full_probe()
+    assert "import mcp" in probe
+    assert "import sentence_transformers" in probe
+    assert "import numpy" in probe
+
+
+def test_full_probe_recomputes_from_venv_deps(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_VENV_DEPS", ("mcp", "numpy"))
+    probe = mcp_server._venv_full_probe()
+    assert probe == "import mcp; import numpy"
+
+
+# -----------------------------------------------------------------------------
+# v1.7.0 — _venv_build_lock (item 2)
+# Smoke test: lock is acquired + released, no exceptions, lock file exists.
+# Actual concurrency contention testing would need subprocess + fcntl
+# coordination — out of scope for unit tests.
+# -----------------------------------------------------------------------------
+
+
+def test_venv_build_lock_acquires_and_releases(tmp_path):
+    venv_dir = tmp_path / "zh-venv"
+    lock_path = venv_dir.parent / mcp_server._BOOTSTRAP_LOCK
+    with mcp_server._venv_build_lock(venv_dir):
+        # Lock file exists during the with-block.
+        assert lock_path.exists()
+    # After release, the lock file remains (we don't clean it up — that
+    # matches the documented "lockfile-as-persistent-coordinator" pattern).
+    assert lock_path.exists()
+
+
+def test_venv_build_lock_creates_parent_dir(tmp_path):
+    # Even when the parent doesn't exist yet, the lock context creates
+    # it so subsequent acquisitions don't fail.
+    venv_dir = tmp_path / "new-parent" / "venv"
+    assert not venv_dir.parent.exists()
+    with mcp_server._venv_build_lock(venv_dir):
+        assert venv_dir.parent.is_dir()
