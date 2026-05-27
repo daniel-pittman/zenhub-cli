@@ -1298,15 +1298,23 @@ def _walk_sprint_issues(
 
     Returns (issue_dicts, walked_numbers, pagination_warning).
 
-    * `issue_dicts` — repo-filtered, fully-decoded issue records used
-      by `get_sprint_detail`'s `issues` list.
-    * `walked_numbers` — every issue number the walker iterated, PRE-
-      REPO-FILTER. Load-bearing for the round-5 #1 succeeded-
-      inflation fix: `remove_issues_from_sprint` needs to know
-      which inputs the walker actually saw, separately from which
-      ones are in our repo, so partial-coverage classification can
-      distinguish "walker observed it absent" from "walker never
-      reached it."
+    * `issue_dicts` — UNFILTERED fully-decoded issue records, used
+      by `get_sprint_detail`'s `issues` list. Multi-repo sprints
+      surface issues from every repo; consumers that need a
+      repo-specific view filter downstream (e.g.
+      `remove_issues_from_sprint` builds `still_attached_numbers`
+      via `repos_match` against the ctx repo).
+    * `walked_numbers` — POST-REPO-FILTER set of issue numbers
+      the walker iterated AND whose `.repository` matches
+      `ctx.owner_repo` (case-insensitive via `repos_match`).
+      Round-5 #1 introduced this set pre-repo-filter; round-6 #1
+      moved the filter inside the walker because the downstream
+      consumer's `still_attached_numbers` is already post-repo-
+      filter. With both sets in the same coordinate space,
+      `remove_issues_from_sprint` can compute
+      `inputs ∩ walked_numbers - still_attached_numbers` to
+      classify "walker confirmed this input's absence" without
+      a cross-repo same-number false positive.
     * `pagination_warning` — set when the walk bailed defensively
       (stuck cursor or iteration cap).
 

@@ -3693,14 +3693,30 @@ Examples:
            | .issue.number
          ] | map(tostring) | join(",")')
 
-    # `walked_nums_csv` — pre-repo-filter list of issue numbers the
-    # walker iterated. Load-bearing for round-5 #2: when the walker
-    # bails mid-flight, an input the walker didn't reach is NOT in
-    # `walked_nums`, so it can't be classified as succeeded (which
-    # would inflate the count and lie to the user). Honest SPEC
-    # mirrors the Python side (zh_graphql_ops round-5 #1).
+    # `walked_nums_csv` — list of issue numbers the walker iterated,
+    # already POST-REPO-FILTER because `cmd_sprint_remove` invoked
+    # `zh_sprint_issues_fetch_all "$sprint_id" "1" "$owner_repo"` —
+    # the third arg made the walker repo-filter `walked_nums` before
+    # emitting it. Load-bearing for round-5 #2 / round-6 #2: when
+    # the walker bails mid-flight, an input the walker didn't reach
+    # in OUR repo is NOT in `walked_nums`, so it can't be classified
+    # as succeeded (which would inflate the count and lie to the
+    # user). Honest SPEC mirrors the Python side (zh_graphql_ops
+    # round-6 #1: post-repo-filter walked_numbers).
+    #
+    # Round-7 #6: drop the legacy `// [.nodes[].issue.number]`
+    # fallback. That fallback was pre-repo-filter and would
+    # re-introduce round-6 #2 silently if the walker ever stopped
+    # emitting `walked_nums`. The walker always emits it; treat its
+    # absence as a structural bug rather than masking it. Read-only
+    # callers of the walker (`cmd_sprint`) don't compute
+    # `walked_nums_csv` at all, so the fallback was dead in
+    # practice.
     local walked_nums_csv
-    walked_nums_csv=$(echo "$post_state" | jq -r '(.walked_nums // [.nodes[].issue.number]) | map(tostring) | join(",")')
+    walked_nums_csv=$(echo "$post_state" | jq -r 'if .walked_nums then (.walked_nums | map(tostring) | join(",")) else null end')
+    if [[ "$walked_nums_csv" == "null" ]]; then
+        error "Walker output is missing the 'walked_nums' field — internal bug. Re-run; if it persists, report it."
+    fi
 
     local input_nums_csv
     input_nums_csv=$(echo "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)

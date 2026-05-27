@@ -1299,6 +1299,15 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             succeeded: list[int] — children the API actually linked
             failed: list[dict] — each {number, owner, name}
             github_errors: dict | None
+            partial_success_warning: str | None — set when the API's
+                successCount diverges from the inferred succeeded
+                set (success=N succeeded, failed=[F], inputs=I, but
+                N != I-len(F)). In that case `succeeded` is empty
+                because we can't identify which inputs landed and
+                `outcome` is downgraded to "partial" (except when
+                outcome was already "noop" or "fail" — those keep
+                their stronger semantics). Callers should re-list
+                the parent's children to determine actual state.
             stderr: str
     """
     if not child_numbers:
@@ -1383,6 +1392,14 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             succeeded: list[int]
             failed: list[dict]
             github_errors: dict | None
+            partial_success_warning: str | None — set when the API's
+                successCount diverges from the inferred succeeded
+                set; succeeded list will be empty in that case.
+                `outcome` is downgraded to "partial" only when it
+                would otherwise have been "ok" (i.e. `noop` and
+                `fail` keep their stronger semantics — round-7 #1).
+                Callers should re-list the parent's children to
+                determine actual state.
             stderr: str
     """
     if not child_numbers:
