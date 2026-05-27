@@ -11,7 +11,8 @@ Architecture:
   - Sentence embeddings via sentence-transformers (all-MiniLM-L6-v2,
     384-dim, ~80MB on disk, ~30s cold start, ~10ms per query)
   - Per-repo pickled cache at ~/.config/zh/index/<owner_repo>.pkl
-    (durable across reboots — model + index outlive /tmp/zhenv)
+    (durable across reboots — model + index outlive any rebuild of the
+    MCP venv)
   - Delta sync on every query via GitHub's
     `GET /repos/{owner}/{repo}/issues?since=<ISO8601>` filter
     (only re-embeds issues whose title/body/state actually changed)

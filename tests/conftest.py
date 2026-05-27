@@ -5,9 +5,10 @@ files at the repo root rather than in an installed package. Adding the
 repo root to sys.path here means `import zh_api` works in every test.
 
 We also set `ZH_MCP_SKIP_BOOTSTRAP=1` before any test module imports
-`mcp_server`. The MCP server's normal import path builds a venv at
-`/tmp/zhenv` and `os.execv`s into it — which would mid-flight replace
-the pytest process. The sentinel keeps the bootstrap dormant and
+`mcp_server`. The MCP server's normal import path validates (and
+builds, if missing or broken) a venv under `$XDG_DATA_HOME/zh/venv`
+and then `os.execv`s into it — which would mid-flight replace the
+pytest process. The sentinel keeps the bootstrap dormant and
 substitutes a no-op `FastMCP` stub so tests can exercise the tool
 functions' guards and result shapes without pulling in mcp / torch /
 transformers / numpy.

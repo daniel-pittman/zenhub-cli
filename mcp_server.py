@@ -22,9 +22,10 @@ from its working directory. If omitted, falls back to:
 Run as a subprocess (stdio transport):
     /usr/bin/python3 mcp_server.py
 
-The script self-bootstraps /tmp/zhenv (mcp package) on first run and on
-reboot when /tmp is wiped, then re-execs under that venv. Any python3 on PATH
-that can run `python3 -m venv` works as the launcher.
+The script self-bootstraps a durable venv under XDG_DATA_HOME (default
+`~/.local/share/zh/venv`) on first run, validates it on every launch, and
+re-execs under that venv. Any python3 on PATH that can run `python3 -m venv`
+works as the launcher.
 
 Register user-scope so every Claude Code session sees it:
     claude mcp add --scope user zenhub \\
@@ -35,35 +36,104 @@ Environment overrides:
   ZH_DEFAULT_REPO_PATH — default git-checkout dir to run zh from
                          (otherwise uses MCP server cwd at launch)
   ZH_BIN_PATH          — path to zh bash script (default: peer to this file)
+  ZH_MCP_VENV          — full path of the venv directory to use; overrides
+                         the XDG_DATA_HOME-derived default. Useful for
+                         pinning to a project-local venv during development.
+  XDG_DATA_HOME        — standard XDG override for the data root; the venv
+                         is created at `$XDG_DATA_HOME/zh/venv`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 # -----------------------------------------------------------------------------
-# Self-bootstrap: /tmp gets wiped on reboot. If our venv is missing, build it
-# with stdlib-only code and re-exec under it. Must run before any third-party
-# import (mcp).
+# Self-bootstrap: build (or rebuild, if broken / stale) a durable venv under
+# XDG_DATA_HOME, validate it, and re-exec under it. Must run before any
+# third-party import (mcp).
 # -----------------------------------------------------------------------------
 
-_VENV_DIR = Path("/tmp/zhenv")
+
+def _default_venv_dir() -> Path:
+    """Compute the default venv location.
+
+    Priority:
+      1. ZH_MCP_VENV environment variable (full path).
+      2. $XDG_DATA_HOME/zh/venv (standard XDG; defaults to
+         ~/.local/share/zh/venv when XDG_DATA_HOME is unset).
+    """
+    override = os.environ.get("ZH_MCP_VENV")
+    if override:
+        return Path(override).expanduser()
+    xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share"
+    )
+    return Path(xdg_data) / "zh" / "venv"
+
+
+_VENV_DIR = _default_venv_dir()
 _VENV_PY = _VENV_DIR / "bin" / "python3"
 _VENV_DEPS = (
     "mcp",
     # similarity search: sentence-transformers brings in torch + transformers
     # + huggingface_hub. The model weights themselves are cached under
-    # ~/.cache/huggingface/ so they survive reboots even when /tmp/zhenv
-    # is wiped.
+    # ~/.cache/huggingface/ so they survive even if the venv is rebuilt.
     "sentence-transformers",
     "numpy",
 )
 _VENV_MIN_PY = (3, 10)  # mcp package requires >= 3.10
+_VENV_MARKER = ".zh-deps-hash"  # records the _VENV_DEPS hash this venv was built for
+
+
+def _deps_hash() -> str:
+    """Stable hash of _VENV_DEPS — used to detect dep changes between launches.
+
+    A 16-char SHA-256 prefix is plenty: collisions don't matter for a
+    cache-invalidation token that's only compared against itself.
+    """
+    return hashlib.sha256("|".join(_VENV_DEPS).encode()).hexdigest()[:16]
+
+
+def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
+    """Return True iff `venv_dir` is a working venv built for `deps_hash`.
+
+    Catches all the failure modes that have happened in practice:
+      - bin/python missing (venv never built, or partial wipe)
+      - pyvenv.cfg missing (venv structure incomplete — Python won't add
+        the venv's site-packages to sys.path, so installed wheels are
+        unreachable)
+      - deps-hash marker missing or mismatched (deps tuple changed since
+        the venv was built — needs reinstall)
+      - `import mcp` fails under the venv's python (interpreter or
+        site-packages broken, e.g. pyenv updated underneath us)
+
+    `venv_dir` and `deps_hash` are arguments (not module globals) so this
+    function is unit-testable with synthetic temp-dir fixtures.
+    """
+    venv_py = venv_dir / "bin" / "python3"
+    if not venv_py.exists():
+        return False
+    if not (venv_dir / "pyvenv.cfg").exists():
+        return False
+    marker = venv_dir / _VENV_MARKER
+    if not marker.exists() or marker.read_text().strip() != deps_hash:
+        return False
+    try:
+        subprocess.check_call(
+            [str(venv_py), "-c", "import mcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    return True
 
 
 def _find_builder_python() -> str:
@@ -72,7 +142,6 @@ def _find_builder_python() -> str:
     Prefer the interpreter that invoked us; fall back to common Homebrew /
     pyenv locations. Skips anything below `_VENV_MIN_PY`.
     """
-    import shutil
     if sys.version_info >= _VENV_MIN_PY:
         return sys.executable
     candidates = [
@@ -108,23 +177,60 @@ def _find_builder_python() -> str:
     )
 
 
-def _bootstrap_venv() -> None:
-    if not _VENV_PY.exists():
-        builder = _find_builder_python()
-        # Log to stderr so MCP stdio transport isn't corrupted.
+def _build_venv(venv_dir: Path, deps_hash: str) -> None:
+    """Tear down (if present) and rebuild the venv at `venv_dir`.
+
+    On exit the venv has `_VENV_DEPS` installed and the deps-hash marker
+    file written. Sanity-checks that `import mcp` works before returning
+    — a broken build is a hard error, not a silent half-state we'd then
+    re-exec into.
+    """
+    builder = _find_builder_python()
+    venv_py = venv_dir / "bin" / "python3"
+    if venv_dir.exists():
         print(
-            f"[zenhub-mcp] bootstrapping {_VENV_DIR} with {builder}",
+            f"[zenhub-mcp] rebuilding {venv_dir} "
+            f"(missing/broken or _VENV_DEPS changed)",
             file=sys.stderr,
         )
-        subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
-        subprocess.check_call(
-            [str(_VENV_PY), "-m", "pip", "install",
-             "--quiet", "--no-cache-dir", "--upgrade", "pip"]
+        shutil.rmtree(venv_dir)
+    else:
+        print(
+            f"[zenhub-mcp] bootstrapping {venv_dir} with {builder}",
+            file=sys.stderr,
         )
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.check_call([builder, "-m", "venv", str(venv_dir)])
+    subprocess.check_call(
+        [str(venv_py), "-m", "pip", "install",
+         "--quiet", "--no-cache-dir", "--upgrade", "pip"]
+    )
+    subprocess.check_call(
+        [str(venv_py), "-m", "pip", "install",
+         "--quiet", "--no-cache-dir", *_VENV_DEPS]
+    )
+    (venv_dir / _VENV_MARKER).write_text(deps_hash)
+    # Post-build sanity check. If this fails, the venv build produced
+    # something that can't import its declared deps — fail loudly here
+    # rather than re-exec into a broken interpreter.
+    try:
         subprocess.check_call(
-            [str(_VENV_PY), "-m", "pip", "install",
-             "--quiet", "--no-cache-dir", *_VENV_DEPS]
+            [str(venv_py), "-c", "import mcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
+            f"`import mcp`. Delete {venv_dir} and retry; check your "
+            f"network and Python installation."
+        ) from exc
+
+
+def _bootstrap_venv() -> None:
+    deps_hash = _deps_hash()
+    if not _venv_is_valid(_VENV_DIR, deps_hash):
+        _build_venv(_VENV_DIR, deps_hash)
     if os.path.realpath(sys.executable) != os.path.realpath(str(_VENV_PY)):
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
 
@@ -327,6 +433,47 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
     return issues
 
 
+def _parse_mine_listing(plain: str) -> list[dict]:
+    """Parse `zh mine` output into list of {number, repo, pipeline, title}.
+
+    `zh mine` uses a different per-issue shape than `zh pipeline`: three
+    fields (`#N │ owner/repo │ pipeline`) instead of four (`#N │ repo │
+    N pts │ assignee`), because the assignee is implied by the command
+    and the pipeline is the differentiating field. Separate parser keeps
+    each regex specific rather than gluing both shapes into one
+    branchier pattern.
+    """
+    issues: list[dict] = []
+    lines = plain.splitlines()
+    i = 0
+    while i < len(lines):
+        m = re.match(
+            r"^\s*#(\d+)\s*│\s*(\S+/\S+)\s*│\s*(.+?)\s*$",
+            lines[i],
+        )
+        if m:
+            number = int(m.group(1))
+            repo = m.group(2)
+            pipeline = m.group(3).strip()
+            # Title is the next non-empty, non-arrow-URL line.
+            title = ""
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("#"):
+                stripped = lines[j].strip()
+                if stripped and not stripped.startswith("→"):
+                    title = stripped
+                    break
+                j += 1
+            issues.append({
+                "number": number,
+                "repo": repo,
+                "pipeline": pipeline,
+                "title": title,
+            })
+        i += 1
+    return issues
+
+
 # Sub-issue helpers moved to zh_graphql_ops.py — the MCP server now talks
 # directly to ZenHub's GraphQL API for the sub-issue family of tools
 # (list / add / remove / reorder). The bash text contract used in v1.5.0
@@ -460,7 +607,11 @@ def mine(user: str = "", repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, issues (parsed listing), raw, stderr.
+        dict with:
+            ok: bool
+            issues: list of {number, repo, pipeline, title}
+            raw: full stdout for display
+            stderr: any error output
     """
     args = ["mine"]
     if user:
@@ -468,7 +619,7 @@ def mine(user: str = "", repo_path: str = "") -> dict:
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     return {
         "ok": r["ok"],
-        "issues": _parse_pipeline_listing(r["stdout_plain"]) if r["ok"] else [],
+        "issues": _parse_mine_listing(r["stdout_plain"]) if r["ok"] else [],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }

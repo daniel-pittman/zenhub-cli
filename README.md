@@ -687,9 +687,15 @@ claude mcp add --scope user zenhub \
     /usr/bin/python3 \
     /absolute/path/to/zenhub-cli/mcp_server.py
 
-# 3. On first invocation, the server self-bootstraps a venv at /tmp/zhenv
-#    and installs the `mcp` package there. /tmp is wiped on reboot, so the
-#    server will re-bootstrap automatically next time it's launched.
+# 3. On first invocation, the server self-bootstraps a durable venv at
+#    $XDG_DATA_HOME/zh/venv (default: ~/.local/share/zh/venv) and installs
+#    mcp + sentence-transformers + numpy into it. Subsequent launches
+#    validate the venv (pyvenv.cfg present, `import mcp` works, deps-hash
+#    matches the current dependency tuple); if any check fails, the venv
+#    is rebuilt automatically.
+#
+#    To force a clean rebuild: `rm -rf ~/.local/share/zh/venv` and relaunch
+#    the MCP server.
 
 # 4. Verify:
 claude mcp list
@@ -712,12 +718,14 @@ For multi-project use, the typical pattern is to pass `repo_path` explicitly on 
 |---|---|
 | `ZH_DEFAULT_REPO_PATH` | Default git checkout directory to run `zh` from when `repo_path` arg is omitted. |
 | `ZH_BIN_PATH` | Path to the `zh` bash script (default: peer to `mcp_server.py`). Useful if you want to test against an alternate `zh` build. |
+| `ZH_MCP_VENV` | Full path of the venv the MCP server bootstraps and re-execs into. Overrides the default location. Useful for pinning to a project-local venv during development. |
+| `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/zh/venv` (default `~/.local/share/zh/venv`). |
 
 ### Requirements
 
 - Python 3.10+ available on PATH (the server probes common locations: PATH default, Homebrew, pyenv shims, system Python).
 - All the same requirements as `zh` itself (authenticated `gh` CLI, `ZH_TOKEN` configured, `jq`, `curl`).
-- For the similarity-search tools: ~500MB of disk space the first time it runs — `sentence-transformers` installs `torch` + `transformers` into the venv (~400MB) and the embedding model itself caches under `~/.cache/huggingface/` (~80MB).
+- For the similarity-search tools: ~500MB of disk space the first time it runs — `sentence-transformers` installs `torch` + `transformers` into the MCP venv (~400MB) and the embedding model itself caches under `~/.cache/huggingface/` (~80MB).
 
 ### Optional: install the bundled `zenhub` agent for delegated use
 
