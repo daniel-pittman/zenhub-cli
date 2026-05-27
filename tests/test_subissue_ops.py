@@ -1136,6 +1136,7 @@ def test_subissue_add_count_conservation_under_fail_divergence():
     assert out["succeeded"] == []
     assert [f["number"] for f in out["failed"]] == [100]
     # 101 and 102 are unaccounted — neither succeeded nor in failedIssues.
+    # Order preserved from inputs (round-10 #14).
     assert out["unaccounted"] == [101, 102]
     # Conservation invariant.
     assert (
@@ -1214,47 +1215,70 @@ def test_subissue_add_unaccounted_empty_on_trusted_path():
 # =============================================================================
 
 def test_subissue_add_pre_flight_result_shape_complete():
-    """Round-8 #4: every pre-flight return site MUST include the full
-    documented result shape — `unaccounted` and `partial_success_warning`
-    cannot be missing or callers reading those keys will KeyError.
+    """Round-8 #4 / Round-10 Pattern A: every pre-flight return site
+    MUST include the full documented result shape — `unaccounted`,
+    `failed_unknown_count`, and `partial_success_warning` cannot be
+    missing or callers reading those keys will KeyError. Uses
+    multi-input fixtures so the conservation invariant
+    `len(succeeded) + len(failed) + len(unaccounted) == len(inputs)`
+    is meaningfully exercised on pre-flight bails.
     """
     ctx = _ctx()
-    # Parent not found — the first pre-flight return site.
+    # Parent not found — nothing was attempted, every input is
+    # unaccounted (Round-10 Pattern A).
     responses = [
         {"data": {"issueByInfo": None}},
     ]
     with _patch_ctx_query(ctx, responses):
-        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100])
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101, 102])
     # All keys present.
     for k in (
         "ok", "parent_number", "outcome", "success_count", "failed_count",
-        "succeeded", "failed", "unaccounted", "github_errors",
-        "partial_success_warning", "error",
+        "succeeded", "failed", "unaccounted", "failed_unknown_count",
+        "github_errors", "partial_success_warning", "error",
     ):
         assert k in out, f"pre-flight (parent-not-found) missing key {k!r}"
-    assert out["unaccounted"] == []
+    # Round-10: parent-not-found means NOTHING was attempted.
+    assert out["unaccounted"] == [100, 101, 102]
     assert out["partial_success_warning"] is None
+    assert out["failed_unknown_count"] == 0
+    # Conservation invariant.
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
 
-    # Child not found — the second pre-flight return site.
+    # Child not found — the second pre-flight return site. Mix of
+    # found and not-found inputs so unaccounted is non-trivial.
     ctx2 = _ctx()
     responses = [
         _issue_by_info(42),
-        {"data": {"issueByInfo": None}},  # child 100 lookup misses
+        _issue_by_info(100),                # found
+        {"data": {"issueByInfo": None}},    # 101 lookup misses
+        _issue_by_info(102),                # found
     ]
     with _patch_ctx_query(ctx2, responses):
-        out2 = zh_graphql_ops.add_sub_issues(ctx2, 42, [100])
+        out2 = zh_graphql_ops.add_sub_issues(ctx2, 42, [100, 101, 102])
     for k in (
-        "unaccounted", "partial_success_warning",
+        "unaccounted", "partial_success_warning", "failed_unknown_count",
     ):
         assert k in out2, f"pre-flight (child-not-found) missing key {k!r}"
-    assert out2["unaccounted"] == []
+    # Round-10: the resolved inputs (100, 102) weren't attempted, so
+    # they're unaccounted; only 101 is in `failed`.
+    assert [f["number"] for f in out2["failed"]] == [101]
+    assert out2["unaccounted"] == [100, 102]
     assert out2["partial_success_warning"] is None
+    # Conservation.
+    assert (
+        len(out2["succeeded"]) + len(out2["failed"]) + len(out2["unaccounted"])
+        == 3
+    )
 
 
 def test_subissue_remove_pre_flight_result_shape_complete():
-    """Round-8 #4 symmetric: `remove` has two pre-flight return sites
-    (parent-not-found, validation-failed) — both must include the
-    full documented shape.
+    """Round-8 #4 / Round-10 Pattern A symmetric: `remove`'s two
+    pre-flight return sites populate `unaccounted` with un-attempted
+    inputs preserving input order.
     """
     ctx = _ctx()
     # Parent not found.
@@ -1262,13 +1286,27 @@ def test_subissue_remove_pre_flight_result_shape_complete():
         {"data": {"issueByInfo": None}},
     ]
     with _patch_ctx_query(ctx, responses):
-        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100])
-    for k in ("unaccounted", "partial_success_warning"):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101, 102])
+    for k in (
+        "unaccounted", "partial_success_warning", "failed_unknown_count",
+    ):
         assert k in out, f"remove pre-flight (parent-not-found) missing {k!r}"
-    assert out["unaccounted"] == []
+    assert out["unaccounted"] == [100, 101, 102]
     assert out["partial_success_warning"] is None
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
 
-    # Validation failed: child found but wrong parent.
+    # Validation failed: mixed — one child has correct parent, one
+    # has wrong parent. The correct one wasn't attempted (the bail
+    # aborts before the mutation), so it lands in `unaccounted`.
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
     wrong = {
         "id": "issue-gid-99",
         "number": 99,
@@ -1278,15 +1316,316 @@ def test_subissue_remove_pre_flight_result_shape_complete():
     ctx2 = _ctx()
     responses = [
         _issue_by_info(42),
-        _issue_by_info(100, parent=wrong),
+        _issue_by_info(100, parent=correct_parent),  # valid
+        _issue_by_info(101, parent=wrong),           # invalid → mismatch
     ]
     with _patch_ctx_query(ctx2, responses):
-        out2 = zh_graphql_ops.remove_sub_issues(ctx2, 42, [100])
+        out2 = zh_graphql_ops.remove_sub_issues(ctx2, 42, [100, 101])
     assert "Pre-flight validation failed" in (out2["error"] or "")
-    for k in ("unaccounted", "partial_success_warning"):
+    for k in (
+        "unaccounted", "partial_success_warning", "failed_unknown_count",
+    ):
         assert k in out2, f"remove pre-flight (validation) missing {k!r}"
-    assert out2["unaccounted"] == []
+    # Round-10: 100 passed validation but wasn't attempted; 101 is in
+    # failed.
+    assert [f["number"] for f in out2["failed"]] == [101]
+    assert out2["unaccounted"] == [100]
     assert out2["partial_success_warning"] is None
+    assert (
+        len(out2["succeeded"]) + len(out2["failed"]) + len(out2["unaccounted"])
+        == 2
+    )
+
+
+# =============================================================================
+# round-10 Pattern A: order-preserving unaccounted, None-numbered
+# failedIssues, duplicate / out-of-input failed entries
+# =============================================================================
+
+def test_subissue_add_unaccounted_preserves_input_order():
+    """Round-9 #14 / Round-10 Pattern A: `unaccounted` must preserve
+    input order (not sort by value). Previously used
+    `sorted(set(...))` which discarded the order while `succeeded`
+    and `failed` preserved it. Mixed semantics is confusing.
+    """
+    ctx = _ctx()
+    # Inputs out of natural order on purpose so a sort would
+    # produce a different visible result.
+    inputs = [102, 100, 101]
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(102),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, inputs)
+    assert out["outcome"] == "fail"
+    # 102, 101 (in input order; 100 is in failed). Pre-fix would
+    # have emitted [101, 102] (sorted).
+    assert out["unaccounted"] == [102, 101]
+
+
+def test_subissue_remove_unaccounted_preserves_input_order():
+    """Round-10 Pattern A symmetric on remove."""
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    inputs = [102, 100, 101]
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(102, parent=correct_parent),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, inputs)
+    assert out["outcome"] == "fail"
+    assert out["unaccounted"] == [102, 101]
+
+
+def test_subissue_add_count_conservation_with_none_numbered_failed():
+    """Round-9 #10 / Round-10 Pattern A: a None-numbered failedIssues
+    entry counts toward `failed_count` but not toward `failed`'s
+    numbered entries. The pre-fix arithmetic (`unaccounted_count =
+    len(inputs) - failed_count`) silently mis-classified the affected
+    input as unaccounted. SPEC: track via `failed_unknown_count` and
+    extend `partial_success_warning` so the operator knows the API
+    refused without telling us which.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        _issue_by_info(102),
+        {
+            "data": {
+                "addSubIssues": {
+                    # Two API-side failures: one with a number (100),
+                    # one without (None). successCount=1 says one of
+                    # the remaining inputs succeeded — but we don't
+                    # know which one, so divergence fires (inferred
+                    # set would be [101, 102] of length 2 ≠ 1).
+                    "successCount": 1,
+                    "failedIssues": [
+                        {
+                            "number": 100,
+                            "repository": {"ownerName": "acme", "name": "widgets"},
+                        },
+                        {
+                            "number": None,
+                            "repository": {"ownerName": "acme", "name": "widgets"},
+                        },
+                    ],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101, 102])
+    # The numbered failure stays in `failed_numbers` for accounting,
+    # the None-numbered one bumps `failed_unknown_count`.
+    assert out["failed_count"] == 2
+    assert out["failed_unknown_count"] == 1
+    # `failed` always lists what the API said (including the None).
+    assert [f["number"] for f in out["failed"]] == [100, None]
+    # Divergence flips ok→partial.
+    assert out["outcome"] == "partial"
+    assert out["partial_success_warning"] is not None
+    # The anonymous-failure note is appended.
+    assert "no usable issue number" in out["partial_success_warning"]
+
+
+def test_subissue_add_count_conservation_with_duplicate_failed_issues():
+    """Round-10 Pattern A: API returns the same number twice in
+    `failedIssues`. The `failed` list reflects the API verbatim;
+    `failed_numbers` is a set so dedup happens there; conservation
+    invariant holds across `succeeded + failed_numbers_set +
+    unaccounted` but len(`failed`) (with duplicates) may exceed
+    that. Pin the documented behavior.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 1,
+                    "failedIssues": [
+                        {
+                            "number": 100,
+                            "repository": {"ownerName": "acme", "name": "widgets"},
+                        },
+                        {
+                            "number": 100,  # duplicate
+                            "repository": {"ownerName": "acme", "name": "widgets"},
+                        },
+                    ],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    # `failed` reflects API output verbatim.
+    assert len(out["failed"]) == 2
+    # success_count=1, inferred_succeeded=[101] (one entry; 100 is
+    # in failed_numbers). lengths match → no divergence.
+    assert out["succeeded"] == [101]
+    assert out["unaccounted"] == []
+    # Conservation invariant (using deduped failed numbers).
+    failed_unique = {f["number"] for f in out["failed"] if f["number"] is not None}
+    assert len(out["succeeded"]) + len(failed_unique) + len(out["unaccounted"]) == 2
+
+
+def test_subissue_add_count_conservation_with_out_of_input_failed_issues():
+    """Round-10 Pattern A: API returns a `failedIssues` entry with
+    a number that wasn't in our inputs (defensive — API anomaly).
+    SPEC: the out-of-input number is recorded in `failed` (verbatim
+    from API), it does NOT inflate `unaccounted` (set difference is
+    against inputs, not API output), and the conservation invariant
+    on inputs holds.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 2,
+                    "failedIssues": [
+                        {
+                            "number": 999,  # not in our inputs
+                            "repository": {"ownerName": "acme", "name": "widgets"},
+                        },
+                    ],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    # 999 is in failed but not in failed_numbers ∩ inputs, so it
+    # doesn't subtract from inferred_succeeded.
+    assert [f["number"] for f in out["failed"]] == [999]
+    # inferred_succeeded = [100, 101]; success_count=2 matches; no
+    # divergence; succeeded = [100, 101].
+    assert out["succeeded"] == [100, 101]
+    # 100 and 101 are both in succeeded; unaccounted is over INPUTS,
+    # so it's empty.
+    assert out["unaccounted"] == []
+    # Conservation over inputs.
+    assert (
+        len(out["succeeded"]) + len(out["unaccounted"]) == 2
+    )
+
+
+# =============================================================================
+# round-10 Pattern B: derived-count text must match canonical field
+# =============================================================================
+
+def test_subissue_add_fail_divergence_warning_count_matches_unaccounted():
+    """Round-9 #2 / Round-10 Pattern B: the fail-divergence warning
+    text count `"did not report on N input(s)"` must equal
+    `len(unaccounted)`. Pre-fix derived it arithmetically
+    (`len(inputs) - failed_count`), which disagreed with the field
+    under None-numbered failedIssues entries.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        _issue_by_info(102),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101, 102])
+    assert out["outcome"] == "fail"
+    # Both must report 2.
+    assert len(out["unaccounted"]) == 2
+    assert "report on 2 input(s)" in out["partial_success_warning"]
+
+
+def test_subissue_remove_fail_divergence_warning_count_matches_unaccounted():
+    """Round-10 Pattern B symmetric on remove."""
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        _issue_by_info(102, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101, 102])
+    assert out["outcome"] == "fail"
+    assert len(out["unaccounted"]) == 2
+    assert "report on 2 input(s)" in out["partial_success_warning"]
 
 
 # =============================================================================

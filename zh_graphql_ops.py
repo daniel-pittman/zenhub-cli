@@ -406,6 +406,11 @@ def add_sub_issues(
 
     parent_issue = get_issue_by_info(ctx, parent_number)
     if not parent_issue:
+        # Round-10 Pattern A: parent-not-found means NOTHING was
+        # attempted — every input is unaccounted. The pre-fix
+        # `unaccounted: []` broke the conservation invariant for
+        # this branch (succeeded=[] + failed=[] + unaccounted=[]
+        # summed to 0, not len(inputs)).
         return {
             "ok": False,
             "parent_number": parent_number,
@@ -414,7 +419,8 @@ def add_sub_issues(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
-            "unaccounted": [],
+            "unaccounted": list(child_numbers),
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "error": f"Parent #{parent_number} not found in this repository",
@@ -433,6 +439,10 @@ def add_sub_issues(
         else:
             child_ids.append(info["issue"]["id"])
     if not_found:
+        # Round-10 Pattern A: children that resolved but weren't used
+        # (because we bailed before the mutation) belong in
+        # `unaccounted`. Preserve input order (round-9 #14).
+        not_found_set = set(not_found)
         return {
             "ok": False,
             "parent_number": parent_number,
@@ -443,7 +453,8 @@ def add_sub_issues(
             "failed": [
                 {"number": n, "owner": "", "name": ""} for n in not_found
             ],
-            "unaccounted": [],
+            "unaccounted": [n for n in child_numbers if n not in not_found_set],
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "error": (
@@ -481,9 +492,19 @@ def add_sub_issues(
         }
         for fi in failed_issues
     ]
+    # Round-10 Pattern A (round-9 #10): the API can return failedIssues
+    # entries with `number: null` (or non-int). Pre-fix code did
+    # `if fi.get("number") is not None` and silently dropped those,
+    # which meant the affected inputs landed in `unaccounted` falsely
+    # (the API DID report them, just without a usable identifier).
+    # Count them separately so the conservation invariant still holds
+    # AND surface them in the partial_success_warning text so the
+    # operator knows the API failed an input it couldn't name.
     failed_numbers = {
-        fi["number"] for fi in failed_serialized if fi.get("number") is not None
+        fi["number"] for fi in failed_serialized
+        if isinstance(fi.get("number"), int) and not isinstance(fi.get("number"), bool)
     }
+    failed_unknown_count = failed_count - len(failed_numbers)
     inferred_succeeded = [n for n in child_numbers if n not in failed_numbers]
     # Review finding #3: the API exposes a count but not an array of
     # succeeded numbers. We INFER `succeeded` as "input minus failed",
@@ -509,6 +530,17 @@ def add_sub_issues(
     # rationale (round-7 #1 made these two functions match).
     if divergence and outcome == "ok":
         outcome = "partial"
+
+    # Round-10 Pattern A: compute `unaccounted` FIRST (preserving input
+    # order — round-9 #14) so the partial_success_warning text below
+    # can derive its count from the canonical field instead of
+    # arithmetic (round-9 #2). The pre-fix
+    # `unaccounted_count = len(child_numbers) - failed_count`
+    # was wrong under None-numbered failed entries: those entries
+    # bumped `failed_count` but not `failed_numbers`, so the
+    # subtraction over-counted unaccounted.
+    accounted: set[int] = set(failed_numbers) | set(succeeded)
+    unaccounted: list[int] = [n for n in child_numbers if n not in accounted]
 
     # Round-8 #1: gate warning text by outcome shape under divergence.
     partial_success_warning: str | None = None
@@ -536,21 +568,28 @@ def add_sub_issues(
             )
         elif outcome == "fail":
             # failed_count>0 but doesn't account for every input.
-            unaccounted_count = len(child_numbers) - failed_count
+            # Derive the count from the canonical `unaccounted` field
+            # so the text and the field can never disagree (round-9 #2).
             partial_success_warning = (
                 f"API reported {failed_count} failure(s) but did not "
-                f"report on {unaccounted_count} input(s) (neither "
+                f"report on {len(unaccounted)} input(s) (neither "
                 "succeeded nor in failedIssues). Those inputs' state "
                 "is undetermined. Re-list to confirm."
             )
-
-    # Round-8 #2: explicit accounting of inputs the API neither
-    # confirmed succeeded nor reported as failed. Empty list when
-    # divergence is False and the inferred set is trusted (set
-    # difference is then exactly the failed set, which is by
-    # construction outside `succeeded`, so `unaccounted == []`).
-    accounted: set[int] = set(failed_numbers) | set(succeeded)
-    unaccounted: list[int] = sorted(set(child_numbers) - accounted)
+    # Round-10 Pattern A (round-9 #10): if the API failed inputs it
+    # couldn't name, extend (or seed) the warning so the operator
+    # knows. This is independent of `divergence` — the API may report
+    # failed=[None] for one of N inputs without otherwise diverging.
+    if failed_unknown_count > 0:
+        anon_note = (
+            f"{failed_unknown_count} failedIssues entries had no usable "
+            "issue number; those inputs cannot be identified and are "
+            "not present in `failed` or `unaccounted`."
+        )
+        partial_success_warning = (
+            f"{partial_success_warning} {anon_note}"
+            if partial_success_warning else anon_note
+        )
 
     return {
         "ok": outcome == "ok",
@@ -561,6 +600,7 @@ def add_sub_issues(
         "succeeded": succeeded,
         "failed": failed_serialized,
         "unaccounted": unaccounted,
+        "failed_unknown_count": failed_unknown_count,
         "github_errors": github_errors,
         "partial_success_warning": partial_success_warning,
         "error": None,
@@ -596,6 +636,8 @@ def remove_sub_issues(
 
     parent_issue = get_issue_by_info(ctx, parent_number)
     if not parent_issue:
+        # Round-10 Pattern A: nothing was attempted; every input is
+        # unaccounted. Conservation invariant fix.
         return {
             "ok": False,
             "parent_number": parent_number,
@@ -604,7 +646,8 @@ def remove_sub_issues(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
-            "unaccounted": [],
+            "unaccounted": list(child_numbers),
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "error": f"Parent #{parent_number} not found in this repository",
@@ -669,6 +712,18 @@ def remove_sub_issues(
                     for w in wrong_parent
                 )
             )
+        # Round-10 Pattern A: inputs that passed validation (in
+        # `resolved`) weren't attempted because the bail aborts before
+        # the mutation. Surface them as `unaccounted` preserving input
+        # order. The pre-fix `unaccounted: []` broke the conservation
+        # invariant: a 3-input call with 1 mismatch would yield
+        # failed_count=1 + succeeded=[] + unaccounted=[] summing to 1,
+        # not 3.
+        mismatch_numbers = (
+            set(not_found)
+            | {c["number"] for c in cross_repo}
+            | {w["number"] for w in wrong_parent}
+        )
         return {
             "ok": False,
             "parent_number": parent_number,
@@ -686,7 +741,10 @@ def remove_sub_issues(
                     for w in wrong_parent
                 ],
             ],
-            "unaccounted": [],
+            "unaccounted": [
+                n for n in child_numbers if n not in mismatch_numbers
+            ],
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "error": "Pre-flight validation failed: " + "; ".join(msgs),
@@ -723,9 +781,13 @@ def remove_sub_issues(
         }
         for fi in failed_issues
     ]
+    # Round-10 Pattern A (round-9 #10): symmetric None-numbered handling
+    # — see add_sub_issues for the rationale.
     failed_numbers = {
-        fi["number"] for fi in failed_serialized if fi.get("number") is not None
+        fi["number"] for fi in failed_serialized
+        if isinstance(fi.get("number"), int) and not isinstance(fi.get("number"), bool)
     }
+    failed_unknown_count = failed_count - len(failed_numbers)
     inferred_succeeded = [n for n in child_numbers if n not in failed_numbers]
     # Same review-finding-#3 logic as add_sub_issues: only trust the
     # inferred set when its length matches successCount.
@@ -744,6 +806,12 @@ def remove_sub_issues(
     # divergence; noop and fail keep their dedicated semantics.
     if divergence and outcome == "ok":
         outcome = "partial"
+
+    # Round-10 Pattern A: compute `unaccounted` FIRST (order-preserving;
+    # round-9 #14) so the warning text below can derive its count from
+    # the canonical field (round-9 #2).
+    accounted: set[int] = set(failed_numbers) | set(succeeded)
+    unaccounted: list[int] = [n for n in child_numbers if n not in accounted]
 
     # Round-8 #1: gate warning text by outcome shape under divergence.
     # Symmetric with add_sub_issues.
@@ -765,18 +833,24 @@ def remove_sub_issues(
                 "to confirm."
             )
         elif outcome == "fail":
-            unaccounted_count = len(child_numbers) - failed_count
+            # Derive from canonical `unaccounted` (round-9 #2).
             partial_success_warning = (
                 f"API reported {failed_count} failure(s) but did not "
-                f"report on {unaccounted_count} input(s) (neither "
+                f"report on {len(unaccounted)} input(s) (neither "
                 "succeeded nor in failedIssues). Those inputs' state "
                 "is undetermined. Re-list to confirm."
             )
-
-    # Round-8 #2: explicit accounting of inputs the API neither
-    # confirmed succeeded nor reported as failed.
-    accounted: set[int] = set(failed_numbers) | set(succeeded)
-    unaccounted: list[int] = sorted(set(child_numbers) - accounted)
+    # Round-10 Pattern A (round-9 #10) — see add_sub_issues.
+    if failed_unknown_count > 0:
+        anon_note = (
+            f"{failed_unknown_count} failedIssues entries had no usable "
+            "issue number; those inputs cannot be identified and are "
+            "not present in `failed` or `unaccounted`."
+        )
+        partial_success_warning = (
+            f"{partial_success_warning} {anon_note}"
+            if partial_success_warning else anon_note
+        )
 
     return {
         "ok": outcome == "ok",
@@ -787,6 +861,7 @@ def remove_sub_issues(
         "succeeded": succeeded,
         "failed": failed_serialized,
         "unaccounted": unaccounted,
+        "failed_unknown_count": failed_unknown_count,
         "github_errors": github_errors,
         "partial_success_warning": partial_success_warning,
         "error": None,
@@ -1727,6 +1802,10 @@ def add_issues_to_sprint(
 
     sprint_id, actual_sprint_name, err = _find_sprint_id(ctx, sprint_name)
     if err or not sprint_id:
+        # Round-10 Pattern A: pre-flight failure means nothing was
+        # attempted; every input is unaccounted. Includes the canonical
+        # mutation-tool keys (`unaccounted`, `partial_success_warning`)
+        # so MCP callers reading the canonical shape don't KeyError.
         return {
             "ok": False,
             "sprint_id": None,
@@ -1736,11 +1815,17 @@ def add_issues_to_sprint(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": list(issue_numbers),
+            "partial_success_warning": None,
             "error": err,
         }
 
     issue_ids, missing = _resolve_issue_ids_in_repo(ctx, issue_numbers)
     if missing:
+        # Round-10 Pattern A: inputs that resolved but weren't
+        # attempted (because the bail aborts before the mutation)
+        # belong in `unaccounted`. Preserve input order.
+        missing_set = set(missing)
         return {
             "ok": False,
             "sprint_id": sprint_id,
@@ -1750,6 +1835,8 @@ def add_issues_to_sprint(
             "failed_count": len(missing),
             "succeeded": [],
             "failed": missing,
+            "unaccounted": [n for n in issue_numbers if n not in missing_set],
+            "partial_success_warning": None,
             "error": (
                 "Some issue numbers were not found in this repository: "
                 + ", ".join(f"#{n}" for n in missing)
@@ -1790,6 +1877,12 @@ def add_issues_to_sprint(
     failed = [n for n in issue_numbers if n not in succeeded_numbers]
     outcome = _classify_outcome(len(succeeded), len(failed))
 
+    # Round-10 Pattern A: canonical key `unaccounted` and
+    # `partial_success_warning` so add/remove sprint mutations share
+    # the mutation-tool shape with the subissue family. On the
+    # trusted path here `succeeded` and `failed` exhaustively
+    # partition the input set, so `unaccounted` is always [] — but
+    # the key must still be present for shape invariance. Round-9 #6.
     return {
         "ok": outcome == "ok",
         "sprint_id": sprint_id,
@@ -1799,6 +1892,8 @@ def add_issues_to_sprint(
         "failed_count": len(failed),
         "succeeded": succeeded,
         "failed": failed,
+        "unaccounted": [],
+        "partial_success_warning": None,
         "error": None,
     }
 
@@ -1885,6 +1980,7 @@ def remove_issues_from_sprint(
 
     sprint_id, actual_sprint_name, err = _find_sprint_id(ctx, sprint_name)
     if err or not sprint_id:
+        # Round-10 Pattern A: pre-flight bail = nothing attempted.
         return {
             "ok": False,
             "sprint_id": None,
@@ -1894,14 +1990,18 @@ def remove_issues_from_sprint(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": list(issue_numbers),
             "inspected_full": False,
             "pagination_warning": None,
             "response_anomaly": None,
+            "partial_success_warning": None,
             "error": err,
         }
 
     issue_ids, missing = _resolve_issue_ids_in_repo(ctx, issue_numbers)
     if missing:
+        # Round-10 Pattern A: inputs that resolved go to `unaccounted`.
+        missing_set = set(missing)
         return {
             "ok": False,
             "sprint_id": sprint_id,
@@ -1911,9 +2011,11 @@ def remove_issues_from_sprint(
             "failed_count": len(missing),
             "succeeded": [],
             "failed": missing,
+            "unaccounted": [n for n in issue_numbers if n not in missing_set],
             "inspected_full": False,
             "pagination_warning": None,
             "response_anomaly": None,
+            "partial_success_warning": None,
             "error": (
                 "Some issue numbers were not found in this repository: "
                 + ", ".join(f"#{n}" for n in missing)
@@ -1998,6 +2100,9 @@ def remove_issues_from_sprint(
                 ctx, sprint_id,
             )
         except ZhApiError as walk_err:
+            # Round-10 Pattern A: every input is marked `failed` here
+            # (deliberate fail-loud-on-walk-error semantics), so
+            # `unaccounted=[]` keeps the conservation invariant.
             return {
                 "ok": False,
                 "sprint_id": sprint_id,
@@ -2007,11 +2112,13 @@ def remove_issues_from_sprint(
                 "failed_count": len(issue_numbers),
                 "succeeded": [],
                 "failed": list(issue_numbers),
+                "unaccounted": [],
                 "inspected_full": False,
                 "pagination_warning": None,
                 "response_anomaly": (response_anomaly or "") + (
                     f" Recovery walk also failed: {walk_err}"
                 ),
+                "partial_success_warning": None,
                 "error": (
                     "Sprint post-state could not be determined: "
                     f"{walk_err}"
@@ -2046,6 +2153,8 @@ def remove_issues_from_sprint(
                     ctx, sprint_id,
                 )
             except ZhApiError as walk_err:
+                # Round-10 Pattern A: same fail-loud semantics as the
+                # other walk-failure path above.
                 return {
                     "ok": False,
                     "sprint_id": sprint_id,
@@ -2055,12 +2164,14 @@ def remove_issues_from_sprint(
                     "failed_count": len(issue_numbers),
                     "succeeded": [],
                     "failed": list(issue_numbers),
+                    "unaccounted": [],
                     "inspected_full": False,
                     "pagination_warning": None,
                     "response_anomaly": (
                         "Mutation response was full; follow-up walk "
                         f"to confirm post-state failed: {walk_err}"
                     ),
+                    "partial_success_warning": None,
                     "error": (
                         "Sprint post-state could not be confirmed: "
                         f"{walk_err}"
@@ -2104,6 +2215,9 @@ def remove_issues_from_sprint(
         succeeded = [n for n in issue_numbers if n not in still_attached_numbers]
         failed = [n for n in issue_numbers if n in still_attached_numbers]
         outcome = _classify_outcome(len(succeeded), len(failed))
+        # On the trusted path, succeeded + failed exhausts the input
+        # set, so `unaccounted=[]`. Round-10 Pattern A canonical key.
+        unaccounted: list[int] = []
     else:
         succeeded = [
             n for n in issue_numbers
@@ -2112,21 +2226,27 @@ def remove_issues_from_sprint(
         # `failed` for partial coverage: only count inputs the walker
         # actually saw still-attached. Inputs the walker never
         # reached are NEITHER succeeded NOR failed — they're
-        # un-verified (reflected in `response_anomaly`'s coverage
-        # note below). This keeps success_count + failed_count <=
-        # len(inputs), so the counts honestly report what we
-        # observed.
+        # un-verified (now surfaced as the `unaccounted` field too,
+        # round-10 Pattern A / round-9 #6). This keeps
+        # success_count + failed_count <= len(inputs), so the counts
+        # honestly report what we observed.
         failed = [
             n for n in issue_numbers
             if n in walked_numbers and n in still_attached_numbers
         ]
-        unverified_count = len(issue_numbers) - len(succeeded) - len(failed)
+        # Round-10 Pattern A: surface un-verified inputs as
+        # `unaccounted` (preserving input order) so the structured
+        # field carries the same accounting that the `response_anomaly`
+        # text describes. Round-9 #2: derive the text's count from
+        # the field rather than arithmetic.
+        accounted_set: set[int] = set(succeeded) | set(failed)
+        unaccounted = [n for n in issue_numbers if n not in accounted_set]
         coverage_note = (
             f"Post-state coverage incomplete (inspected_full=False, "
             f"walker bailed: {pagination_warning or 'unknown reason'}); "
             f"verified {len(succeeded)} of {len(issue_numbers)} input(s) "
             f"as removed; "
-            f"{unverified_count} input(s) un-verified — the walker "
+            f"{len(unaccounted)} input(s) un-verified — the walker "
             f"never reached them, so we cannot say whether the "
             f"mutation took effect. "
             f"Re-verify with `zh sprint show '{actual_sprint_name or sprint_name}'`."
@@ -2148,8 +2268,10 @@ def remove_issues_from_sprint(
         "failed_count": len(failed),
         "succeeded": succeeded,
         "failed": failed,
+        "unaccounted": unaccounted,
         "inspected_full": inspected_full,
         "pagination_warning": pagination_warning,
         "response_anomaly": response_anomaly,
+        "partial_success_warning": None,
         "error": None,
     }

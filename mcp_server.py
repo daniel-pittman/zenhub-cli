@@ -1320,10 +1320,21 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
                 Populated under divergence (success_count != len(
                 inferred_succeeded)) — succeeded is then empty and
                 `unaccounted` exposes which input numbers the API
-                neither confirmed nor explicitly failed. The
-                conservation invariant holds across all outcomes:
+                neither confirmed nor explicitly failed. Pre-flight
+                bails (parent-not-found, child-not-found) populate
+                this with the un-attempted inputs so the conservation
+                invariant holds across all return paths:
                 len(succeeded) + len(failed) + len(unaccounted) ==
-                len(deduped input child_numbers).
+                len(deduped input child_numbers). Order preserves the
+                deduped input order. (round-10 Pattern A)
+            failed_unknown_count: int — count of `failedIssues`
+                entries that lacked a usable issue `number` (null or
+                non-int). Those entries bumped `failed_count` but
+                are NOT in `failed` (no identifier to surface) and
+                are NOT in `unaccounted` (the API DID report on them,
+                just opaquely). When > 0, `partial_success_warning`
+                names the count so the operator knows. (round-10
+                Pattern A / round-9 #10)
             github_errors: dict | None
             partial_success_warning: str | None — set when the API's
                 successCount diverges from the inferred succeeded
@@ -1354,6 +1365,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "succeeded": [],
             "failed": [],
             "unaccounted": [],
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": "child_numbers must be non-empty",
@@ -1363,6 +1375,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         return {**err, "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
                 "succeeded": [], "failed": [], "unaccounted": [],
+                "failed_unknown_count": 0,
                 "github_errors": None,
                 "partial_success_warning": None}
     from zh_graphql_ops import add_sub_issues  # noqa: PLC0415
@@ -1379,6 +1392,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "succeeded": [],
             "failed": [],
             "unaccounted": [],
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": str(e),
@@ -1392,6 +1406,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
         "unaccounted": result.get("unaccounted", []),
+        "failed_unknown_count": result.get("failed_unknown_count", 0),
         "github_errors": result.get("github_errors"),
         "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
@@ -1428,9 +1443,12 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             failed: list[dict]
             unaccounted: list[int] — inputs the API did not report on
                 in either succeeded or failed. Empty on the trusted
-                path; populated under divergence. Conservation
-                invariant: len(succeeded) + len(failed) +
-                len(unaccounted) == len(deduped input child_numbers).
+                path; populated under divergence OR under pre-flight
+                bails (parent-not-found, validation-failed). Order
+                preserves deduped input order. Conservation invariant:
+                len(succeeded) + len(failed) + len(unaccounted) ==
+                len(deduped input child_numbers). (round-10 Pattern A)
+            failed_unknown_count: int — see subissue_add_children.
             github_errors: dict | None
             partial_success_warning: str | None — set when the API's
                 successCount diverges from the inferred succeeded
@@ -1458,6 +1476,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             "succeeded": [],
             "failed": [],
             "unaccounted": [],
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": "child_numbers must be non-empty",
@@ -1467,6 +1486,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         return {**err, "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
                 "succeeded": [], "failed": [], "unaccounted": [],
+                "failed_unknown_count": 0,
                 "github_errors": None,
                 "partial_success_warning": None}
     from zh_graphql_ops import remove_sub_issues  # noqa: PLC0415
@@ -1483,6 +1503,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             "succeeded": [],
             "failed": [],
             "unaccounted": [],
+            "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": str(e),
@@ -1496,6 +1517,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
         "unaccounted": result.get("unaccounted", []),
+        "failed_unknown_count": result.get("failed_unknown_count", 0),
         "github_errors": result.get("github_errors"),
         "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
@@ -1774,6 +1796,18 @@ def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
             failed_count: int
             succeeded: list[int] — API confirmed these were linked
             failed: list[int] — API did not return links for these
+            unaccounted: list[int] — canonical mutation-tool key
+                (round-10 Pattern A). Empty on the trusted path
+                (succeeded + failed exhaustively partition the input
+                set). Populated on pre-flight bails (sprint-not-found,
+                issue-not-found) with the un-attempted inputs so the
+                conservation invariant holds:
+                    len(succeeded) + len(failed) + len(unaccounted)
+                        == len(deduped input issue_numbers).
+            partial_success_warning: str | None — canonical
+                mutation-tool key. Currently always None for
+                add_issues_to_sprint (no divergence-detection
+                surface here); reserved for future use.
             stderr: str
     """
     # Full result shape on the empty-input guards so strict MCP callers
@@ -1789,6 +1823,8 @@ def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
+            "partial_success_warning": None,
             "stderr": "issue_numbers must be non-empty",
         }
     if not sprint_name or not str(sprint_name).strip():
@@ -1801,13 +1837,16 @@ def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
+            "partial_success_warning": None,
             "stderr": "sprint_name must be non-empty",
         }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "sprint_id": None, "sprint_name": sprint_name,
                 "outcome": "fail", "success_count": 0, "failed_count": 0,
-                "succeeded": [], "failed": []}
+                "succeeded": [], "failed": [],
+                "unaccounted": [], "partial_success_warning": None}
     from zh_graphql_ops import add_issues_to_sprint  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1822,6 +1861,8 @@ def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
+            "partial_success_warning": None,
             "stderr": str(e),
         }
     return {
@@ -1833,6 +1874,8 @@ def sprint_add_issues(sprint_name: str, issue_numbers: list[int],
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
+        "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
     }
 
@@ -1871,8 +1914,14 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
     incorrectly counted as succeeded). `failed` lists inputs the
     walker observed still-attached. Inputs the walker never
     reached are NEITHER succeeded NOR failed — they're un-verified,
-    and `response_anomaly` names the un-verified count plus a
-    `zh sprint show '<name>'` re-verification command.
+    surfaced in BOTH the `unaccounted` structured field (round-10
+    Pattern A / round-9 #6) AND `response_anomaly` text, with the
+    text's count derived from the field (no arithmetic drift).
+    Re-verify with `zh sprint show '<name>'`.
+
+    The conservation invariant holds across every return path:
+        len(succeeded) + len(failed) + len(unaccounted)
+            == len(deduped input issue_numbers)
     """
     if not issue_numbers:
         return {
@@ -1884,9 +1933,11 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "inspected_full": False,
             "pagination_warning": None,
             "response_anomaly": None,
+            "partial_success_warning": None,
             "stderr": "issue_numbers must be non-empty",
         }
     if not sprint_name or not str(sprint_name).strip():
@@ -1899,9 +1950,11 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "inspected_full": False,
             "pagination_warning": None,
             "response_anomaly": None,
+            "partial_success_warning": None,
             "stderr": "sprint_name must be non-empty",
         }
     ctx, err = _resolve_ctx(repo_path)
@@ -1909,9 +1962,11 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
         return {**err, "sprint_id": None, "sprint_name": sprint_name,
                 "outcome": "fail", "success_count": 0, "failed_count": 0,
                 "succeeded": [], "failed": [],
+                "unaccounted": [],
                 "inspected_full": False,
                 "pagination_warning": None,
-                "response_anomaly": None}
+                "response_anomaly": None,
+                "partial_success_warning": None}
     from zh_graphql_ops import remove_issues_from_sprint  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
@@ -1928,9 +1983,11 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "inspected_full": False,
             "pagination_warning": None,
             "response_anomaly": None,
+            "partial_success_warning": None,
             "stderr": str(e),
         }
     return {
@@ -1942,9 +1999,11 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
         "inspected_full": result.get("inspected_full", False),
         "pagination_warning": result.get("pagination_warning"),
         "response_anomaly": result.get("response_anomaly"),
+        "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
     }
 

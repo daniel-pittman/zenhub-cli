@@ -1084,3 +1084,187 @@ def test_remove_walk_warning_sets_inspected_full_false_in_recovery():
     assert out["pagination_warning"] is not None
     assert out["inspected_full"] is False
     assert out["response_anomaly"] is not None
+
+
+# =============================================================================
+# round-10 Pattern A: sprint mutations canonical shape + conservation
+# =============================================================================
+
+def test_add_issues_to_sprint_canonical_shape_keys_present():
+    """Round-9 #6 / Round-10 Pattern A: every return from
+    add_issues_to_sprint must include the canonical mutation-tool
+    keys (`unaccounted`, `partial_success_warning`) so MCP callers
+    can rely on a uniform shape across subissue and sprint families.
+    """
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        _add_resp([100, 101]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(
+            ctx, "Sprint 7", [100, 101]
+        )
+    for k in (
+        "ok", "sprint_id", "sprint_name", "outcome",
+        "success_count", "failed_count", "succeeded", "failed",
+        "unaccounted", "partial_success_warning", "error",
+    ):
+        assert k in out, f"add_issues_to_sprint missing key {k!r}"
+    # Trusted-path invariants.
+    assert out["unaccounted"] == []
+    assert out["partial_success_warning"] is None
+    # Conservation invariant.
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 2
+    )
+
+
+def test_remove_issues_from_sprint_canonical_shape_keys_present():
+    """Round-10 Pattern A symmetric on remove."""
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        _remove_resp([]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100, 101]
+        )
+    for k in (
+        "ok", "sprint_id", "sprint_name", "outcome",
+        "success_count", "failed_count", "succeeded", "failed",
+        "unaccounted", "inspected_full", "pagination_warning",
+        "response_anomaly", "partial_success_warning", "error",
+    ):
+        assert k in out, f"remove_issues_from_sprint missing key {k!r}"
+    assert out["unaccounted"] == []
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 2
+    )
+
+
+def test_add_issues_to_sprint_sprint_not_found_unaccounted():
+    """Round-10 Pattern A: pre-flight bail = nothing attempted,
+    every input is unaccounted. Conservation invariant holds.
+    """
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(
+            ctx, "Sprint 99", [100, 101, 102]
+        )
+    assert out["ok"] is False
+    assert out["unaccounted"] == [100, 101, 102]
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
+
+
+def test_add_issues_to_sprint_missing_issue_unaccounted_order_preserved():
+    """Round-10 Pattern A: inputs that resolved but weren't attempted
+    (because the missing-issue bail aborts before the mutation) land
+    in `unaccounted` preserving input order.
+    """
+    ctx = _ctx()
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(101),
+        # 9999 returns no issue
+        {"data": {"issueByInfo": None}},
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_issues_to_sprint(
+            ctx, "Sprint 7", [100, 101, 9999]
+        )
+    assert out["ok"] is False
+    assert out["failed"] == [9999]
+    # 100 and 101 resolved but weren't attempted; they're unaccounted
+    # in input order.
+    assert out["unaccounted"] == [100, 101]
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
+
+
+def test_remove_issues_from_sprint_partial_walk_unaccounted_matches_anomaly():
+    """Round-9 #2 / Round-10 Pattern B: when the walker bails mid-
+    walk, the `response_anomaly` text's "N input(s) un-verified"
+    count must equal `len(unaccounted)`. Pre-fix used arithmetic
+    (`len(inputs) - len(succeeded) - len(failed)`); now derived
+    from the field directly.
+    """
+    ctx = _ctx()
+    full_page = [_issue_node(2000 + i) for i in range(100)]
+    full_remove_resp = {
+        "data": {
+            "removeIssuesFromSprints": {
+                "sprints": [
+                    {
+                        "id": "sprint-7",
+                        "sprintIssues": {
+                            "nodes": [
+                                {
+                                    "issue": {
+                                        "number": 2000 + i,
+                                        "repository": {
+                                            "ownerName": "acme",
+                                            "name": "widgets",
+                                        },
+                                    }
+                                }
+                                for i in range(100)
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    # Walk bails on stuck cursor.
+    stuck_walk_page = _sprint_issues_page(
+        full_page, has_next=True, end_cursor=None
+    )
+    responses = [
+        _sprints_page([_sprint_node("sprint-7", "Sprint 7")]),
+        _issue_by_info_resp(100),
+        _issue_by_info_resp(2050),       # in the walked page (succeeded)
+        _issue_by_info_resp(8888),       # NOT in walked page (unverified)
+        full_remove_resp,
+        stuck_walk_page,
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_issues_from_sprint(
+            ctx, "Sprint 7", [100, 2050, 8888]
+        )
+    assert out["inspected_full"] is False
+    # 100 was in the initial 100-node response then bailed walk; depending
+    # on walker semantics may be in succeeded or unverified.
+    # 2050 was in the page; not in still_attached after de-dup? The
+    # walker re-emits the page so 2050 is still_attached → fails.
+    # 8888 was never reached → unaccounted.
+    # The precise allocation depends on the walker's reset behavior;
+    # what we pin: `unaccounted` non-empty AND the response_anomaly's
+    # count agrees with `len(unaccounted)`.
+    assert 8888 in out["unaccounted"]
+    # Conservation invariant.
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
+    # Round-10 Pattern B: text count derived from canonical field.
+    assert (
+        f"{len(out['unaccounted'])} input(s) un-verified"
+        in out["response_anomaly"]
+    )
