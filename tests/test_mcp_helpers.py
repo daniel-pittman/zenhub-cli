@@ -551,13 +551,28 @@ def test_ensure_safe_parent_creates_one_level(tmp_path):
     assert (tmp_path / "zh").is_dir()
 
 
-def test_ensure_safe_parent_refuses_deep_ancestor_creation(tmp_path):
-    # Both grandparent AND parent are missing — refuse rather than
-    # auto-create arbitrary tree (typo'd ZH_MCP_VENV protection).
+def test_ensure_safe_parent_refuses_deep_ancestor_creation(tmp_path, monkeypatch):
+    # Round-2 fix: typo protection now only applies when ZH_MCP_VENV
+    # is explicitly set. Without it, the path is server-chosen and
+    # auto-created. With it, deep ancestors are refused.
+    monkeypatch.setenv("ZH_MCP_VENV", str(tmp_path / "deep" / "nested" / "tree"))
     venv_dir = tmp_path / "deep" / "nested" / "tree"
     with pytest.raises(RuntimeError, match="ancestor"):
         mcp_server._ensure_safe_parent(venv_dir)
     assert not (tmp_path / "deep").exists()  # nothing was created
+
+
+def test_ensure_safe_parent_creates_deep_tree_for_xdg_default(tmp_path, monkeypatch):
+    # Round-2 CRITICAL fix: on a fresh macOS / minimal container,
+    # `~/.local/share` doesn't exist yet. The server-chosen XDG default
+    # must auto-create the ancestor tree without refusing. Typo
+    # protection only kicks in when ZH_MCP_VENV is explicitly set.
+    monkeypatch.delenv("ZH_MCP_VENV", raising=False)
+    venv_dir = tmp_path / "share" / "zh" / "venv"
+    assert not (tmp_path / "share").exists()
+    mcp_server._ensure_safe_parent(venv_dir)
+    # Full ancestor chain created.
+    assert (tmp_path / "share" / "zh").is_dir()
 
 
 def test_ensure_safe_parent_refuses_regular_file_parent(tmp_path):
@@ -656,14 +671,16 @@ def test_venv_build_lock_creates_parent_dir(tmp_path):
         assert venv_dir.parent.is_dir()
 
 
-def test_venv_build_lock_refuses_typo_paths_before_mkdir(tmp_path):
+def test_venv_build_lock_refuses_typo_paths_before_mkdir(tmp_path, monkeypatch):
     # PR #15 round-1 CRITICAL: the lock used to call mkdir(parents=True)
     # before `_ensure_safe_parent` could fire, so a typo'd path like
     # `~/something-typo/sub/venv` would silently create the whole tree.
-    # The lock now calls _ensure_safe_parent FIRST. Verify by pointing
-    # at a deep path where the grandparent doesn't exist — entering
-    # the context must raise without creating anything.
+    # The lock now calls _ensure_safe_parent FIRST.
+    #
+    # Round-2 refinement: typo protection only applies when ZH_MCP_VENV
+    # is explicitly set — so set it here to exercise the strict path.
     venv_dir = tmp_path / "deep" / "nested" / "tree" / "venv"
+    monkeypatch.setenv("ZH_MCP_VENV", str(venv_dir))
     with pytest.raises(RuntimeError, match="ancestor"):
         with mcp_server._venv_build_lock(venv_dir):
             pass  # should not reach this

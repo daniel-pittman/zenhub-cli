@@ -87,7 +87,18 @@ def _default_venv_dir() -> Path:
         )
     override = (raw_override or "").strip()
     if override:
-        return Path(override).expanduser().resolve()
+        expanded = Path(override).expanduser()
+        if str(expanded).startswith("~"):
+            # Same protection as the XDG branch below: HOME unset →
+            # expanduser leaves `~` unchanged → resolve() pins it to
+            # cwd, producing a literal `~` directory + rebuild loop
+            # across cwds.
+            raise RuntimeError(
+                f"[zenhub-mcp] cannot resolve home directory in "
+                f"ZH_MCP_VENV={override!r} (HOME is unset). Set HOME or "
+                f"give ZH_MCP_VENV an absolute path."
+            )
+        return expanded.resolve()
     xdg_raw = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
     xdg_data = os.path.expanduser(xdg_raw)
     if xdg_data.startswith("~"):
@@ -301,19 +312,29 @@ def _looks_like_zh_venv(venv_dir: Path) -> bool:
 
 
 def _ensure_safe_parent(venv_dir: Path) -> None:
-    """Validate the path's parent + grandparent before any mkdir.
+    """Validate the path's parent before any mkdir.
 
-    Guards against two failure modes:
-      1. A typo'd `ZH_MCP_VENV=~/something/zh-venv` (when `~/something`
-         doesn't exist) silently materializing a 500MB venv tree at
-         an unexpected location. `mkdir(parents=True, ...)` would do
-         this without complaint; we require the grandparent to exist
-         and only create one new directory level.
-      2. A pre-existing regular file at the parent path (typo'd
-         earlier `mkdir -p ~/.local/share && touch ~/.local/share/zh`,
-         or `ZH_MCP_VENV=~/.bashrc/whatever`) producing an unhelpful
-         `FileExistsError: [Errno 17]` traceback. We raise a clear
-         RuntimeError naming the offending path instead.
+    Two modes, distinguished by whether `ZH_MCP_VENV` is set:
+
+    1. **Server-chosen default** (no `ZH_MCP_VENV`): the path comes
+       from `_default_venv_dir`'s XDG branch — `$XDG_DATA_HOME/zh/venv`,
+       typically `~/.local/share/zh/venv`. `~/.local/share` is NOT
+       guaranteed to exist on fresh macOS accounts, minimal Linux
+       containers (python:slim, distroless, Alpine), DynamicUser=
+       systemd sandboxes, or CI runners with bespoke $HOME. Auto-
+       create the full ancestor tree; the path is server-controlled
+       and not subject to typo risk.
+
+    2. **User-supplied** (`ZH_MCP_VENV` is set): apply strict typo
+       protection. Require the grandparent to pre-exist and only
+       create ONE new directory level. A typo'd path like
+       `ZH_MCP_VENV=~/something-typo/sub/venv` refuses rather than
+       silently materializing a 500MB venv tree at an unexpected
+       location.
+
+    In both modes, a pre-existing regular file at the parent path
+    raises a clear RuntimeError (avoiding the unhelpful
+    `FileExistsError: [Errno 17]` traceback from `mkdir`).
     """
     parent = venv_dir.parent
     if parent.exists():
@@ -324,6 +345,15 @@ def _ensure_safe_parent(venv_dir: Path) -> None:
                 f"or rename the stray file, or set ZH_MCP_VENV / "
                 f"XDG_DATA_HOME to point elsewhere."
             )
+        return
+    user_supplied = bool(os.environ.get("ZH_MCP_VENV", "").strip())
+    if not user_supplied:
+        # Server-chosen XDG default. Auto-create the ancestor tree;
+        # the path is server-controlled. Without this, a fresh user
+        # account where `~/.local/share` doesn't exist yet would fail
+        # to bootstrap — the most common first-launch failure on a
+        # vanilla macOS install.
+        parent.mkdir(parents=True, exist_ok=True)
         return
     grandparent = parent.parent
     if not grandparent.exists():
@@ -338,25 +368,33 @@ def _ensure_safe_parent(venv_dir: Path) -> None:
 
 
 def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
-    """Robust rmtree that handles symlinks + EACCES gracefully.
+    """Robust rmtree that handles symlinks + a NARROW class of EACCES.
 
     Plain `shutil.rmtree` raises on symlinked dirs (`OSError: Cannot
-    call rmtree on a symbolic link`) and on permission errors mid-walk
-    (e.g. a user-owned `__pycache__/` with mode 000 from an aborted
-    install, or a parent dir whose write+execute bits were dropped
-    by another tool). This wrapper:
+    call rmtree on a symbolic link`) and on permission errors mid-walk.
+    This wrapper:
       - unlinks symlinks instead of recursing (preserves the target)
       - on `PermissionError` during a walk, chmods BOTH the failing
-        path AND its parent (unlink permission is parent-driven on
-        POSIX, not file-mode-driven) and retries
+        path AND its parent and retries
       - re-raises if a retry still fails, unless `ignore_errors=True`
 
-    NOTE: a root-owned file the current user can't `chmod` is not
-    recoverable here (the chmod itself raises `PermissionError`); we
-    fall through and re-raise. The caller in that case must clean up
-    via `sudo rm -rf` manually. Cleanup-path callers (inside
-    `_build_venv` except blocks) pass `ignore_errors=True` so a
-    failed cleanup doesn't mask the original failure.
+    Recoverable cases:
+      - file-unlink failure where the parent dir had write/execute
+        bits dropped (chmod parent → retry unlink succeeds)
+      - empty-dir rmdir failure where the dir itself had mode 000
+        (chmod dir → retry rmdir succeeds)
+
+    NOT recoverable here (despite the chmod retry firing):
+      - `os.scandir` failure on a non-empty user-owned mode-000 dir.
+        CPython's `shutil.rmtree` discards the retried iterator and
+        treats the dir as empty, then `os.rmdir` raises `ENOTEMPTY`.
+        Use `chmod -R u+rwx <path>` manually first.
+      - any file/dir owned by another user (the chmod itself raises
+        `PermissionError`).
+
+    Cleanup-path callers (inside `_build_venv` except blocks) pass
+    `ignore_errors=True` so a failed cleanup doesn't mask the
+    original build failure.
     """
     try:
         if path.is_symlink():
@@ -670,13 +708,17 @@ if str(HERE) not in sys.path:
 # ANSI color code regex — zh emits colored output for terminals; strip for MCP.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
-# `  #645 │ owner/repo │ ...` (2-space indent). Bounded to 0-3 leading
-# spaces/tabs so a 4-space-indented title line that legitimately starts
-# with `#NNN │` (a cross-reference convention some teams use, e.g.
-# `    #1234 │ blocker note for OAuth retry path`) isn't mistaken for
-# the next issue's header. Tab support is defensive — `zh` currently
-# emits spaces, but if a future formatting pass switches to tabs the
-# parser should degrade gracefully (skip the line) instead of mis-parse.
+# `  #645 │ owner/repo │ ...` (2-space indent). Two tightening choices
+# both implemented as `[ \t]` (horizontal whitespace only, never \n):
+#   - Leading indent `^[ \t]{0,3}`: bounded to 0-3 so a 4-space title
+#     line that legitimately starts with `#NNN │` (cross-reference
+#     convention) isn't mistaken for the next header. Tab support is
+#     defensive — `zh` currently emits spaces.
+#   - Post-digit gap `\d+[ \t]*│`: previously `\s*` (which matches \n).
+#     Pins the single-line-match contract — a header that wraps mid-
+#     field (terminal resize, malformed unicode in a repo name) won't
+#     span lines and trip the title-walker bail-out. The walker only
+#     ever feeds one line at a time today; this is defense-in-depth.
 _ISSUE_HEADER_RE = re.compile(r"^[ \t]{0,3}#\d+[ \t]*│")
 
 
