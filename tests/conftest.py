@@ -21,8 +21,10 @@ import sys
 from pathlib import Path
 
 # Set BEFORE the sys.path tweak so any later `import mcp_server` from a
-# test sees it in its environment.
-os.environ.setdefault("ZH_MCP_SKIP_BOOTSTRAP", "1")
+# test sees it in its environment. Use direct assignment (not
+# `setdefault`) so a stale `ZH_MCP_SKIP_BOOTSTRAP=0` in the developer's
+# shell can't sneak past and trigger a real venv build mid-test.
+os.environ["ZH_MCP_SKIP_BOOTSTRAP"] = "1"
 
 # Repo root is the parent of this `tests/` directory.
 _REPO_ROOT = Path(__file__).resolve().parent.parent

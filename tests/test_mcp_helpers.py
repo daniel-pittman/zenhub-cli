@@ -107,12 +107,65 @@ def test_venv_invalid_when_marker_mismatch(tmp_path):
     assert not mcp_server._venv_is_valid(tmp_path, "current-hash")
 
 
-# Note: the success path (everything present + `import mcp` works) is
-# covered by the post-build sanity check inside _build_venv at runtime
-# and isn't unit-testable without standing up a real venv (slow + fragile
-# in CI). The "all four file checks pass but mcp import fails" path is
-# implicitly exercised whenever pre-existing /tmp/zhenv-shaped venvs land
-# on a developer's machine and get rejected.
+def test_venv_invalid_when_marker_unreadable(tmp_path):
+    # Simulates a corrupt / root-owned / non-UTF-8 marker file. The
+    # guard must return False (triggering a rebuild) rather than letting
+    # the exception escape and crash the MCP bootstrap.
+    _make_fake_venv(
+        tmp_path, with_python=True, with_cfg=True, marker_value=None,
+    )
+    # Write non-UTF-8 bytes directly — read_text() raises UnicodeDecodeError.
+    (tmp_path / mcp_server._VENV_MARKER).write_bytes(b"\xff\xfe\xfd")
+    assert not mcp_server._venv_is_valid(tmp_path, "any-hash")
+
+
+# Note: the full success path (file checks pass + `import mcp` works) is
+# covered by the post-build sanity check inside _build_venv at runtime,
+# not in this unit-test file. Standing up a real `python -m venv` here
+# would slow the suite by ~1s for one assertion. Tracked as a v1.6.1
+# follow-up if the file-shape tests above prove insufficient.
+
+
+# -----------------------------------------------------------------------------
+# _looks_like_zh_venv — guards the destructive `shutil.rmtree` path so a
+# typo in ZH_MCP_VENV (or XDG_DATA_HOME) can't wipe arbitrary user data.
+# -----------------------------------------------------------------------------
+
+
+def test_looks_like_zh_venv_accepts_missing(tmp_path):
+    # Nothing there yet — nothing to lose, safe to "rebuild" (i.e. build
+    # from scratch). The bootstrap relies on this returning True so the
+    # first-ever launch can proceed.
+    target = tmp_path / "does-not-exist"
+    assert mcp_server._looks_like_zh_venv(target)
+
+
+def test_looks_like_zh_venv_accepts_empty_dir(tmp_path):
+    (tmp_path / "empty").mkdir()
+    assert mcp_server._looks_like_zh_venv(tmp_path / "empty")
+
+
+def test_looks_like_zh_venv_accepts_dir_with_pyvenv_cfg(tmp_path):
+    (tmp_path / "pyvenv.cfg").write_text("home = /fake\n")
+    (tmp_path / "decoy-junk").write_text("anything")
+    assert mcp_server._looks_like_zh_venv(tmp_path)
+
+
+def test_looks_like_zh_venv_accepts_dir_with_our_marker(tmp_path):
+    (tmp_path / mcp_server._VENV_MARKER).write_text("any-hash")
+    (tmp_path / "decoy-junk").write_text("anything")
+    assert mcp_server._looks_like_zh_venv(tmp_path)
+
+
+def test_looks_like_zh_venv_refuses_non_venv_directory(tmp_path):
+    # The pathological case: ZH_MCP_VENV pointed at a user directory by
+    # accident (e.g. `$HOME` typo, `~/projects/myrepo` instead of
+    # `~/projects/myrepo/.venv`). It has contents but no pyvenv.cfg and
+    # no marker — _build_venv must refuse to rmtree it.
+    (tmp_path / "important-document.txt").write_text("don't delete me")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('hi')")
+    assert not mcp_server._looks_like_zh_venv(tmp_path)
 
 
 # -----------------------------------------------------------------------------
@@ -167,3 +220,34 @@ def test_parse_mine_listing_ignores_header_lines():
         "Issues assigned to acme-user (0):\n"
     )
     assert mcp_server._parse_mine_listing(header_only) == []
+
+
+def test_parse_mine_listing_rejects_four_field_shape():
+    # If `zh mine` ever grows a 4th column (or the MCP starts invoking
+    # `--no-urls` mode, which pads the issue number and adds a field),
+    # the tightened pipeline-capture (`[^│]+?` instead of `.+?`) refuses
+    # to match the line rather than silently swallowing the extra column
+    # into `pipeline`. The line is skipped — explicit miss instead of
+    # silent data corruption.
+    four_field = (
+        "  #645 │ acme/widget-app │ In Progress │ extra-field\n"
+        "    a title line\n"
+    )
+    assert mcp_server._parse_mine_listing(four_field) == []
+
+
+def test_parse_mine_listing_title_starting_with_hash():
+    # Real bug class: a legitimate issue title starting with `#` (e.g.
+    # `#perf-2026Q2: foo` or markdown-style `# Goals`) used to trip the
+    # title-bail-out loop, which only checked `startswith("#")` and
+    # exited immediately, leaving title="". Tightened bail-out matches
+    # the full issue-header shape (`#NNN │ ...`) so titles can start
+    # with `#` and still be captured.
+    sample = (
+        "  #645 │ acme/widget-app │ Product Backlog\n"
+        "    #perf-2026Q2: rework batching across hot paths\n"
+        "    → https://app.zenhub.com/anywhere/645\n"
+    )
+    issues = mcp_server._parse_mine_listing(sample)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "#perf-2026Q2: rework batching across hot paths"

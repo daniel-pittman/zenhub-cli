@@ -71,9 +71,11 @@ def _default_venv_dir() -> Path:
     """
     override = os.environ.get("ZH_MCP_VENV")
     if override:
-        return Path(override).expanduser()
-    xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
-        "~/.local/share"
+        # `.resolve()` pins relative paths at startup so the venv doesn't
+        # thrash between projects when the MCP launches from different cwds.
+        return Path(override).expanduser().resolve()
+    xdg_data = os.path.expanduser(
+        os.environ.get("XDG_DATA_HOME") or "~/.local/share"
     )
     return Path(xdg_data) / "zh" / "venv"
 
@@ -123,7 +125,15 @@ def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
     if not (venv_dir / "pyvenv.cfg").exists():
         return False
     marker = venv_dir / _VENV_MARKER
-    if not marker.exists() or marker.read_text().strip() != deps_hash:
+    if not marker.exists():
+        return False
+    try:
+        marker_value = marker.read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        # Corrupt, root-owned, or non-UTF-8 marker → treat as invalid so
+        # the bootstrap rebuilds instead of crashing with a traceback.
+        return False
+    if marker_value != deps_hash:
         return False
     try:
         subprocess.check_call(
@@ -177,14 +187,52 @@ def _find_builder_python() -> str:
     )
 
 
-def _build_venv(venv_dir: Path, deps_hash: str) -> None:
-    """Tear down (if present) and rebuild the venv at `venv_dir`.
+def _looks_like_zh_venv(venv_dir: Path) -> bool:
+    """Return True iff `venv_dir` is safe for `_build_venv` to rmtree.
 
-    On exit the venv has `_VENV_DEPS` installed and the deps-hash marker
-    file written. Sanity-checks that `import mcp` works before returning
-    — a broken build is a hard error, not a silent half-state we'd then
-    re-exec into.
+    A user-controlled `ZH_MCP_VENV` (or a typo'd `XDG_DATA_HOME`) could
+    point the venv path at any directory on disk — including `$HOME` or
+    a tree of unrelated work. Without this guard, a stale/wrong path
+    plus a routine "venv looks invalid" verdict would silently
+    `shutil.rmtree` arbitrary user data on the next launch.
+
+    Safe to delete when:
+      - the directory doesn't exist yet (nothing to remove)
+      - the directory is empty (nothing to lose)
+      - the directory has `pyvenv.cfg` (some venv we can replace) OR
+        our `_VENV_MARKER` file (definitely a venv we built)
+
+    Anything else (e.g. `~/Documents`, a project root) must be removed
+    by the user explicitly.
     """
+    if not venv_dir.exists():
+        return True
+    if not any(venv_dir.iterdir()):
+        return True
+    if (venv_dir / "pyvenv.cfg").exists():
+        return True
+    if (venv_dir / _VENV_MARKER).exists():
+        return True
+    return False
+
+
+def _build_venv(venv_dir: Path, deps_hash: str) -> None:
+    """Tear down (if present and safe) and rebuild the venv at `venv_dir`.
+
+    Refuses to rebuild a directory that doesn't look like a venv (no
+    `pyvenv.cfg`, no `_VENV_MARKER`) to prevent destroying user data
+    pointed at by a typo'd `ZH_MCP_VENV`. Marker is written only AFTER
+    the post-build `import mcp` sanity check passes — so a half-built
+    venv is never certified good.
+    """
+    if not _looks_like_zh_venv(venv_dir):
+        raise RuntimeError(
+            f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: it "
+            f"exists but does not look like a venv we built (no "
+            f"pyvenv.cfg, no {_VENV_MARKER} marker). Check your "
+            f"ZH_MCP_VENV / XDG_DATA_HOME settings; remove the directory "
+            f"manually if you really want it rebuilt."
+        )
     builder = _find_builder_python()
     venv_py = venv_dir / "bin" / "python3"
     if venv_dir.exists():
@@ -209,29 +257,35 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
         [str(venv_py), "-m", "pip", "install",
          "--quiet", "--no-cache-dir", *_VENV_DEPS]
     )
-    (venv_dir / _VENV_MARKER).write_text(deps_hash)
-    # Post-build sanity check. If this fails, the venv build produced
-    # something that can't import its declared deps — fail loudly here
-    # rather than re-exec into a broken interpreter.
+    # Post-build sanity check BEFORE writing the marker. If `import mcp`
+    # fails, the venv is half-built and must not be certified good — the
+    # next launch should rebuild from scratch, not trust a stale marker.
     try:
         subprocess.check_call(
             [str(venv_py), "-c", "import mcp"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, OSError) as exc:
         raise RuntimeError(
             f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
             f"`import mcp`. Delete {venv_dir} and retry; check your "
             f"network and Python installation."
         ) from exc
+    (venv_dir / _VENV_MARKER).write_text(deps_hash)
 
 
 def _bootstrap_venv() -> None:
     deps_hash = _deps_hash()
     if not _venv_is_valid(_VENV_DIR, deps_hash):
         _build_venv(_VENV_DIR, deps_hash)
-    if os.path.realpath(sys.executable) != os.path.realpath(str(_VENV_PY)):
+    # Re-exec into the venv if we're not already running under it.
+    # Compare sys.prefix (the canonical "which prefix am I running under")
+    # to the venv dir, NOT realpath(sys.executable) vs realpath(_VENV_PY)
+    # — those resolve to the same target on Linux when the venv's bin/python
+    # is a symlink to the same builder interpreter as the launcher, which
+    # incorrectly skips the re-exec and leaves us running outside the venv.
+    if Path(sys.prefix).resolve() != _VENV_DIR.resolve():
         os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
 
 
@@ -283,6 +337,11 @@ if str(HERE) not in sys.path:
 
 # ANSI color code regex — zh emits colored output for terminals; strip for MCP.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
+# `  #645 │ owner/repo │ ...`. Used to detect "next issue starts here"
+# when walking title-continuation lines, so titles that legitimately
+# start with `#` aren't mistaken for a new header.
+_ISSUE_HEADER_RE = re.compile(r"^\s*#\d+\s*│")
 
 
 # =============================================================================
@@ -413,10 +472,13 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
             repo = m.group(2)
             pts = m.group(3)
             assignee = m.group(4)
-            # Title is on the next non-empty line, indented
+            # Title is on the next non-empty line, indented. Bail out
+            # only when the line matches the full "next issue header"
+            # shape (`#NNN │ ...`), not just `startswith("#")` — real
+            # titles legitimately start with `#` (e.g. `#perf-2026Q2`).
             title = ""
             j = i + 1
-            while j < len(lines) and not lines[j].strip().startswith("#"):
+            while j < len(lines) and not _ISSUE_HEADER_RE.match(lines[j]):
                 stripped = lines[j].strip()
                 if stripped and not stripped.startswith("→"):
                     title = stripped
@@ -447,18 +509,25 @@ def _parse_mine_listing(plain: str) -> list[dict]:
     lines = plain.splitlines()
     i = 0
     while i < len(lines):
+        # Pipeline capture group is `[^│]+?` (not `.+?`) so it can't
+        # cross another `│` separator. If `zh mine` ever grows a 4th
+        # column the line stops matching here — better than the lazy
+        # `.+?` silently swallowing `"<pipeline> │ <title>"` into
+        # `pipeline` and leaving `title=""` (silent data corruption).
         m = re.match(
-            r"^\s*#(\d+)\s*│\s*(\S+/\S+)\s*│\s*(.+?)\s*$",
+            r"^\s*#(\d+)\s*│\s*(\S+/\S+)\s*│\s*([^│]+?)\s*$",
             lines[i],
         )
         if m:
             number = int(m.group(1))
             repo = m.group(2)
             pipeline = m.group(3).strip()
-            # Title is the next non-empty, non-arrow-URL line.
+            # Title is the next non-empty, non-arrow-URL line. Bail only
+            # on a real `#NNN │ ...` header — not on titles that happen
+            # to start with `#`.
             title = ""
             j = i + 1
-            while j < len(lines) and not lines[j].strip().startswith("#"):
+            while j < len(lines) and not _ISSUE_HEADER_RE.match(lines[j]):
                 stripped = lines[j].strip()
                 if stripped and not stripped.startswith("→"):
                     title = stripped
