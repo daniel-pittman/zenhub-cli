@@ -187,3 +187,71 @@ def test_run_zh_binary_missing_returns_stderr_plain():
     # The early-return path has no ANSI in its synthesized message,
     # but stderr_plain must still be a string.
     assert isinstance(result["stderr_plain"], str)
+
+
+def test_run_zh_timeout_stderr_includes_captured_diagnostic(monkeypatch):
+    """Round-7 #5 SPEC pin: the timeout branch's `stderr` and
+    `stderr_plain` describe the same subprocess state with vs
+    without ANSI escapes. Pre-fix `stderr` was the synthetic
+    timeout message only — callers reading it lost any diagnostic
+    the subprocess had emitted before timing out.
+
+    SPEC: both fields contain the captured diagnostic (when
+    present) AND the synthetic timeout suffix.
+    """
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        # TimeoutExpired's stdout/stderr are set as attributes after
+        # __init__, not kwargs to it.
+        exc = subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs.get("timeout", 60),
+        )
+        exc.stdout = "partial stdout output"
+        exc.stderr = "\x1b[31mfatal: about to fail\x1b[0m"
+        raise exc
+
+    import pathlib
+    monkeypatch.setattr(pathlib.Path, "exists", lambda self: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = mcp_server._run_zh(["test"], timeout=5.0)
+    # stderr retains the captured diagnostic (with ANSI)
+    assert "fatal: about to fail" in result["stderr"], (
+        f"Round-7 #5: stderr must include the captured diagnostic; "
+        f"got {result['stderr']!r}"
+    )
+    assert "\x1b[31m" in result["stderr"]
+    # stderr_plain has the same content with ANSI stripped
+    assert "fatal: about to fail" in result["stderr_plain"]
+    assert "\x1b[31m" not in result["stderr_plain"]
+    # Both fields include the synthetic timeout suffix
+    assert "timed out after" in result["stderr"]
+    assert "timed out after" in result["stderr_plain"]
+
+
+def test_run_zh_timeout_no_captured_stderr_keeps_synthetic_only(monkeypatch):
+    """Round-7 #5 — when the timeout has no captured stderr, the
+    synthetic message stands alone (no leading newline)."""
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        exc = subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs.get("timeout", 60),
+        )
+        # exc.stdout / exc.stderr default to None when unset
+        raise exc
+
+    import pathlib
+    monkeypatch.setattr(pathlib.Path, "exists", lambda self: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = mcp_server._run_zh(["test"], timeout=5.0)
+    # No spurious leading newline when there's no captured diagnostic
+    assert not result["stderr"].startswith("\n"), (
+        f"unexpected leading newline: {result['stderr']!r}"
+    )
+    assert "timed out after" in result["stderr"]
+    assert result["stderr"] == result["stderr_plain"]  # no ANSI to strip

@@ -227,21 +227,31 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
         # callers reading stderr would otherwise see raw `\x1b[...m`
         # escape codes embedded in error messages. Same symmetric
         # fix applies to the success-return path below.
+        #
+        # Round-7 #5: align `stderr` and `stderr_plain` so they
+        # describe the same subprocess state, just with vs without
+        # ANSI escapes. Pre-fix `stderr` was the synthetic timeout
+        # message only, while `stderr_plain` preferred the captured
+        # `e.stderr` (when non-empty). The two diverged — callers
+        # reading `stderr` lost any diagnostic the subprocess had
+        # emitted before timing out. Now both fields contain the
+        # captured diagnostic (when present) AND the synthetic
+        # timeout suffix.
+        captured_stderr = e.stderr or ""
+        synthetic = (
+            f"zh subprocess timed out after {timeout}s (args={args!r})"
+        )
+        combined_stderr = (
+            f"{captured_stderr}\n{synthetic}"
+            if captured_stderr else synthetic
+        )
         return {
             "ok": False,
             "exit_code": -1,
             "stdout": e.stdout or "",
-            "stderr": (
-                f"zh subprocess timed out after {timeout}s "
-                f"(args={args!r})"
-            ),
+            "stderr": combined_stderr,
             "stdout_plain": _ANSI_RE.sub("", e.stdout or ""),
-            "stderr_plain": _ANSI_RE.sub(
-                "", e.stderr or (
-                    f"zh subprocess timed out after {timeout}s "
-                    f"(args={args!r})"
-                )
-            ),
+            "stderr_plain": _ANSI_RE.sub("", combined_stderr),
         }
     return {
         "ok": result.returncode == 0,

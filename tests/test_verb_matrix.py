@@ -1308,37 +1308,11 @@ class TestRemoveIssuesFromSprint:
             issue_by_info_response(100),
             issue_by_info_response(101),
             remove_issues_from_sprints_response(empty_sprints=True),
+            # Walker reaches #101 (still-attached, our repo) then
+            # bails. The canonical SPEC contract is below; the
+            # cross-repo inflation scenario is pinned by
+            # `test_partial_walk_no_inflation_across_repos`.
             sprint_issues_page(
-                # Walker observes the post-mutation sprint contains
-                # #999 (sibling that wasn't touched) AND our input
-                # #101 (still-attached failure). It does NOT contain
-                # #100 — meaning the removal of #100 was confirmed by
-                # what the walker saw. So #100 IS in succeeded ONLY
-                # if walked_numbers includes it. The walker's
-                # walked_numbers is pre-repo-filter and includes
-                # everything it iterated. To get #100 into
-                # walked_numbers we'd need it to actually appear in
-                # the walk pages — which contradicts "removed."
-                #
-                # The clean version of this test would mock the
-                # walker page-by-page and have the walker traverse
-                # the WHOLE sprint excluding #100 (because #100 was
-                # removed). But walked_numbers is built from the
-                # iterated nodes, and #100 won't be in iterated
-                # nodes if it was removed. So #100 is correctly
-                # un-verified — the partial-coverage semantics say
-                # "we never SAW #100's absence specifically; we just
-                # didn't reach pages where it would have been."
-                #
-                # In other words: partial-walk SUCCEEDED detection
-                # of removals is only possible when the walker
-                # observes the FULL post-state, at which point we're
-                # already `inspected_full=True`. Under partial
-                # coverage, succeeded for a removal verb is always
-                # [] (no removal can be confirmed without seeing
-                # the whole sprint).
-                #
-                # This is a deeper SPEC observation worth pinning:
                 [sprint_issue_wrapper(101)],
                 has_next=True, end_cursor=None,
             ),
