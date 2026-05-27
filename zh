@@ -3712,10 +3712,31 @@ Examples:
     # callers of the walker (`cmd_sprint`) don't compute
     # `walked_nums_csv` at all, so the fallback was dead in
     # practice.
+    #
+    # Round-8 #6: change the missing-field handler from `error`
+    # (exit 1, "re-run") to `warn` + `exit 2`. The mutation has
+    # already fired at zh:3633 — bailing with "re-run if it
+    # persists" lies to scripted callers about whether the change
+    # landed. Mirror the null-node soft-fail pattern at zh:3663-3675:
+    # tell the user the mutation succeeded but post-state can't be
+    # confirmed, and exit with the same distinct non-zero code
+    # (2) so callers can disambiguate "real failure" from
+    # "coverage incomplete, re-verify."
+    #
+    # Round-8 #13 folded in: tighten the jq emit to distinguish
+    # "missing/non-array" (structural bug) from "empty array"
+    # (legitimate zero-walk under e.g. a fresh empty sprint). The
+    # pre-fix `if .walked_nums then ...` short-circuited on the
+    # empty list `[]` because jq treats `[]` as falsy in `if`,
+    # mis-classifying empty as missing. Use a type check instead.
     local walked_nums_csv
-    walked_nums_csv=$(echo "$post_state" | jq -r 'if .walked_nums then (.walked_nums | map(tostring) | join(",")) else null end')
-    if [[ "$walked_nums_csv" == "null" ]]; then
-        error "Walker output is missing the 'walked_nums' field — internal bug. Re-run; if it persists, report it."
+    walked_nums_csv=$(echo "$post_state" | jq -r 'if (.walked_nums | type) == "array" then (.walked_nums | map(tostring) | join(",")) else "__MISSING__" end')
+    if [[ "$walked_nums_csv" == "__MISSING__" ]]; then
+        echo ""
+        warn "Mutation landed (removeIssuesFromSprints succeeded), but post-state could not be confirmed:"
+        warn "  Walker output is missing the 'walked_nums' field (internal bug)"
+        warn "Re-verify with 'zh sprint show \"${sprint_actual_name}\"' to see the current state."
+        exit 2
     fi
 
     local input_nums_csv
