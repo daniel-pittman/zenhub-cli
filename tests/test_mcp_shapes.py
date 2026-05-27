@@ -135,3 +135,55 @@ def test_subissue_remove_children_empty_returns_full_shape():
     assert r["ok"] is False
     assert "child_numbers" in r["stderr"]
     _has_keys(r, SUBISSUE_MUTATION_KEYS)
+
+
+def test_run_zh_strips_ansi_from_stderr_plain(monkeypatch):
+    """Round-6 #15 SPEC pin: `_run_zh` returns both `stdout_plain`
+    AND `stderr_plain` with ANSI escape codes stripped. Pre-fix,
+    only stdout got the strip — MCP callers surfacing tool errors
+    saw raw `\\x1b[...m` codes embedded in error messages.
+    """
+    import subprocess
+
+    class _FakeResult:
+        def __init__(self):
+            self.returncode = 1
+            self.stdout = "\x1b[31mfoo\x1b[0m"
+            self.stderr = "\x1b[31mError: not found\x1b[0m"
+
+    def fake_run(*args, **kwargs):
+        return _FakeResult()
+
+    # Patch ZH_BIN.exists so _run_zh proceeds past the early-return
+    # binary-missing branch.
+    import pathlib
+    monkeypatch.setattr(
+        pathlib.Path, "exists", lambda self: True
+    )
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = mcp_server._run_zh(["test"])
+    # Original streams retain escape codes
+    assert "\x1b[31m" in result["stdout"]
+    assert "\x1b[31m" in result["stderr"]
+    # _plain variants strip them
+    assert result["stdout_plain"] == "foo"
+    assert result["stderr_plain"] == "Error: not found", (
+        f"stderr_plain should be ANSI-free; got {result['stderr_plain']!r}"
+    )
+
+
+def test_run_zh_binary_missing_returns_stderr_plain():
+    """Round-6 #15: even the early-return path when the binary is
+    missing must include `stderr_plain` for shape consistency
+    (callers that always read .get('stderr_plain', '') don't
+    KeyError on this path).
+    """
+    import pathlib
+    from unittest.mock import patch
+    with patch.object(pathlib.Path, "exists", return_value=False):
+        result = mcp_server._run_zh(["test"])
+    assert "stderr_plain" in result
+    # The early-return path has no ANSI in its synthesized message,
+    # but stderr_plain must still be a string.
+    assert isinstance(result["stderr_plain"], str)

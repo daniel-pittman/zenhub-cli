@@ -1240,6 +1240,7 @@ def _find_sprint_id(
     listing = list_sprints(ctx, include_closed=True)
     sprints = listing.get("sprints") or []
     active_id = listing.get("active_sprint_id")
+    listing_pagination_warning = listing.get("pagination_warning")
     if want.lower() in {"current", "active"}:
         if not active_id:
             return None, None, "No active sprint in this workspace"
@@ -1254,6 +1255,22 @@ def _find_sprint_id(
         if (s.get("name") or "").lower() == want_lc:
             return s.get("id"), s.get("name"), None
     available = ", ".join(s.get("name") or "?" for s in sprints) or "(none)"
+    # Round-6 #11: when the sprints listing bailed mid-walk, a
+    # "not found" message is misleading — the sprint may exist on
+    # an unreached page. Tell the user the listing was incomplete
+    # so they can re-run rather than assume the sprint doesn't
+    # exist.
+    if listing_pagination_warning:
+        return (
+            None,
+            None,
+            (
+                f"Sprint {sprint_name!r} not found in the first "
+                f"{len(sprints)} walked sprints — listing was "
+                f"incomplete due to: {listing_pagination_warning}. "
+                f"Try re-running, or provide an exact sprint id."
+            ),
+        )
     return (
         None,
         None,

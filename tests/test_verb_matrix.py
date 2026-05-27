@@ -726,6 +726,31 @@ class TestGetSprintDetail:
         assert out["ok"] is False
         assert "not found" in (out["error"] or "").lower()
 
+    def test_find_sprint_id_surfaces_pagination_warning(self):
+        """Round-6 #11 SPEC pin: when the sprints listing bailed
+        mid-walk and the requested sprint isn't in the partial set,
+        the error must say so rather than just claiming "not found."
+        Otherwise the user might assume the sprint doesn't exist
+        when it's actually on an unreached page.
+        """
+        ctx = make_ctx()
+        # Page 1 has Sprint 7, then bails on stuck cursor.
+        with patch_ctx_query(ctx, [
+            sprints_page(
+                [sprint_node("sprint-7", "Sprint 7")],
+                has_next=True, end_cursor=None,  # stuck cursor
+            ),
+        ]):
+            out = zh_graphql_ops.get_sprint_detail(ctx, "Sprint 99")
+        assert out["ok"] is False
+        err = (out["error"] or "").lower()
+        assert "incomplete" in err, (
+            f"expected 'incomplete' in error to flag the partial walk; "
+            f"got: {err!r}"
+        )
+        # Mention the bail reason so the user can decide what to do
+        assert "stuck_cursor" in err or "cursor" in err
+
     def test_walks_issue_pagination(self):
         ctx = make_ctx()
         page1 = [sprint_issue_wrapper(i) for i in range(1, 101)]
@@ -1930,3 +1955,69 @@ class TestBashDispatcher:
         result = self._run_zh("-r", "acme/widgets", "-w", "Backend")
         combined = (result.stdout or "") + (result.stderr or "")
         assert "unbound variable" not in combined
+
+    def test_load_config_env_wins_over_config(self, tmp_path):
+        """Round-6 #14 SPEC pin: env var beats config file, matching
+        Python `resolve_context` precedence (round-3 #11 SPEC).
+
+        Pre-round-6 the bash side `source $CONFIG_FILE` overwrote
+        env-set values with config-file values — config-wins. The
+        two sides disagreed: a user with `export ZH_REPO=x` and a
+        stale config file would see Python use `x` and bash silently
+        use the config value. Round-6 fixes the bash side.
+        """
+        import os
+        import subprocess
+        # Build a temp config file
+        cfg = tmp_path / "config"
+        cfg.write_text(
+            "ZH_TOKEN=tok_from_config\n"
+            "ZH_REPO=repo_from_config\n"
+            "ZH_WORKSPACE=ws_from_config\n"
+        )
+        # Extract load_config from zh and run with the temp config.
+        # Use a wrapper script so we can override CONFIG_FILE and
+        # call load_config in isolation.
+        env = os.environ.copy()
+        env["CONFIG_FILE"] = str(cfg)
+        env["ZH_REPO"] = "repo_from_env"
+        # ZH_TOKEN not set in env → config should win
+        env.pop("ZH_TOKEN", None)
+        env.pop("ZH_WORKSPACE", None)
+
+        # Inline shell that sources zh's load_config and dumps the
+        # resolved values. Routes through `bash zh workspaces` —
+        # this will fail at the gh api call but we only need to
+        # observe the resolved env vars BEFORE the API attempt.
+        # Simpler: extract load_config and run it directly.
+        wrapper = tmp_path / "wrapper.sh"
+        zh_path = str(self._ZH_SCRIPT)
+        wrapper.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            "error() { echo \"ERROR: $1\" >&2; exit 1; }\n"
+            f"eval \"$(awk '/^load_config\\(\\)/,/^}}/' {zh_path})\"\n"
+            "load_config\n"
+            "echo \"TOKEN=$ZH_TOKEN\"\n"
+            "echo \"REPO=$ZH_REPO\"\n"
+            "echo \"WS=$ZH_WORKSPACE\"\n"
+        )
+        wrapper.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(wrapper)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        out = result.stdout
+        # Config token (env unset) → config wins
+        assert "TOKEN=tok_from_config" in out, (
+            f"expected token from config; got: {out!r}"
+        )
+        # Env repo set → env wins
+        assert "REPO=repo_from_env" in out, (
+            f"Round-6 #14: env var should win over config file. "
+            f"got: {out!r}"
+        )
+        # Workspace env unset → config wins
+        assert "WS=ws_from_config" in out, (
+            f"expected workspace from config; got: {out!r}"
+        )

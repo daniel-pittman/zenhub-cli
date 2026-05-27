@@ -374,9 +374,18 @@ def list_workspaces(
         check_graphql_errors(resp, context="workspacesConnection")
         repos = (resp.get("data") or {}).get("repositoriesByGhId") or []
         if not repos:
-            raise ZhApiError(
-                f"No ZenHub repository found for GitHub {owner_repo}"
-            )
+            # Round-6 #12: raise only on page 1 (nothing accumulated
+            # yet). On page 2+, treat the empty response as a
+            # transient API blip — break and return what we've
+            # accumulated rather than discarding it. Without this
+            # guard, a server-side hiccup on a deep walk would
+            # discard 50+ already-fetched workspaces and force the
+            # user to retry.
+            if not out:
+                raise ZhApiError(
+                    f"No ZenHub repository found for GitHub {owner_repo}"
+                )
+            break
         conn = repos[0].get("workspacesConnection") or {}
         for n in conn.get("nodes") or []:
             out.append(n)

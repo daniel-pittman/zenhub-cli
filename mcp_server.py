@@ -211,6 +211,7 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
             "stdout": "",
             "stderr": f"zh binary not found at {ZH_BIN}",
             "stdout_plain": "",
+            "stderr_plain": "",
         }
     try:
         result = subprocess.run(
@@ -222,6 +223,10 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
+        # Round-6 #15: also strip ANSI from stderr_plain. MCP
+        # callers reading stderr would otherwise see raw `\x1b[...m`
+        # escape codes embedded in error messages. Same symmetric
+        # fix applies to the success-return path below.
         return {
             "ok": False,
             "exit_code": -1,
@@ -231,6 +236,12 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
                 f"(args={args!r})"
             ),
             "stdout_plain": _ANSI_RE.sub("", e.stdout or ""),
+            "stderr_plain": _ANSI_RE.sub(
+                "", e.stderr or (
+                    f"zh subprocess timed out after {timeout}s "
+                    f"(args={args!r})"
+                )
+            ),
         }
     return {
         "ok": result.returncode == 0,
@@ -238,6 +249,10 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
         "stdout": result.stdout,
         "stderr": result.stderr,
         "stdout_plain": _ANSI_RE.sub("", result.stdout),
+        # Round-6 #15: symmetric ANSI strip on stderr — MCP callers
+        # surfacing tool errors should see human-readable text, not
+        # escape codes.
+        "stderr_plain": _ANSI_RE.sub("", result.stderr),
     }
 
 

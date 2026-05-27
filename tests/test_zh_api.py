@@ -223,6 +223,52 @@ def test_list_workspaces_stuck_cursor_bails(monkeypatch):
     assert {n["id"] for n in nodes} == {"ws-a"}
 
 
+def test_list_workspaces_preserves_page1_on_page2_empty(monkeypatch):
+    """Round-6 #12 SPEC pin: when page 2+ returns an empty
+    repositoriesByGhId (transient API blip), preserve the
+    accumulated page-1 state instead of raising and discarding it.
+
+    Pre-fix: 50 workspaces fetched on page 1, page 2 returns empty
+    repositoriesByGhId → raise ZhApiError, all 50 discarded.
+    SPEC: break and return the 50; only raise when the FIRST page
+    is empty (nothing accumulated).
+    """
+    monkeypatch.setattr(zh_api, "get_gh_repo_id", lambda *a, **kw: 123)
+    page1 = _ws_page(
+        [{"id": f"ws-{i}", "name": f"W{i}"} for i in range(50)],
+        has_next=True, end_cursor="cur1",
+    )
+    # Page 2: empty repositoriesByGhId (transient blip)
+    page2 = {"data": {"repositoriesByGhId": []}}
+    responses = iter([page1, page2])
+    monkeypatch.setattr(
+        zh_api, "graphql_request",
+        lambda *a, **kw: next(responses),
+    )
+    nodes = zh_api.list_workspaces("acme/widgets", token="t", gh_token="t")
+    # SPEC: all 50 page-1 workspaces preserved, no raise.
+    assert len(nodes) == 50, (
+        f"page-1 state discarded on page-2 blip; got {len(nodes)} "
+        f"workspaces, expected 50"
+    )
+
+
+def test_list_workspaces_raises_when_page1_empty(monkeypatch):
+    """Round-6 #12 — sanity for the symmetric case: when the FIRST
+    page is empty (nothing accumulated yet), keep raising — that's
+    a real "repo doesn't exist" signal.
+    """
+    monkeypatch.setattr(zh_api, "get_gh_repo_id", lambda *a, **kw: 123)
+    page1 = {"data": {"repositoriesByGhId": []}}
+    monkeypatch.setattr(
+        zh_api, "graphql_request",
+        lambda *a, **kw: page1,
+    )
+    with pytest.raises(zh_api.ZhApiError) as exc:
+        zh_api.list_workspaces("acme/widgets", token="t", gh_token="t")
+    assert "no zenhub repository found" in str(exc.value).lower()
+
+
 # =============================================================================
 # Env-var contract: resolve_context honors the same vars bash exports
 # =============================================================================

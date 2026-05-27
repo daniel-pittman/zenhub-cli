@@ -61,17 +61,78 @@ success() {
 
 # Load configuration
 load_config() {
-    # Check for config file
-    if [[ -f "$CONFIG_FILE" ]]; then
-        # shellcheck source=/dev/null
-        source "$CONFIG_FILE"
-    fi
+    # Round-6 #14: precedence must be env > config (to match Python
+    # `resolve_context` round-3 #11 SPEC).
+    #
+    # The pre-fix idiom `source $CONFIG_FILE` overwrote any
+    # environment-set values with config-file values — config-wins.
+    # That was inverted vs the Python side, which read env first
+    # and only fell back to config. A user with `export ZH_REPO=
+    # acme/widgets` and a stale config file would see Python pick
+    # `acme/widgets` while bash silently used the config value.
+    #
+    # Fix: source each config file in a SUBSHELL, capture the
+    # variables we care about, then apply them only when the
+    # caller's env is unset. The subshell isolates the source so
+    # the file's full set of side effects doesn't leak into our
+    # process. Quoted-value handling stays correct because bash
+    # parses the file with its own rules in the subshell.
+    local config_zh_token=""
+    local config_zh_rest_token=""
+    local config_zh_repo=""
+    local config_zh_workspace=""
 
-    # Check for local .env file
-    if [[ -f ".env" ]]; then
-        # shellcheck source=/dev/null
-        source ".env"
-    fi
+    _load_config_from() {
+        local src="$1"
+        [[ -f "$src" ]] || return 0
+        # Subshell isolates the source: unset our target vars first
+        # so the subshell starts with them empty, then source the
+        # file and emit each captured value on its OWN line so the
+        # outer reader can pick them by line position. `read -r` with
+        # tab-delimited values collapses consecutive tabs (empty
+        # fields disappear), so line-per-value is the robust shape.
+        local sourced
+        sourced=$(
+            unset ZH_TOKEN ZH_REST_TOKEN ZH_REPO ZH_WORKSPACE
+            # shellcheck disable=SC1090
+            source "$src" 2>/dev/null
+            printf '%s\n' \
+                "${ZH_TOKEN:-}" \
+                "${ZH_REST_TOKEN:-}" \
+                "${ZH_REPO:-}" \
+                "${ZH_WORKSPACE:-}"
+        )
+        # Parse line-by-line; empty lines stay as empty values.
+        local line idx=0
+        local t="" r="" p="" w=""
+        while IFS= read -r line; do
+            case "$idx" in
+                0) t="$line" ;;
+                1) r="$line" ;;
+                2) p="$line" ;;
+                3) w="$line" ;;
+            esac
+            idx=$((idx + 1))
+        done <<< "$sourced"
+        # First-wins across the two config sources: only set if not
+        # already set by an earlier source (or env, see apply step).
+        [[ -z "$config_zh_token" ]] && config_zh_token="$t"
+        [[ -z "$config_zh_rest_token" ]] && config_zh_rest_token="$r"
+        [[ -z "$config_zh_repo" ]] && config_zh_repo="$p"
+        [[ -z "$config_zh_workspace" ]] && config_zh_workspace="$w"
+    }
+
+    _load_config_from "$CONFIG_FILE"
+    _load_config_from ".env"
+    unset -f _load_config_from
+
+    # Apply config values ONLY where the corresponding env var is
+    # unset/empty. Env wins; config is fallback. Matches Python's
+    # resolve_context precedence.
+    ZH_TOKEN="${ZH_TOKEN:-$config_zh_token}"
+    ZH_REST_TOKEN="${ZH_REST_TOKEN:-$config_zh_rest_token}"
+    ZH_REPO="${ZH_REPO:-$config_zh_repo}"
+    ZH_WORKSPACE="${ZH_WORKSPACE:-$config_zh_workspace}"
 
     # Validate required config
     if [[ -z "${ZH_TOKEN:-}" ]]; then
@@ -2766,11 +2827,16 @@ zh_sprints_fetch_all() {
     local workspace_name=""
     local active_sprint_id=""
     local first_page=true
+    # Round-6 #11: emit a `pagination_bailed` sentinel so callers
+    # like zh_resolve_sprint_id can downgrade their "not found"
+    # messaging when the walk was incomplete.
+    local pagination_bailed=""
 
     while :; do
         iterations=$((iterations + 1))
         if [[ "$iterations" -gt "$ZH_SPRINT_PAGINATION_CAP" ]]; then
             warn "Sprint pagination iteration cap (${ZH_SPRINT_PAGINATION_CAP}) reached"
+            pagination_bailed="iteration_cap"
             break
         fi
 
@@ -2816,6 +2882,7 @@ zh_sprints_fetch_all() {
         fi
         if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
             warn "Sprint pagination cursor not advancing — bailing"
+            pagination_bailed="stuck_cursor"
             break
         fi
         last_cursor="$end_cursor"
@@ -2826,7 +2893,8 @@ zh_sprints_fetch_all() {
         --arg workspace_name "$workspace_name" \
         --arg active_sprint_id "$active_sprint_id" \
         --argjson nodes "$all_nodes" \
-        '{workspace_name: $workspace_name, active_sprint_id: $active_sprint_id, nodes: $nodes}'
+        --arg pagination_bailed "$pagination_bailed" \
+        '{workspace_name: $workspace_name, active_sprint_id: $active_sprint_id, nodes: $nodes, pagination_bailed: $pagination_bailed}'
 }
 
 cmd_sprints() {
@@ -3159,6 +3227,13 @@ Examples:
     local issues_json
     issues_json=$(zh_sprint_issues_fetch_all "$sprint_id")
 
+    # Round-6 #13: the read-only sprint view used to silently
+    # truncate the issues list under partial coverage. Now mirror
+    # cmd_sprint_remove's footer — surface the bail reason so the
+    # user knows the listing was incomplete.
+    local sprint_pagination_bailed
+    sprint_pagination_bailed=$(echo "$issues_json" | jq -r '.pagination_bailed // ""')
+
     local sprint_state start_at end_at completed_pts total_pts closed_count description
     sprint_state=$(echo "$detail_response" | jq -r '.data.node.state // "UNKNOWN"')
     start_at=$(echo "$detail_response" | jq -r '.data.node.startAt[:10] // "?"')
@@ -3203,6 +3278,14 @@ Examples:
         fi
     fi
     echo ""
+
+    # Round-6 #13: footer warning when the issues walk was
+    # partial. Exit 2 so scripted callers can branch on it.
+    if [[ -n "$sprint_pagination_bailed" ]]; then
+        warn "Showing the first ${issue_count} issue(s) only — pagination incomplete: ${sprint_pagination_bailed}."
+        warn "  Re-run 'zh sprint show \"${sprint_name}\"' to retry the listing."
+        exit 2
+    fi
 }
 
 cmd_sprint_current() {
@@ -3220,6 +3303,12 @@ zh_resolve_sprint_id() {
     local sprints_json
     sprints_json=$(zh_sprints_fetch_all "$workspace_id" "")
 
+    # Round-6 #11: when the sprints listing bailed mid-walk, a
+    # "not found" message is misleading — the sprint may exist on
+    # an unreached page. Tell the user.
+    local listing_bailed
+    listing_bailed=$(echo "$sprints_json" | jq -r '.pagination_bailed // ""')
+
     local sprint_id sprint_actual_name
     if [[ "$sprint_name" == "current" || "$sprint_name" == "active" ]]; then
         sprint_id=$(echo "$sprints_json" | jq -r '.active_sprint_id // empty')
@@ -3236,6 +3325,11 @@ zh_resolve_sprint_id() {
 
         if [[ -z "$sprint_id" ]]; then
             echo -e "${RED}Error:${NC} Sprint '${sprint_name}' not found." >&2
+            if [[ -n "$listing_bailed" ]]; then
+                echo "" >&2
+                echo "  Listing was incomplete due to: ${listing_bailed}." >&2
+                echo "  The sprint may exist on an unreached page; try re-running." >&2
+            fi
             echo "" >&2
             echo "Available sprints:" >&2
             echo "$sprints_json" | jq -r '.nodes[] | "  - \(.name) (\(.state))"' >&2
