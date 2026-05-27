@@ -3729,20 +3729,25 @@ Examples:
     # pre-fix `if .walked_nums then ...` short-circuited on the
     # empty list `[]` because jq treats `[]` as falsy in `if`,
     # mis-classifying empty as missing. Use a type check instead.
-    # Round-10 Pattern C (round-9 #7): broaden the missing-field
-    # guard to also catch the case where jq itself errored out.
-    # Pre-fix: jq's stderr went to /dev/null implicitly and the
-    # command substitution produced "" — which doesn't match
-    # "__MISSING__", so the structural-bug branch never fired.
-    # The script runs under `set -euo pipefail` but `inherit_errexit`
-    # is NOT set, so subshells like `$(echo ... | jq ...)` don't
-    # propagate jq's non-zero exit to the parent shell. Catching
-    # the empty-string case here is a belt-and-suspenders fix that
-    # avoids needing `shopt -s inherit_errexit` (which would have
-    # widespread effects on other subshells in this script).
+    # The jq emit distinguishes:
+    #   walked_nums: []   -> ""           (legitimate zero-walk; e.g.
+    #                                       sprint emptied by our own
+    #                                       successful removal)
+    #   walked_nums absent or non-array -> "__MISSING__"
+    #                                       (structural bug; walker
+    #                                        must emit the field as an
+    #                                        array on every call)
+    # Only the sentinel branch is the structural-bug case. An empty
+    # CSV is the normal "nothing left in the sprint" outcome and must
+    # fall through to the regular success path so the user sees
+    # "Removed N/N issue(s)", not a spurious "internal bug" warning.
+    # The `2>/dev/null || echo "__MISSING__"` recovery covers jq itself
+    # failing (since `set -euo pipefail` does not propagate through
+    # command substitution without `shopt -s inherit_errexit`, which we
+    # don't enable here).
     local walked_nums_csv
     walked_nums_csv=$(echo "$post_state" | jq -r 'if (.walked_nums | type) == "array" then (.walked_nums | map(tostring) | join(",")) else "__MISSING__" end' 2>/dev/null || echo "__MISSING__")
-    if [[ -z "$walked_nums_csv" || "$walked_nums_csv" == "__MISSING__" ]]; then
+    if [[ "$walked_nums_csv" == "__MISSING__" ]]; then
         echo ""
         warn "Mutation landed (removeIssuesFromSprints succeeded), but post-state could not be confirmed:"
         warn "  Walker output is missing the 'walked_nums' field (internal bug)"
