@@ -45,6 +45,7 @@ Environment overrides:
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -52,6 +53,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 # -----------------------------------------------------------------------------
@@ -61,13 +64,23 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 
 
-def _default_venv_dir() -> Path:
+def _default_venv_dir() -> tuple[Path, bool]:
     """Compute the default venv location.
 
+    Returns `(venv_dir, user_supplied)`. `user_supplied` is True when
+    the path came from the explicit `ZH_MCP_VENV` env var (subject to
+    strict typo protection downstream) and False when the path is the
+    server-chosen XDG default (subject to permissive auto-mkdir).
+    Threading the flag through to downstream callers (rather than
+    re-reading the env in each consumer) keeps the classification
+    coupled to the path it produced — env mutation between calls
+    can't defeat the typo guard.
+
     Priority:
-      1. ZH_MCP_VENV environment variable (full path).
+      1. ZH_MCP_VENV environment variable (full path) → user_supplied=True
       2. $XDG_DATA_HOME/zh/venv (standard XDG; defaults to
-         ~/.local/share/zh/venv when XDG_DATA_HOME is unset).
+         ~/.local/share/zh/venv when XDG_DATA_HOME is unset) →
+         user_supplied=False
     """
     raw_override = os.environ.get("ZH_MCP_VENV")
     if raw_override is not None and not raw_override.strip():
@@ -84,16 +97,38 @@ def _default_venv_dir() -> Path:
         )
     override = (raw_override or "").strip()
     if override:
-        return Path(override).expanduser().resolve()
-    xdg_data = os.path.expanduser(
-        os.environ.get("XDG_DATA_HOME") or "~/.local/share"
-    )
+        expanded = Path(override).expanduser()
+        if str(expanded).startswith("~"):
+            # Same protection as the XDG branch below: HOME unset →
+            # expanduser leaves `~` unchanged → resolve() pins it to
+            # cwd, producing a literal `~` directory + rebuild loop
+            # across cwds.
+            raise RuntimeError(
+                f"[zenhub-mcp] cannot resolve home directory in "
+                f"ZH_MCP_VENV={override!r} (HOME is unset). Set HOME or "
+                f"give ZH_MCP_VENV an absolute path."
+            )
+        return expanded.resolve(), True
+    xdg_raw = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
+    xdg_data = os.path.expanduser(xdg_raw)
+    if xdg_data.startswith("~"):
+        # `expanduser` returns the input unchanged when HOME is unset
+        # (sandboxed CI, certain systemd / launchd configurations).
+        # `Path("~/...").resolve()` would then resolve against cwd and
+        # produce a literal `~` directory under the working directory —
+        # different across launches, triggering rebuild loops.
+        raise RuntimeError(
+            f"[zenhub-mcp] cannot resolve home directory in {xdg_raw!r} "
+            f"(HOME is unset). Set HOME, set XDG_DATA_HOME to an "
+            f"absolute path, or set ZH_MCP_VENV to point at the venv "
+            f"location explicitly."
+        )
     # `.resolve()` on both branches — pins relative paths (e.g. a
     # mis-configured `XDG_DATA_HOME=./local-data`) at startup so the
     # MCP doesn't thrash between projects when it launches from
     # different cwds, and produces consistent paths in error messages
     # regardless of which branch was taken.
-    return (Path(xdg_data) / "zh" / "venv").resolve()
+    return (Path(xdg_data) / "zh" / "venv").resolve(), False
 
 
 _VENV_DEPS = (
@@ -106,23 +141,39 @@ _VENV_DEPS = (
 )
 _VENV_MIN_PY = (3, 10)  # mcp package requires >= 3.10
 _VENV_MARKER = ".zh-deps-hash"  # records the _VENV_DEPS hash this venv was built for
+_BUILD_SENTINEL = ".zh-build-in-progress"  # written during _build_venv; absent on success
+_BOOTSTRAP_LOCK = ".zh-bootstrap.lock"     # fcntl.flock file for concurrent-launch serialization
 
-# Subprocess timeouts. The probe must stay snappy because it runs on
-# every MCP launch; build steps can take longer (pip + torch download).
-_VENV_PROBE_TIMEOUT = 30        # seconds for `python -c "import ..."`
-_VENV_BUILD_TIMEOUT = 60        # seconds for `python -m venv ...`
-_VENV_PIP_TIMEOUT = 600         # seconds for `pip install ...` (torch is ~400MB)
+# Subprocess timeouts. The per-launch probe stays snappy (mcp only) so
+# slow cold-disk transformers imports don't trigger needless rebuild
+# loops; the post-build probe runs once when caches are warm anyway.
+_VENV_PER_LAUNCH_PROBE_TIMEOUT = 15   # `import mcp` only — fast
+_VENV_FULL_PROBE_TIMEOUT = 60         # all _VENV_DEPS — cold-cache torch import can take ~30s
+_VENV_BUILD_TIMEOUT = 60              # `python -m venv ...`
+_VENV_PIP_TIMEOUT = 600               # `pip install ...` (torch is ~400MB)
 
 
-def _venv_import_probe() -> str:
-    """Build the import-probe command from `_VENV_DEPS` at call time.
+def _venv_per_launch_probe() -> str:
+    """Lightweight probe — just `import mcp` — runs on every MCP launch.
 
-    Recomputes on every call so a test that monkeypatches `_VENV_DEPS`
-    sees a matching probe (mirrors `_deps_hash()`'s lazy pattern).
-    Maps PyPI names to module names by `s/-/_/`. If a future dep has
-    a non-trivial mapping (`Pillow` → `PIL`), the probe fails loudly
-    at the call site, which is the desired behavior — we want a hard
-    error before we certify a half-importable venv as valid.
+    Importing the full _VENV_DEPS tuple (sentence_transformers + torch +
+    numpy) takes seconds on a warm cache and tens of seconds on a cold
+    one — far too costly to pay on every launch. The post-build probe
+    (`_venv_full_probe`) catches half-installed venvs once; per-launch
+    just confirms the interpreter still runs and mcp still imports.
+    """
+    return "import mcp"
+
+
+def _venv_full_probe() -> str:
+    """Heavyweight probe — every declared dep — runs once after build.
+
+    Catches a partial install where one wheel landed cleanly and
+    another failed mid-stream. Recomputes from `_VENV_DEPS` at call
+    time so monkeypatching tests see matching imports. Maps PyPI
+    names to module names by `s/-/_/`. If a future dep has a
+    non-trivial mapping (`Pillow` → `PIL`), the probe fails loudly
+    at the call site — desired behavior.
     """
     return "; ".join(
         f"import {name.replace('-', '_')}" for name in _VENV_DEPS
@@ -172,10 +223,10 @@ def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
         return False
     try:
         subprocess.check_call(
-            [str(venv_py), "-c", _venv_import_probe()],
+            [str(venv_py), "-c", _venv_per_launch_probe()],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=_VENV_PROBE_TIMEOUT,
+            timeout=_VENV_PER_LAUNCH_PROBE_TIMEOUT,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         # Probe failed, timed out, or interpreter is unrunnable —
@@ -242,10 +293,14 @@ def _looks_like_zh_venv(venv_dir: Path) -> bool:
     Safe to delete only when:
       - the path doesn't exist yet (nothing to remove)
       - the path is a directory AND empty (nothing to lose)
-      - the path is a directory AND carries our `_VENV_MARKER` file
-        (definitely a venv we built — `pyvenv.cfg` alone is NOT
-        sufficient, since the user may have pointed ZH_MCP_VENV at
-        their own project's venv)
+      - the path is a directory AND carries our `_VENV_MARKER`
+        (a venv we built and certified) OR `_BUILD_SENTINEL` (a venv
+        a prior `_build_venv` crashed in the middle of). The sentinel
+        is what makes the bootstrap self-healing across crashes /
+        Ctrl-C / SIGKILL mid-build: even with no marker, the sentinel
+        certifies "we own this directory, safe to wipe and retry."
+        `pyvenv.cfg` alone is NOT sufficient — the user may have
+        pointed ZH_MCP_VENV at their own project's venv.
 
     Anything else (a regular file, an unreadable dir, a foreign venv,
     `~/Documents`) must be removed by the user explicitly.
@@ -260,25 +315,177 @@ def _looks_like_zh_venv(venv_dir: Path) -> bool:
         return False  # unreadable, race-deleted, etc.
     if is_empty:
         return True
-    return (venv_dir / _VENV_MARKER).exists()
+    return (
+        (venv_dir / _VENV_MARKER).exists()
+        or (venv_dir / _BUILD_SENTINEL).exists()
+    )
 
 
-def _build_venv(venv_dir: Path, deps_hash: str) -> None:
+def _ensure_safe_parent(venv_dir: Path, *, user_supplied: bool) -> None:
+    """Validate the path's parent before any mkdir.
+
+    Two modes, distinguished by the explicit `user_supplied` flag from
+    `_default_venv_dir`:
+
+    1. **Server-chosen default** (`user_supplied=False`): the path comes
+       from `_default_venv_dir`'s XDG branch — `$XDG_DATA_HOME/zh/venv`,
+       typically `~/.local/share/zh/venv`. `~/.local/share` is NOT
+       guaranteed to exist on fresh macOS accounts, minimal Linux
+       containers (python:slim, distroless, Alpine), DynamicUser=
+       systemd sandboxes, or CI runners with bespoke $HOME. Auto-
+       create the full ancestor tree; the path is server-controlled
+       and not subject to typo risk.
+
+    2. **User-supplied** (`user_supplied=True`): apply strict typo
+       protection. Require the grandparent to pre-exist and only
+       create ONE new directory level. A typo'd path like
+       `ZH_MCP_VENV=~/something-typo/sub/venv` refuses rather than
+       silently materializing a 500MB venv tree at an unexpected
+       location.
+
+    The flag is threaded as a parameter (not re-read from env at each
+    call boundary) so the classification stays coupled to the path
+    `_default_venv_dir` produced. Env mutation between calls can't
+    defeat the typo guard.
+
+    In both modes, a pre-existing regular file at the parent path
+    raises a clear RuntimeError (avoiding the unhelpful
+    `FileExistsError: [Errno 17]` traceback from `mkdir`).
+    """
+    parent = venv_dir.parent
+    if parent.exists():
+        if not parent.is_dir():
+            raise RuntimeError(
+                f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: "
+                f"parent {parent} exists but is not a directory. Remove "
+                f"or rename the stray file, or set ZH_MCP_VENV / "
+                f"XDG_DATA_HOME to point elsewhere."
+            )
+        return
+    if not user_supplied:
+        # Server-chosen XDG default. Auto-create the ancestor tree;
+        # the path is server-controlled. Without this, a fresh user
+        # account where `~/.local/share` doesn't exist yet would fail
+        # to bootstrap — the most common first-launch failure on a
+        # vanilla macOS install.
+        parent.mkdir(parents=True, exist_ok=True)
+        return
+    grandparent = parent.parent
+    if not grandparent.exists():
+        raise RuntimeError(
+            f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: "
+            f"ancestor {grandparent} does not exist. Auto-creating a "
+            f"deep directory tree from a typo'd ZH_MCP_VENV would "
+            f"silently pollute user space — create the parent "
+            f"directory manually and retry."
+        )
+    # `exist_ok=True` because _ensure_safe_parent runs BEFORE the
+    # bootstrap lock is acquired — two concurrent launches can both
+    # pass the `parent.exists()` check above; the second one would
+    # otherwise raise FileExistsError. The single-level-creation
+    # safety property is enforced by the `grandparent.exists()` check
+    # above, not by mkdir's mode.
+    parent.mkdir(exist_ok=True)
+
+
+def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
+    """Robust rmtree that handles symlinks + a NARROW class of EACCES.
+
+    Plain `shutil.rmtree` raises on symlinked dirs (`OSError: Cannot
+    call rmtree on a symbolic link`) and on permission errors mid-walk.
+    This wrapper:
+      - unlinks symlinks instead of recursing (preserves the target)
+      - on `PermissionError` during a walk, chmods BOTH the failing
+        path AND its parent and retries
+      - re-raises if a retry still fails, unless `ignore_errors=True`
+
+    Recoverable cases:
+      - file-unlink failure where the parent dir had write/execute
+        bits dropped (chmod parent → retry unlink succeeds)
+      - empty-dir rmdir failure where the dir itself had mode 000
+        (chmod dir → retry rmdir succeeds)
+
+    NOT recoverable here (despite the chmod retry firing):
+      - `os.scandir` failure on a non-empty user-owned mode-000 dir.
+        CPython's `shutil.rmtree` discards the retried iterator and
+        treats the dir as empty, then `os.rmdir` raises `ENOTEMPTY`.
+        Use `chmod -R u+rwx <path>` manually first.
+      - any file/dir owned by another user (the chmod itself raises
+        `PermissionError`).
+
+    Cleanup-path callers (inside `_build_venv` except blocks) pass
+    `ignore_errors=True` so a failed cleanup doesn't mask the
+    original build failure.
+    """
+    try:
+        if path.is_symlink():
+            # Don't follow the symlink and rmtree the target! Just
+            # remove the link itself.
+            path.unlink()
+            return
+
+        # Bind the rmtree root in the closure so the chmod-parent
+        # retry below can verify the parent it's about to chmod is
+        # INSIDE the cleanup target. Round-3 #1: when shutil.rmtree
+        # fails at the root itself (e.g. `os.scandir(venv_dir)` raises),
+        # `os.path.dirname(p)` is `venv_dir.parent` — a directory
+        # OUTSIDE our cleanup scope. Chmod-ing it silently downgrades
+        # perms on a shared `~/.local/share/zh` or `/srv/shared/...`.
+        # Never modify dirs outside the rmtree root.
+        rmtree_root = path
+
+        def _on_error(func, p, exc_info):
+            # `onerror` (not `onexc`) for Python 3.10 / 3.11 compat.
+            exc_type = exc_info[0]
+            # Defensive `is not None` guard: some `shutil.rmtree`
+            # internals can pass `(None, ..., ...)` for non-OSError
+            # cases, and `issubclass(None, ...)` would TypeError-mask
+            # the real exception.
+            if exc_type is not None and issubclass(exc_type, PermissionError):
+                # Permission to unlink depends on the PARENT dir's
+                # write+execute bits, not on the file's mode. Chmod the
+                # parent ONLY if it sits at or inside the rmtree root —
+                # never the root's own parent.
+                p_parent = Path(p).parent
+                if p_parent == rmtree_root or rmtree_root in p_parent.parents:
+                    try:
+                        os.chmod(str(p_parent), 0o700)
+                    except OSError:
+                        pass
+                try:
+                    os.chmod(p, 0o700)
+                    func(p)
+                    return
+                except OSError:
+                    pass
+            raise exc_info[1]
+
+        shutil.rmtree(path, onerror=_on_error)
+    except OSError:
+        if not ignore_errors:
+            raise
+
+
+def _build_venv(venv_dir: Path, deps_hash: str, *, user_supplied: bool) -> None:
     """Tear down (if present and safe) and rebuild the venv at `venv_dir`.
 
     Refuses to rebuild a directory that doesn't look like a venv (no
-    `pyvenv.cfg`, no `_VENV_MARKER`) to prevent destroying user data
-    pointed at by a typo'd `ZH_MCP_VENV`. Marker is written only AFTER
-    the post-build `import mcp` sanity check passes — so a half-built
-    venv is never certified good.
+    `_VENV_MARKER`, no `_BUILD_SENTINEL`) to prevent destroying user
+    data pointed at by a typo'd `ZH_MCP_VENV`. Writes a sentinel file
+    at the start of the build so a crash mid-flight (Ctrl-C, SIGKILL,
+    OOM, network failure, double-Ctrl-C-during-cleanup) leaves a
+    self-recoverable state: `_looks_like_zh_venv` recognizes the
+    sentinel and the next launch can safely rmtree + rebuild without
+    manual cleanup. The marker is written only after the full
+    post-build probe passes; sentinel is removed last.
     """
     if not _looks_like_zh_venv(venv_dir):
         raise RuntimeError(
             f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: it "
             f"exists but does not look like a venv we built (no "
-            f"{_VENV_MARKER} marker). Check your ZH_MCP_VENV / "
-            f"XDG_DATA_HOME settings; remove the directory manually "
-            f"if you really want it rebuilt."
+            f"{_VENV_MARKER} marker, no {_BUILD_SENTINEL} sentinel). "
+            f"Check your ZH_MCP_VENV / XDG_DATA_HOME settings; remove "
+            f"the directory manually if you really want it rebuilt."
         )
     builder = _find_builder_python(venv_dir)
     venv_py = venv_dir / "bin" / "python3"
@@ -295,14 +502,28 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             file=sys.stderr,
             flush=True,
         )
-    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_safe_parent(venv_dir, user_supplied=user_supplied)
     try:
         # rmtree lives INSIDE the try so a partial rmtree failure
         # (EACCES on a root-owned `__pycache__/*.pyc`, NFS stale
         # handle, antivirus quarantine race) hits the cleanup path
         # rather than escaping uncaught and bricking the next launch.
         if venv_dir.exists():
-            shutil.rmtree(venv_dir)
+            _safe_rmtree(venv_dir)
+        # Pre-create the venv dir and write the sentinel BEFORE any
+        # subprocess. `python -m venv` preserves pre-existing files
+        # in the target dir (it doesn't `--clear` by default), so the
+        # sentinel survives the build. If anything between here and
+        # the final marker write crashes — Ctrl-C, OOM, SIGKILL,
+        # subprocess error — the sentinel stays on disk so the next
+        # launch's _looks_like_zh_venv returns True and recovery is
+        # automatic.
+        venv_dir.mkdir()
+        sentinel = venv_dir / _BUILD_SENTINEL
+        sentinel.write_text(
+            f"deps_hash={deps_hash}\nstarted_at={time.time()}\n",
+            encoding="utf-8",
+        )
         subprocess.check_call(
             [builder, "-m", "venv", str(venv_dir)],
             timeout=_VENV_BUILD_TIMEOUT,
@@ -318,20 +539,20 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             timeout=_VENV_PIP_TIMEOUT,
         )
     except (KeyboardInterrupt, SystemExit):
-        # First-time bootstrap takes minutes (torch is ~400MB). User
-        # Ctrl-C / SIGTERM / sleep mid-install must wipe the partial
-        # venv so the next launch isn't blocked by a markerless
-        # non-empty dir. KeyboardInterrupt is BaseException, not
-        # Exception — it must be caught BEFORE the wider except below.
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        # First-time bootstrap takes minutes (torch is ~400MB). On
+        # Ctrl-C / SIGTERM, attempt cleanup — but if that fails (e.g.
+        # second Ctrl-C during rmtree), the sentinel on disk still
+        # marks the dir as ours, so the next launch can recover
+        # without manual intervention.
+        _safe_rmtree(venv_dir, ignore_errors=True)
         raise
     except (subprocess.TimeoutExpired,
             subprocess.CalledProcessError,
             OSError) as exc:
-        # Build crashed mid-flight — wipe the partial venv so the next
-        # launch's _looks_like_zh_venv sees a missing path (safe to
-        # rebuild) instead of a markerless non-empty dir (refused).
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        # Build crashed mid-flight — clean up so the next launch's
+        # _looks_like_zh_venv sees a missing path (safe to rebuild)
+        # instead of needing the sentinel recovery path.
+        _safe_rmtree(venv_dir, ignore_errors=True)
         if isinstance(exc, subprocess.TimeoutExpired):
             reason = (f"timed out after {exc.timeout}s "
                       f"({exc.cmd[0] if exc.cmd else '?'} ...)")
@@ -342,22 +563,22 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             f"up partial state; check your network (slow PyPI mirror?) "
             f"and Python installation, then retry."
         ) from exc
-    # Post-build sanity check BEFORE writing the marker. Probes EVERY
-    # declared dep (not just `mcp`) so a half-installed venv where
-    # `sentence-transformers` failed mid-stream isn't certified good.
+    # Post-build sanity check BEFORE writing the marker. Uses the FULL
+    # probe (every declared dep, not just `mcp`) so a half-installed
+    # venv where `sentence-transformers` failed mid-stream isn't
+    # certified good. The per-launch probe stays light to avoid cold-
+    # cache transformers-import rebuild loops.
     try:
         subprocess.check_call(
-            [str(venv_py), "-c", _venv_import_probe()],
+            [str(venv_py), "-c", _venv_full_probe()],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=_VENV_PROBE_TIMEOUT,
+            timeout=_VENV_FULL_PROBE_TIMEOUT,
         )
     except (subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
             OSError) as exc:
-        # Same recovery story as the build except above: clean up so
-        # the next launch can rebuild cleanly without manual intervention.
-        shutil.rmtree(venv_dir, ignore_errors=True)
+        _safe_rmtree(venv_dir, ignore_errors=True)
         raise RuntimeError(
             f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
             f"import all declared deps ({', '.join(_VENV_DEPS)}). "
@@ -365,13 +586,73 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             f"Python installation."
         ) from exc
     # Atomic marker write: write to tmp, then os.replace. A SIGKILL
-    # between the probe success and the marker landing would otherwise
-    # leave a fully-working venv that fails validity checks forever,
-    # forcing manual rm. Tmp-and-rename closes that window.
+    # between probe success and the marker landing would otherwise
+    # leave a working venv that fails validity checks forever.
     marker = venv_dir / _VENV_MARKER
     tmp_marker = marker.with_suffix(".tmp")
     tmp_marker.write_text(deps_hash, encoding="utf-8")
     os.replace(tmp_marker, marker)
+    # Sentinel last — the build is fully certified before we declare
+    # it complete. A crash here leaves the marker (good) AND the
+    # sentinel (also harmless — next launch will see the marker and
+    # treat the venv as valid). Swallow non-FileNotFoundError too
+    # (PermissionError, AV-scanner race) — the marker is the source
+    # of truth at this point; the sentinel is cosmetic cleanup.
+    try:
+        sentinel.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _venv_build_lock(venv_dir: Path, *, user_supplied: bool):
+    """Serialize concurrent `_build_venv` invocations via fcntl.flock.
+
+    Two MCP launches that fire within seconds (Claude Code session
+    restart, supervisor reconnect, two terminal windows) used to race
+    on rmtree + pip install with non-deterministic outcomes — one
+    process could rmtree the other's in-flight site-packages, leaving
+    a corrupt venv that the surviving process then certifies as
+    valid. fcntl.flock on a parent-dir lockfile gives us serialization
+    cheaply on POSIX. Callers should re-check `_venv_is_valid` AFTER
+    acquiring the lock — another process may have completed the
+    rebuild while we were waiting.
+
+    Calls `_ensure_safe_parent` BEFORE creating the lock file so a
+    typo'd `ZH_MCP_VENV` doesn't materialize an unintended ancestor
+    tree just to host the lockfile. The lock file lands at
+    `venv_dir.parent / _BOOTSTRAP_LOCK`.
+
+    `user_supplied` is threaded from `_default_venv_dir` so the
+    typo-protection in `_ensure_safe_parent` stays coupled to the
+    path's origin.
+    """
+    _ensure_safe_parent(venv_dir, user_supplied=user_supplied)
+    lock_path = venv_dir.parent / _BOOTSTRAP_LOCK
+    # `O_NOFOLLOW` defeats the symlink-redirect attack vector that's
+    # widest when ZH_MCP_VENV points at a shared-writable parent
+    # (`/tmp`, `/srv/shared`, `/var/cache`). Without it, a local user
+    # with write access to the parent could plant a symlink at
+    # `_BOOTSTRAP_LOCK` → `~/.bashrc` (or any sensitive file).
+    # Currently harmless because we only flock and never write, but
+    # safe against future diagnostic-write additions.
+    # `O_CLOEXEC` ensures the fd doesn't leak into the re-exec'd venv
+    # python or any subprocess pip spawns.
+    # Mode `0o600` keeps the lockfile single-user since it's per-process
+    # coordination state, not data anyone else needs to read.
+    fd = os.open(
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _bootstrap_venv() -> None:
@@ -379,11 +660,17 @@ def _bootstrap_venv() -> None:
     # test that monkeypatches the env vars sees them — and so an
     # unreadable parent path doesn't crash module import for tests
     # that set ZH_MCP_SKIP_BOOTSTRAP=1.
-    venv_dir = _default_venv_dir()
+    venv_dir, user_supplied = _default_venv_dir()
     venv_py = venv_dir / "bin" / "python3"
     deps_hash = _deps_hash()
     if not _venv_is_valid(venv_dir, deps_hash):
-        _build_venv(venv_dir, deps_hash)
+        # Serialize concurrent bootstraps. After acquiring the lock,
+        # re-check validity — another process may have finished while
+        # we were waiting, in which case skipping the rebuild saves
+        # ~5 minutes of redundant torch download.
+        with _venv_build_lock(venv_dir, user_supplied=user_supplied):
+            if not _venv_is_valid(venv_dir, deps_hash):
+                _build_venv(venv_dir, deps_hash, user_supplied=user_supplied)
     # Re-exec into the venv if we're not already running under it.
     # Compare sys.prefix (the canonical "which prefix am I running under")
     # to the venv dir, NOT realpath(sys.executable) vs realpath(venv_py)
@@ -398,10 +685,26 @@ def _bootstrap_venv() -> None:
         # launch and bootstrap.
         sys.stderr.flush()
         sys.stdout.flush()
-        os.execv(
-            str(venv_py),
-            [str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]],
-        )
+        argv = [str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]]
+        try:
+            os.execv(str(venv_py), argv)
+        except OSError:
+            # TOCTOU: the venv was wiped between _venv_is_valid and
+            # execv (concurrent rm, broken symlink, race-deleted bin/
+            # by a stale clean-up script). Rebuild once and retry; if
+            # the second exec also fails, let it propagate.
+            print(
+                f"[zenhub-mcp] {venv_py} missing at exec time; "
+                f"rebuilding once and retrying...",
+                file=sys.stderr,
+                flush=True,
+            )
+            with _venv_build_lock(venv_dir, user_supplied=user_supplied):
+                if not _venv_is_valid(venv_dir, deps_hash):
+                    _build_venv(venv_dir, deps_hash, user_supplied=user_supplied)
+            sys.stderr.flush()
+            sys.stdout.flush()
+            os.execv(str(venv_py), argv)
 
 
 # Test-mode escape hatch: setting ZH_MCP_SKIP_BOOTSTRAP=1 in the
@@ -453,12 +756,18 @@ if str(HERE) not in sys.path:
 # ANSI color code regex — zh emits colored output for terminals; strip for MCP.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
-# `  #645 │ owner/repo │ ...` (2-space indent). Bounded to 0-3 leading
-# spaces so a 4-space-indented title line that legitimately starts with
-# `#NNN │` (a cross-reference convention some teams use, e.g.
-# `    #1234 │ blocker note for OAuth retry path`) isn't mistaken for
-# the next issue's header.
-_ISSUE_HEADER_RE = re.compile(r"^ {0,3}#\d+\s*│")
+# `  #645 │ owner/repo │ ...` (2-space indent). Two tightening choices
+# both implemented as `[ \t]` (horizontal whitespace only, never \n):
+#   - Leading indent `^[ \t]{0,3}`: bounded to 0-3 so a 4-space title
+#     line that legitimately starts with `#NNN │` (cross-reference
+#     convention) isn't mistaken for the next header. Tab support is
+#     defensive — `zh` currently emits spaces.
+#   - Post-digit gap `\d+[ \t]*│`: previously `\s*` (which matches \n).
+#     Pins the single-line-match contract — a header that wraps mid-
+#     field (terminal resize, malformed unicode in a repo name) won't
+#     span lines and trip the title-walker bail-out. The walker only
+#     ever feeds one line at a time today; this is defense-in-depth.
+_ISSUE_HEADER_RE = re.compile(r"^[ \t]{0,3}#\d+[ \t]*│")
 
 
 # =============================================================================
@@ -680,11 +989,14 @@ def _parse_mine_listing(plain: str) -> list[dict]:
 # title quotes an earlier ticket), or the preceding `Info: Creating
 # issue: <title>...` line. Anchor at line-start + ✓ + ws so the
 # captured number is the one immediately after the ✓ marker.
+# `[ \t]*` (not `\s*`) so the leading-whitespace match can't traverse
+# newlines and accidentally span multiple lines — defensive pin on the
+# "match a single line starting with ✓" contract.
 _SUCCESS_ISSUE_RE = re.compile(
-    r"^\s*✓\s*Created issue #(\d+)", re.MULTILINE,
+    r"^[ \t]*✓[ \t]*Created issue #(\d+)", re.MULTILINE,
 )
 _SUCCESS_EPIC_RE = re.compile(
-    r"^\s*✓\s*Created epic #(\d+)", re.MULTILINE,
+    r"^[ \t]*✓[ \t]*Created epic #(\d+)", re.MULTILINE,
 )
 
 
