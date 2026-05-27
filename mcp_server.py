@@ -71,13 +71,16 @@ def _default_venv_dir() -> Path:
     """
     override = os.environ.get("ZH_MCP_VENV")
     if override:
-        # `.resolve()` pins relative paths at startup so the venv doesn't
-        # thrash between projects when the MCP launches from different cwds.
         return Path(override).expanduser().resolve()
     xdg_data = os.path.expanduser(
         os.environ.get("XDG_DATA_HOME") or "~/.local/share"
     )
-    return Path(xdg_data) / "zh" / "venv"
+    # `.resolve()` on both branches — pins relative paths (e.g. a
+    # mis-configured `XDG_DATA_HOME=./local-data`) at startup so the
+    # MCP doesn't thrash between projects when it launches from
+    # different cwds, and produces consistent paths in error messages
+    # regardless of which branch was taken.
+    return (Path(xdg_data) / "zh" / "venv").resolve()
 
 
 _VENV_DIR = _default_venv_dir()
@@ -92,6 +95,23 @@ _VENV_DEPS = (
 )
 _VENV_MIN_PY = (3, 10)  # mcp package requires >= 3.10
 _VENV_MARKER = ".zh-deps-hash"  # records the _VENV_DEPS hash this venv was built for
+
+# Probe command used to validate that a venv can actually load every
+# declared dep — not just `mcp`. Catches half-installed venvs where the
+# torch download for sentence-transformers failed mid-stream but `mcp`
+# landed cleanly. Derived from `_VENV_DEPS` (s/-/_/) so the source of
+# truth stays in one tuple. If a future dep has a non-trivial PyPI →
+# import name mapping (`Pillow` → `PIL`), this assumption breaks
+# loudly when the probe fails.
+_VENV_IMPORT_PROBE = "; ".join(
+    f"import {name.replace('-', '_')}" for name in _VENV_DEPS
+)
+
+# Subprocess timeouts. The probe must stay snappy because it runs on
+# every MCP launch; build steps can take longer (pip + torch download).
+_VENV_PROBE_TIMEOUT = 30        # seconds for `python -c "import ..."`
+_VENV_BUILD_TIMEOUT = 60        # seconds for `python -m venv ...`
+_VENV_PIP_TIMEOUT = 600         # seconds for `pip install ...` (torch is ~400MB)
 
 
 def _deps_hash() -> str:
@@ -137,11 +157,14 @@ def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
         return False
     try:
         subprocess.check_call(
-            [str(venv_py), "-c", "import mcp"],
+            [str(venv_py), "-c", _VENV_IMPORT_PROBE],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=_VENV_PROBE_TIMEOUT,
         )
-    except (subprocess.CalledProcessError, OSError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        # Probe failed, timed out, or interpreter is unrunnable —
+        # rebuild rather than try to limp along.
         return False
     return True
 
@@ -191,29 +214,33 @@ def _looks_like_zh_venv(venv_dir: Path) -> bool:
     """Return True iff `venv_dir` is safe for `_build_venv` to rmtree.
 
     A user-controlled `ZH_MCP_VENV` (or a typo'd `XDG_DATA_HOME`) could
-    point the venv path at any directory on disk — including `$HOME` or
-    a tree of unrelated work. Without this guard, a stale/wrong path
-    plus a routine "venv looks invalid" verdict would silently
+    point the venv path at any directory on disk — including `$HOME`, a
+    project venv, or a regular file. Without this guard, a stale/wrong
+    path plus a routine "venv looks invalid" verdict would silently
     `shutil.rmtree` arbitrary user data on the next launch.
 
-    Safe to delete when:
-      - the directory doesn't exist yet (nothing to remove)
-      - the directory is empty (nothing to lose)
-      - the directory has `pyvenv.cfg` (some venv we can replace) OR
-        our `_VENV_MARKER` file (definitely a venv we built)
+    Safe to delete only when:
+      - the path doesn't exist yet (nothing to remove)
+      - the path is a directory AND empty (nothing to lose)
+      - the path is a directory AND carries our `_VENV_MARKER` file
+        (definitely a venv we built — `pyvenv.cfg` alone is NOT
+        sufficient, since the user may have pointed ZH_MCP_VENV at
+        their own project's venv)
 
-    Anything else (e.g. `~/Documents`, a project root) must be removed
-    by the user explicitly.
+    Anything else (a regular file, an unreadable dir, a foreign venv,
+    `~/Documents`) must be removed by the user explicitly.
     """
     if not venv_dir.exists():
         return True
-    if not any(venv_dir.iterdir()):
+    if not venv_dir.is_dir():
+        return False  # regular file, FIFO, etc.
+    try:
+        is_empty = not any(venv_dir.iterdir())
+    except OSError:
+        return False  # unreadable, race-deleted, etc.
+    if is_empty:
         return True
-    if (venv_dir / "pyvenv.cfg").exists():
-        return True
-    if (venv_dir / _VENV_MARKER).exists():
-        return True
-    return False
+    return (venv_dir / _VENV_MARKER).exists()
 
 
 def _build_venv(venv_dir: Path, deps_hash: str) -> None:
@@ -248,29 +275,47 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             file=sys.stderr,
         )
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call([builder, "-m", "venv", str(venv_dir)])
-    subprocess.check_call(
-        [str(venv_py), "-m", "pip", "install",
-         "--quiet", "--no-cache-dir", "--upgrade", "pip"]
-    )
-    subprocess.check_call(
-        [str(venv_py), "-m", "pip", "install",
-         "--quiet", "--no-cache-dir", *_VENV_DEPS]
-    )
-    # Post-build sanity check BEFORE writing the marker. If `import mcp`
-    # fails, the venv is half-built and must not be certified good — the
-    # next launch should rebuild from scratch, not trust a stale marker.
     try:
         subprocess.check_call(
-            [str(venv_py), "-c", "import mcp"],
+            [builder, "-m", "venv", str(venv_dir)],
+            timeout=_VENV_BUILD_TIMEOUT,
+        )
+        subprocess.check_call(
+            [str(venv_py), "-m", "pip", "install",
+             "--quiet", "--no-cache-dir", "--upgrade", "pip"],
+            timeout=_VENV_PIP_TIMEOUT,
+        )
+        subprocess.check_call(
+            [str(venv_py), "-m", "pip", "install",
+             "--quiet", "--no-cache-dir", *_VENV_DEPS],
+            timeout=_VENV_PIP_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"[zenhub-mcp] venv build at {venv_dir} timed out after "
+            f"{exc.timeout}s ({exc.cmd[0]} ...). Check your network "
+            f"(slow PyPI mirror?) and retry."
+        ) from exc
+    # Post-build sanity check BEFORE writing the marker. Probes EVERY
+    # declared dep (not just `mcp`) so a half-installed venv where
+    # `sentence-transformers` failed mid-stream isn't certified good.
+    # If the probe fails, the next launch rebuilds from scratch instead
+    # of trusting a stale marker.
+    try:
+        subprocess.check_call(
+            [str(venv_py), "-c", _VENV_IMPORT_PROBE],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=_VENV_PROBE_TIMEOUT,
         )
-    except (subprocess.CalledProcessError, OSError) as exc:
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError) as exc:
         raise RuntimeError(
             f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
-            f"`import mcp`. Delete {venv_dir} and retry; check your "
-            f"network and Python installation."
+            f"import all declared deps ({', '.join(_VENV_DEPS)}). "
+            f"Delete {venv_dir} and retry; check your network and "
+            f"Python installation."
         ) from exc
     (venv_dir / _VENV_MARKER).write_text(deps_hash)
 
@@ -472,17 +517,20 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
             repo = m.group(2)
             pts = m.group(3)
             assignee = m.group(4)
-            # Title is on the next non-empty line, indented. Bail out
-            # only when the line matches the full "next issue header"
-            # shape (`#NNN │ ...`), not just `startswith("#")` — real
-            # titles legitimately start with `#` (e.g. `#perf-2026Q2`).
+            # Title is on the next indented non-empty line. Bail out
+            # only when we see a real `#NNN │` header. Require the
+            # candidate to actually start with whitespace so an
+            # interstitial unindented banner (group header, gh warning,
+            # progress note) can't be silently consumed as the title.
             title = ""
             j = i + 1
             while j < len(lines) and not _ISSUE_HEADER_RE.match(lines[j]):
-                stripped = lines[j].strip()
-                if stripped and not stripped.startswith("→"):
-                    title = stripped
-                    break
+                line = lines[j]
+                if line.startswith((" ", "\t")):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("→"):
+                        title = stripped
+                        break
                 j += 1
             issues.append({
                 "number": number,
@@ -522,16 +570,20 @@ def _parse_mine_listing(plain: str) -> list[dict]:
             number = int(m.group(1))
             repo = m.group(2)
             pipeline = m.group(3).strip()
-            # Title is the next non-empty, non-arrow-URL line. Bail only
-            # on a real `#NNN │ ...` header — not on titles that happen
-            # to start with `#`.
+            # Title is the next indented non-empty non-arrow line. Bail
+            # only on a real `#NNN │ ...` header (titles can start with
+            # `#`), and require the candidate to start with whitespace
+            # so an interstitial unindented banner can't be silently
+            # swallowed as the title.
             title = ""
             j = i + 1
             while j < len(lines) and not _ISSUE_HEADER_RE.match(lines[j]):
-                stripped = lines[j].strip()
-                if stripped and not stripped.startswith("→"):
-                    title = stripped
-                    break
+                line = lines[j]
+                if line.startswith((" ", "\t")):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("→"):
+                        title = stripped
+                        break
                 j += 1
             issues.append({
                 "number": number,

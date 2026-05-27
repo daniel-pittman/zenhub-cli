@@ -33,23 +33,42 @@ def test_deps_hash_changes_when_deps_change(monkeypatch):
 # -----------------------------------------------------------------------------
 
 
+# `_default_venv_dir()` calls `.resolve()` on both branches — assertions
+# compare resolved paths so macOS's /var → /private/var firmlink and any
+# Linux symlink in $TMPDIR / $HOME don't break the test cross-platform.
+
+
 def test_default_venv_dir_uses_zh_mcp_venv_when_set(monkeypatch, tmp_path):
     custom = tmp_path / "custom-venv"
     monkeypatch.setenv("ZH_MCP_VENV", str(custom))
-    assert mcp_server._default_venv_dir() == custom
+    assert mcp_server._default_venv_dir() == custom.resolve()
 
 
 def test_default_venv_dir_uses_xdg_data_home(monkeypatch, tmp_path):
     monkeypatch.delenv("ZH_MCP_VENV", raising=False)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    assert mcp_server._default_venv_dir() == tmp_path / "zh" / "venv"
+    assert mcp_server._default_venv_dir() == (tmp_path / "zh" / "venv").resolve()
 
 
 def test_default_venv_dir_fallback(monkeypatch):
     monkeypatch.delenv("ZH_MCP_VENV", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    expected = Path(os.path.expanduser("~/.local/share")) / "zh" / "venv"
+    expected = (
+        Path(os.path.expanduser("~/.local/share")) / "zh" / "venv"
+    ).resolve()
     assert mcp_server._default_venv_dir() == expected
+
+
+def test_default_venv_dir_resolves_relative_xdg(monkeypatch, tmp_path):
+    # Relative XDG_DATA_HOME must be pinned to an absolute path at
+    # startup, otherwise launches from different cwds would compute
+    # different venv locations and rebuild-loop.
+    monkeypatch.delenv("ZH_MCP_VENV", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XDG_DATA_HOME", "local-data")
+    result = mcp_server._default_venv_dir()
+    assert result.is_absolute()
+    assert result == (tmp_path / "local-data" / "zh" / "venv").resolve()
 
 
 # -----------------------------------------------------------------------------
@@ -145,27 +164,46 @@ def test_looks_like_zh_venv_accepts_empty_dir(tmp_path):
     assert mcp_server._looks_like_zh_venv(tmp_path / "empty")
 
 
-def test_looks_like_zh_venv_accepts_dir_with_pyvenv_cfg(tmp_path):
-    (tmp_path / "pyvenv.cfg").write_text("home = /fake\n")
-    (tmp_path / "decoy-junk").write_text("anything")
-    assert mcp_server._looks_like_zh_venv(tmp_path)
-
-
 def test_looks_like_zh_venv_accepts_dir_with_our_marker(tmp_path):
     (tmp_path / mcp_server._VENV_MARKER).write_text("any-hash")
     (tmp_path / "decoy-junk").write_text("anything")
     assert mcp_server._looks_like_zh_venv(tmp_path)
 
 
+def test_looks_like_zh_venv_refuses_foreign_venv(tmp_path):
+    # The footgun the round-2 review caught: a user sets
+    # ZH_MCP_VENV=~/projects/myrepo/.venv (their own project venv). It
+    # has pyvenv.cfg but NO _VENV_MARKER. The guard must refuse rather
+    # than rmtree it — `pyvenv.cfg` alone is not sufficient evidence
+    # that this venv belongs to us.
+    (tmp_path / "pyvenv.cfg").write_text("home = /fake\nversion = 3.11.0\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "python3").touch(mode=0o755)
+    # site-packages with the user's editable install — losing this is
+    # the actual damage scenario.
+    (tmp_path / "lib" / "python3.11" / "site-packages").mkdir(parents=True)
+    (tmp_path / "lib" / "python3.11" / "site-packages" / "myrepo.pth").write_text(
+        "/home/user/projects/myrepo/src\n"
+    )
+    assert not mcp_server._looks_like_zh_venv(tmp_path)
+
+
 def test_looks_like_zh_venv_refuses_non_venv_directory(tmp_path):
-    # The pathological case: ZH_MCP_VENV pointed at a user directory by
-    # accident (e.g. `$HOME` typo, `~/projects/myrepo` instead of
-    # `~/projects/myrepo/.venv`). It has contents but no pyvenv.cfg and
-    # no marker — _build_venv must refuse to rmtree it.
+    # ZH_MCP_VENV pointed at a project dir by accident (e.g. omitted
+    # `/.venv` suffix). Has contents but no pyvenv.cfg and no marker —
+    # must refuse.
     (tmp_path / "important-document.txt").write_text("don't delete me")
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("print('hi')")
     assert not mcp_server._looks_like_zh_venv(tmp_path)
+
+
+def test_looks_like_zh_venv_refuses_regular_file(tmp_path):
+    # ZH_MCP_VENV pointed at a regular file (e.g. `~/.bashrc` typo).
+    # `iterdir()` would raise NotADirectoryError without the is_dir guard.
+    target = tmp_path / "some-file.txt"
+    target.write_text("not a venv")
+    assert not mcp_server._looks_like_zh_venv(target)
 
 
 # -----------------------------------------------------------------------------
@@ -234,6 +272,22 @@ def test_parse_mine_listing_rejects_four_field_shape():
         "    a title line\n"
     )
     assert mcp_server._parse_mine_listing(four_field) == []
+
+
+def test_parse_mine_listing_skips_unindented_banner():
+    # If `zh mine` ever emits an interstitial unindented line between
+    # the header and the title (group banner, gh warning, etc.), it must
+    # NOT be silently captured as the title. The walker continues past
+    # unindented lines and finds the real indented title below.
+    sample = (
+        "  #645 │ acme/widget-app │ Product Backlog\n"
+        "WARNING: gh emitted a banner here without indentation\n"
+        "    Add loading state to account screen\n"
+        "    → https://app.zenhub.com/anywhere/645\n"
+    )
+    issues = mcp_server._parse_mine_listing(sample)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "Add loading state to account screen"
 
 
 def test_parse_mine_listing_title_starting_with_hash():
