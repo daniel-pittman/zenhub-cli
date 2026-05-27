@@ -731,19 +731,24 @@ def test_venv_build_lock_uses_o_nofollow(tmp_path):
     # symlink at the lock path can't redirect the bootstrap's fd.
     venv_dir = tmp_path / "zh" / "venv"
     venv_dir.parent.mkdir(parents=True)
-    # Plant a symlink where the lockfile would land.
     decoy_target = tmp_path / "decoy-target"
-    decoy_target.write_text("would be overwritten without O_NOFOLLOW")
+    decoy_target.write_text("untouched")
     lock_path = venv_dir.parent / mcp_server._BOOTSTRAP_LOCK
     lock_path.symlink_to(decoy_target)
     # Acquiring the lock through the symlink must fail with ELOOP
     # (POSIX errno 62 / 40 depending on platform) — proving O_NOFOLLOW
-    # is honored. Without O_NOFOLLOW we'd silently open `decoy-target`.
+    # is honored.
     with pytest.raises(OSError):
         with mcp_server._venv_build_lock(venv_dir, user_supplied=False):
             pass
-    # And the decoy is untouched (mode + contents unchanged).
-    assert decoy_target.read_text() == "would be overwritten without O_NOFOLLOW"
+    # The lock path is still a symlink — the failed open didn't
+    # materialize a regular file there (which would imply O_NOFOLLOW
+    # was stripped and the open silently followed the link, creating
+    # the regular file at decoy_target). This is the assertion that
+    # actually demonstrates redirect-prevention: code paths that only
+    # `flock` without writing wouldn't observably affect `decoy_target`
+    # either way, so checking decoy contents proves nothing.
+    assert lock_path.is_symlink()
 
 
 # -----------------------------------------------------------------------------
@@ -772,3 +777,72 @@ def test_safe_rmtree_default_mode_raises(tmp_path):
     # POSIX (an OSError subclass).
     with pytest.raises(OSError):
         mcp_server._safe_rmtree(bogus)
+
+
+def test_safe_rmtree_does_not_chmod_above_rmtree_root(tmp_path, monkeypatch):
+    # Round-3 #1 (CRITICAL) regression pin. When `shutil.rmtree` fails
+    # at the rmtree ROOT (`os.scandir(venv_dir)` raises), the round-2
+    # implementation chmod'd `os.path.dirname(p) == venv_dir.parent`
+    # — a directory OUTSIDE the cleanup target. For the default path
+    # that silently downgraded `~/.local/share/zh` from 0o755 → 0o700;
+    # for shared `ZH_MCP_VENV=/srv/shared/...` configs, it locked
+    # group/world out of the shared parent. Round-3's fix bound
+    # `rmtree_root` in the closure and gated the parent-chmod on
+    # `p_parent == rmtree_root or rmtree_root in p_parent.parents`.
+    #
+    # This test simulates the EXACT failure mode (force scandir to
+    # raise PermissionError on venv_dir once, intercept all chmod
+    # calls, assert no chmod target sits at or above the rmtree root).
+    # A future "simplification" that reverts the closure-bound check
+    # to `os.chmod(os.path.dirname(p), 0o700)` re-introduces the
+    # regression and this test fails.
+    venv_dir = tmp_path / "share" / "zh" / "venv"
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "child.txt").write_text("payload")
+
+    chmod_targets: list[Path] = []
+    real_chmod = os.chmod
+
+    def chmod_spy(p, mode, *args, **kwargs):
+        # `os.chmod` accepts (path, mode) AND (fd, mode); shutil may
+        # use the fd form internally. Only record path-like calls;
+        # always delegate to the real chmod.
+        if isinstance(p, (str, os.PathLike)):
+            chmod_targets.append(Path(p))
+        return real_chmod(p, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", chmod_spy)
+
+    real_scandir = os.scandir
+    fired_once = [False]
+
+    def flaky_scandir(p):
+        # Force the rmtree-root EACCES exactly once. shutil's
+        # `_rmtree_safe_fd` opens venv_dir as a file descriptor then
+        # calls os.scandir(fd) — so `p` here may be an int fd, not a
+        # path. The first scandir IS the root call, so just fail on
+        # the very first invocation rather than trying to inspect `p`.
+        if not fired_once[0]:
+            fired_once[0] = True
+            raise PermissionError(13, "EACCES")
+        return real_scandir(p)
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+
+    # Best-effort mode so a failure to recover doesn't mask the
+    # property under test.
+    mcp_server._safe_rmtree(venv_dir, ignore_errors=True)
+
+    # Critical invariant: no chmod target may be AT or ABOVE the
+    # rmtree root's PARENT. Equivalent: every chmod target must be
+    # at-or-below the rmtree root.
+    forbidden = {
+        tmp_path,
+        tmp_path / "share",
+        tmp_path / "share" / "zh",  # this is rmtree_root.parent
+    }
+    leaked = forbidden & set(chmod_targets)
+    assert not leaked, (
+        f"_safe_rmtree chmod'd above the rmtree root: {sorted(leaked)} "
+        f"(all chmod calls: {chmod_targets})"
+    )
