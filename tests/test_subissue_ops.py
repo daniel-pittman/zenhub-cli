@@ -886,6 +886,15 @@ def test_remove_sub_issues_divergence_noop_preserved():
     # length mismatch), so the warning is still set — what matters
     # is the outcome label.
     assert out["partial_success_warning"] is not None
+    # Round-8 #1: warning text must reflect the noop shape, not the
+    # generic "cannot identify" phrasing that ok→partial divergence
+    # uses. The operator needs to know this was a strict no-op so
+    # they know to investigate whether the inputs were already in
+    # the requested state vs. silently rejected.
+    assert "strict no-op" in out["partial_success_warning"], (
+        f"Round-8 #1: noop-divergence warning must name the shape; "
+        f"got {out['partial_success_warning']!r}"
+    )
 
 
 def test_remove_sub_issues_divergence_fail_preserved():
@@ -926,6 +935,12 @@ def test_remove_sub_issues_divergence_fail_preserved():
     assert out["succeeded"] == []
     # Divergence fires (success=0, failed=1, but 2 inputs → mismatch)
     assert out["partial_success_warning"] is not None
+    # Round-8 #1: under-reported fail names the input(s) the API
+    # neither succeeded nor failed.
+    assert "did not report on" in out["partial_success_warning"], (
+        f"Round-8 #1: fail-divergence warning must name the under-"
+        f"report; got {out['partial_success_warning']!r}"
+    )
 
 
 def test_add_sub_issues_divergence_noop_preserved():
@@ -954,6 +969,9 @@ def test_add_sub_issues_divergence_noop_preserved():
     assert out["outcome"] == "noop"
     assert out["succeeded"] == []
     assert out["failed"] == []
+    # Round-8 #1 symmetric.
+    assert out["partial_success_warning"] is not None
+    assert "strict no-op" in out["partial_success_warning"]
 
 
 def test_add_sub_issues_divergence_fail_preserved():
@@ -980,6 +998,9 @@ def test_add_sub_issues_divergence_fail_preserved():
         out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
     assert out["outcome"] == "fail"
     assert out["succeeded"] == []
+    # Round-8 #1 symmetric.
+    assert out["partial_success_warning"] is not None
+    assert "did not report on" in out["partial_success_warning"]
 
 
 def test_add_sub_issues_full_success_when_count_matches():
@@ -1004,6 +1025,268 @@ def test_add_sub_issues_full_success_when_count_matches():
     assert out["ok"] is True
     assert sorted(out["succeeded"]) == [100, 101]
     assert out["partial_success_warning"] is None
+
+
+# =============================================================================
+# round-8 #1: ok→partial divergence warning text shape
+# =============================================================================
+
+def test_add_sub_issues_ok_divergence_warning_text():
+    """Round-8 #1: when outcome would have been "ok" but divergence
+    fires (success=1 with no failed, but 2 inputs → inferred=[both]),
+    outcome flips to "partial" and warning names the "cannot identify"
+    shape — distinct from the noop and fail-divergence variants.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 1,        # 1 but inferred=[100,101]
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    assert out["outcome"] == "partial"
+    assert out["succeeded"] == []
+    assert out["partial_success_warning"] is not None
+    assert (
+        "cannot identify which inputs succeeded"
+        in out["partial_success_warning"].lower()
+    ), (
+        f"Round-8 #1: ok→partial divergence warning must name the "
+        f"can't-identify shape; got {out['partial_success_warning']!r}"
+    )
+
+
+def test_remove_sub_issues_ok_divergence_warning_text():
+    """Round-8 #1 symmetric on `remove`."""
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 1,
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101])
+    assert out["outcome"] == "partial"
+    assert out["succeeded"] == []
+    assert out["partial_success_warning"] is not None
+    assert (
+        "cannot identify which inputs succeeded"
+        in out["partial_success_warning"].lower()
+    )
+
+
+# =============================================================================
+# round-8 #2: `unaccounted` field + count conservation
+# =============================================================================
+
+def test_subissue_add_count_conservation_under_fail_divergence():
+    """Round-8 #2: under fail-divergence (success=0, failed=[100],
+    but 3 inputs), `unaccounted` MUST surface the input(s) the API
+    didn't report on. Invariant:
+        len(succeeded) + len(failed) + len(unaccounted) == len(input)
+    holds across every outcome.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        _issue_by_info(102),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101, 102])
+    assert out["outcome"] == "fail"
+    assert out["succeeded"] == []
+    assert [f["number"] for f in out["failed"]] == [100]
+    # 101 and 102 are unaccounted — neither succeeded nor in failedIssues.
+    assert out["unaccounted"] == [101, 102]
+    # Conservation invariant.
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
+
+
+def test_subissue_remove_count_conservation_under_fail_divergence():
+    """Round-8 #2 symmetric on `remove`."""
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        _issue_by_info(102, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101, 102])
+    assert out["outcome"] == "fail"
+    assert out["succeeded"] == []
+    assert [f["number"] for f in out["failed"]] == [100]
+    assert out["unaccounted"] == [101, 102]
+    assert (
+        len(out["succeeded"]) + len(out["failed"]) + len(out["unaccounted"])
+        == 3
+    )
+
+
+def test_subissue_add_unaccounted_empty_on_trusted_path():
+    """Round-8 #2: when successCount matches the inferred set,
+    `unaccounted` MUST be empty — there are no API-omitted inputs
+    on the trusted path.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 2,
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    assert out["ok"] is True
+    assert out["unaccounted"] == []
+
+
+# =============================================================================
+# round-8 #4: pre-flight return shape completeness
+# =============================================================================
+
+def test_subissue_add_pre_flight_result_shape_complete():
+    """Round-8 #4: every pre-flight return site MUST include the full
+    documented result shape — `unaccounted` and `partial_success_warning`
+    cannot be missing or callers reading those keys will KeyError.
+    """
+    ctx = _ctx()
+    # Parent not found — the first pre-flight return site.
+    responses = [
+        {"data": {"issueByInfo": None}},
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100])
+    # All keys present.
+    for k in (
+        "ok", "parent_number", "outcome", "success_count", "failed_count",
+        "succeeded", "failed", "unaccounted", "github_errors",
+        "partial_success_warning", "error",
+    ):
+        assert k in out, f"pre-flight (parent-not-found) missing key {k!r}"
+    assert out["unaccounted"] == []
+    assert out["partial_success_warning"] is None
+
+    # Child not found — the second pre-flight return site.
+    ctx2 = _ctx()
+    responses = [
+        _issue_by_info(42),
+        {"data": {"issueByInfo": None}},  # child 100 lookup misses
+    ]
+    with _patch_ctx_query(ctx2, responses):
+        out2 = zh_graphql_ops.add_sub_issues(ctx2, 42, [100])
+    for k in (
+        "unaccounted", "partial_success_warning",
+    ):
+        assert k in out2, f"pre-flight (child-not-found) missing key {k!r}"
+    assert out2["unaccounted"] == []
+    assert out2["partial_success_warning"] is None
+
+
+def test_subissue_remove_pre_flight_result_shape_complete():
+    """Round-8 #4 symmetric: `remove` has two pre-flight return sites
+    (parent-not-found, validation-failed) — both must include the
+    full documented shape.
+    """
+    ctx = _ctx()
+    # Parent not found.
+    responses = [
+        {"data": {"issueByInfo": None}},
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100])
+    for k in ("unaccounted", "partial_success_warning"):
+        assert k in out, f"remove pre-flight (parent-not-found) missing {k!r}"
+    assert out["unaccounted"] == []
+    assert out["partial_success_warning"] is None
+
+    # Validation failed: child found but wrong parent.
+    wrong = {
+        "id": "issue-gid-99",
+        "number": 99,
+        "title": "Wrong",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    ctx2 = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=wrong),
+    ]
+    with _patch_ctx_query(ctx2, responses):
+        out2 = zh_graphql_ops.remove_sub_issues(ctx2, 42, [100])
+    assert "Pre-flight validation failed" in (out2["error"] or "")
+    for k in ("unaccounted", "partial_success_warning"):
+        assert k in out2, f"remove pre-flight (validation) missing {k!r}"
+    assert out2["unaccounted"] == []
+    assert out2["partial_success_warning"] is None
 
 
 # =============================================================================

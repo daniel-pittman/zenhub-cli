@@ -178,15 +178,26 @@ def test_run_zh_binary_missing_returns_stderr_plain():
     missing must include `stderr_plain` for shape consistency
     (callers that always read .get('stderr_plain', '') don't
     KeyError on this path).
+
+    Round-8 #3: tighten — `stderr` and `stderr_plain` carry the
+    SAME content under the binary-missing path (the message is
+    plain ASCII, no ANSI to strip). The pre-fix code returned
+    `stderr_plain=""` while `stderr` had the diagnostic, so any
+    caller reading the plain field saw nothing. Pin the alignment.
     """
     import pathlib
     from unittest.mock import patch
     with patch.object(pathlib.Path, "exists", return_value=False):
         result = mcp_server._run_zh(["test"])
     assert "stderr_plain" in result
-    # The early-return path has no ANSI in its synthesized message,
-    # but stderr_plain must still be a string.
     assert isinstance(result["stderr_plain"], str)
+    # Round-8 #3 alignment with timeout / success branches.
+    assert result["stderr_plain"] == result["stderr"], (
+        f"Round-8 #3: binary-missing stderr_plain must equal stderr "
+        f"(no ANSI to strip); got plain={result['stderr_plain']!r} "
+        f"stderr={result['stderr']!r}"
+    )
+    assert "zh binary not found" in result["stderr_plain"]
 
 
 def test_run_zh_timeout_stderr_includes_captured_diagnostic(monkeypatch):

@@ -205,13 +205,19 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
     server hanging if the API is unresponsive — review note.
     """
     if not ZH_BIN.exists():
+        # Round-8 #3: align with timeout / success branches — `stderr`
+        # and `stderr_plain` carry the same content, just with vs.
+        # without ANSI escapes. This message is plain ASCII so the
+        # two are identical, but callers comparing the fields (or
+        # reading `stderr_plain` exclusively) must see the diagnostic.
+        msg = f"zh binary not found at {ZH_BIN}"
         return {
             "ok": False,
             "exit_code": -1,
             "stdout": "",
-            "stderr": f"zh binary not found at {ZH_BIN}",
+            "stderr": msg,
             "stdout_plain": "",
-            "stderr_plain": "",
+            "stderr_plain": msg,
         }
     try:
         result = subprocess.run(
@@ -1308,16 +1314,31 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             failed_count: int — API-reported failedIssues length
             succeeded: list[int] — children the API actually linked
             failed: list[dict] — each {number, owner, name}
+            unaccounted: list[int] — inputs the API did not report on
+                in either succeeded or failed. Empty when the inferred
+                succeeded set matches successCount (the trusted path).
+                Populated under divergence (success_count != len(
+                inferred_succeeded)) — succeeded is then empty and
+                `unaccounted` exposes which input numbers the API
+                neither confirmed nor explicitly failed. The
+                conservation invariant holds across all outcomes:
+                len(succeeded) + len(failed) + len(unaccounted) ==
+                len(deduped input child_numbers).
             github_errors: dict | None
             partial_success_warning: str | None — set when the API's
                 successCount diverges from the inferred succeeded
-                set (success=N succeeded, failed=[F], inputs=I, but
-                N != I-len(F)). In that case `succeeded` is empty
-                because we can't identify which inputs landed and
-                `outcome` is downgraded to "partial" (except when
-                outcome was already "noop" or "fail" — those keep
-                their stronger semantics). Callers should re-list
-                the parent's children to determine actual state.
+                set. Warning text is tailored by outcome shape
+                (round-8 #1): "ok→partial" divergence reads
+                "cannot identify which inputs succeeded"; strict
+                noop divergence reads "strict no-op despite N
+                input(s)"; under-reported fail reads "did not
+                report on N input(s)". In every divergence case
+                `succeeded` is empty because we can't identify
+                which inputs landed. `outcome` is downgraded to
+                "partial" only when it would otherwise have been
+                "ok" — noop and fail keep their stronger semantics.
+                Callers should re-list the parent's children to
+                determine actual state.
             stderr: str
     """
     if not child_numbers:
@@ -1332,6 +1353,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": "child_numbers must be non-empty",
@@ -1340,7 +1362,8 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     if err is not None:
         return {**err, "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
-                "succeeded": [], "failed": [], "github_errors": None,
+                "succeeded": [], "failed": [], "unaccounted": [],
+                "github_errors": None,
                 "partial_success_warning": None}
     from zh_graphql_ops import add_sub_issues  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
@@ -1355,6 +1378,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": str(e),
@@ -1367,6 +1391,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
         "github_errors": result.get("github_errors"),
         "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
@@ -1401,15 +1426,23 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             failed_count: int
             succeeded: list[int]
             failed: list[dict]
+            unaccounted: list[int] — inputs the API did not report on
+                in either succeeded or failed. Empty on the trusted
+                path; populated under divergence. Conservation
+                invariant: len(succeeded) + len(failed) +
+                len(unaccounted) == len(deduped input child_numbers).
             github_errors: dict | None
             partial_success_warning: str | None — set when the API's
                 successCount diverges from the inferred succeeded
-                set; succeeded list will be empty in that case.
-                `outcome` is downgraded to "partial" only when it
-                would otherwise have been "ok" (i.e. `noop` and
-                `fail` keep their stronger semantics — round-7 #1).
-                Callers should re-list the parent's children to
-                determine actual state.
+                set. Warning text is tailored by outcome shape
+                (round-8 #1) — see subissue_add_children for the
+                three variants. `succeeded` is empty under
+                divergence in all cases. `outcome` is downgraded to
+                "partial" only when it would otherwise have been
+                "ok" (round-7 #1 made the `add` and `remove`
+                guards match); `noop` and `fail` keep their
+                stronger semantics. Callers should re-list the
+                parent's children to determine actual state.
             stderr: str
     """
     if not child_numbers:
@@ -1424,6 +1457,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": "child_numbers must be non-empty",
@@ -1432,7 +1466,8 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     if err is not None:
         return {**err, "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
-                "succeeded": [], "failed": [], "github_errors": None,
+                "succeeded": [], "failed": [], "unaccounted": [],
+                "github_errors": None,
                 "partial_success_warning": None}
     from zh_graphql_ops import remove_sub_issues  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
@@ -1447,6 +1482,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "github_errors": None,
             "partial_success_warning": None,
             "stderr": str(e),
@@ -1459,6 +1495,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),
         "failed": result.get("failed", []),
+        "unaccounted": result.get("unaccounted", []),
         "github_errors": result.get("github_errors"),
         "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",

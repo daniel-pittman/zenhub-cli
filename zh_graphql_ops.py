@@ -414,7 +414,9 @@ def add_sub_issues(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "github_errors": None,
+            "partial_success_warning": None,
             "error": f"Parent #{parent_number} not found in this repository",
         }
     parent_id = parent_issue["id"]
@@ -441,7 +443,9 @@ def add_sub_issues(
             "failed": [
                 {"number": n, "owner": "", "name": ""} for n in not_found
             ],
+            "unaccounted": [],
             "github_errors": None,
+            "partial_success_warning": None,
             "error": (
                 "Some child issue numbers were not found in this repository: "
                 + ", ".join(f"#{n}" for n in not_found)
@@ -484,42 +488,70 @@ def add_sub_issues(
     # Review finding #3: the API exposes a count but not an array of
     # succeeded numbers. We INFER `succeeded` as "input minus failed",
     # but that inference is only safe when the inferred set's length
-    # equals success_count. When it doesn't (success_count < inferred,
-    # e.g. successCount=1 with no failedIssues but 3 inputs), we don't
-    # know which inputs actually landed — return an empty `succeeded`
-    # set with a partial_success_warning rather than silently claiming
-    # all 3.
-    partial_success_warning: str | None = None
-    if success_count == len(inferred_succeeded):
+    # equals success_count. When it doesn't, we don't know which
+    # inputs actually landed.
+    divergence = success_count != len(inferred_succeeded)
+    if not divergence:
         succeeded = inferred_succeeded
     else:
         succeeded = []
-        partial_success_warning = (
-            f"API returned successCount={success_count} but "
-            f"failedIssues={failed_count} for {len(child_numbers)} inputs; "
-            "cannot identify which inputs succeeded. Re-list the parent's "
-            "children to determine actual state."
-        )
 
+    # Compute outcome BEFORE shaping the partial_success_warning text so
+    # the warning can be tailored to which outcome-shape the divergence
+    # occurred under (round-8 #1: round-5 produced one warning string
+    # for all divergence cases, but noop/fail/ok-divergence each mean
+    # something different and the operator needs to know which).
     outcome = _classify_outcome(success_count, failed_count)
-    # Round-6 #3: round-5 fixed the DATA (succeeded=[] when we can't
-    # identify) but left the SIGNAL stale — `outcome` was still
-    # computed from `success_count` alone, which produces "ok" for a
-    # single-success-with-divergence case. `ok = outcome == "ok"`
-    # then reported True even though `partial_success_warning` was
-    # set. Force partial when the divergence guard fires, so signal
-    # and data agree.
-    #
-    # Guard: only override when outcome was "ok". `noop` (success=0,
-    # failed=0) has its own specific semantics — the divergence
-    # check inferred succeeded=[input] but the API said success=0,
-    # which IS a divergence by the strict length check; however,
-    # the load-bearing signal there is "noop", not "partial". A
-    # "fail" outcome (failed_count>0, success_count=0) also stays
-    # untouched. Round-6 #3 only fixes the case where the API
-    # claims success but we can't identify which inputs landed.
-    if partial_success_warning is not None and outcome == "ok":
+
+    # Round-6 #3: when divergence overrides under "ok", flip outcome
+    # to "partial". Guard on `outcome == "ok"` preserves the dedicated
+    # noop/fail semantics — see remove_sub_issues for the symmetric
+    # rationale (round-7 #1 made these two functions match).
+    if divergence and outcome == "ok":
         outcome = "partial"
+
+    # Round-8 #1: gate warning text by outcome shape under divergence.
+    partial_success_warning: str | None = None
+    if divergence:
+        if outcome == "partial":
+            # Originally classified "ok" but the inferred set length
+            # disagreed with successCount — we genuinely cannot say
+            # which inputs landed.
+            partial_success_warning = (
+                f"API returned successCount={success_count} but inferred "
+                f"succeeded set has {len(inferred_succeeded)} entries "
+                "(divergence). Cannot identify which inputs succeeded. "
+                "Re-list the parent's children to determine actual state."
+            )
+        elif outcome == "noop":
+            # success_count=0 AND failed=[] but we sent N>0 inputs.
+            # The API silently dropped everything or all inputs were
+            # already in the requested state.
+            partial_success_warning = (
+                "API returned strict no-op (successCount=0, "
+                f"failedIssues=[]) despite {len(child_numbers)} input(s). "
+                "The mutation may have silently rejected all inputs, or "
+                "the inputs were already in the requested state. Re-list "
+                "to confirm."
+            )
+        elif outcome == "fail":
+            # failed_count>0 but doesn't account for every input.
+            unaccounted_count = len(child_numbers) - failed_count
+            partial_success_warning = (
+                f"API reported {failed_count} failure(s) but did not "
+                f"report on {unaccounted_count} input(s) (neither "
+                "succeeded nor in failedIssues). Those inputs' state "
+                "is undetermined. Re-list to confirm."
+            )
+
+    # Round-8 #2: explicit accounting of inputs the API neither
+    # confirmed succeeded nor reported as failed. Empty list when
+    # divergence is False and the inferred set is trusted (set
+    # difference is then exactly the failed set, which is by
+    # construction outside `succeeded`, so `unaccounted == []`).
+    accounted: set[int] = set(failed_numbers) | set(succeeded)
+    unaccounted: list[int] = sorted(set(child_numbers) - accounted)
+
     return {
         "ok": outcome == "ok",
         "parent_number": parent_number,
@@ -528,6 +560,7 @@ def add_sub_issues(
         "failed_count": failed_count,
         "succeeded": succeeded,
         "failed": failed_serialized,
+        "unaccounted": unaccounted,
         "github_errors": github_errors,
         "partial_success_warning": partial_success_warning,
         "error": None,
@@ -571,7 +604,9 @@ def remove_sub_issues(
             "failed_count": 0,
             "succeeded": [],
             "failed": [],
+            "unaccounted": [],
             "github_errors": None,
+            "partial_success_warning": None,
             "error": f"Parent #{parent_number} not found in this repository",
         }
     parent_id = parent_issue["id"]
@@ -651,7 +686,9 @@ def remove_sub_issues(
                     for w in wrong_parent
                 ],
             ],
+            "unaccounted": [],
             "github_errors": None,
+            "partial_success_warning": None,
             "error": "Pre-flight validation failed: " + "; ".join(msgs),
         }
 
@@ -692,36 +729,55 @@ def remove_sub_issues(
     inferred_succeeded = [n for n in child_numbers if n not in failed_numbers]
     # Same review-finding-#3 logic as add_sub_issues: only trust the
     # inferred set when its length matches successCount.
-    partial_success_warning: str | None = None
-    if success_count == len(inferred_succeeded):
+    divergence = success_count != len(inferred_succeeded)
+    if not divergence:
         succeeded = inferred_succeeded
     else:
         succeeded = []
-        partial_success_warning = (
-            f"API returned successCount={success_count} but "
-            f"failedIssues={failed_count} for {len(child_numbers)} inputs; "
-            "cannot identify which inputs succeeded. Re-list the parent's "
-            "children to determine actual state."
-        )
 
+    # Outcome computed BEFORE warning-text shaping so the warning can
+    # be tailored to outcome shape (round-8 #1). See add_sub_issues
+    # for the full rationale.
     outcome = _classify_outcome(success_count, failed_count)
-    # Round-6 #3: force partial when divergence guard fires. See
-    # add_sub_issues for the full rationale — signal must match data.
-    #
-    # Round-7 #1: only override when outcome was "ok". The `add`
-    # counterpart had this `outcome == "ok"` guard; the round-6
-    # patch on the `remove` side dropped it, asymmetrically. The
-    # bare override clobbered:
-    #   - `noop`  (success=0, failed=0) → partial + empty
-    #     succeeded + empty failed (internally inconsistent)
-    #   - `fail`  (success=0, failed>0) → partial + empty
-    #     succeeded + non-empty failed (mis-signals real failure
-    #     as a "couldn't identify" warning)
-    # The `outcome == "ok"` guard preserves the dedicated semantics
-    # for those cases; divergence only overrides the "ok"
-    # misclassification.
-    if partial_success_warning is not None and outcome == "ok":
+
+    # Round-6 #3 / Round-7 #1: only flip "ok"→"partial" under
+    # divergence; noop and fail keep their dedicated semantics.
+    if divergence and outcome == "ok":
         outcome = "partial"
+
+    # Round-8 #1: gate warning text by outcome shape under divergence.
+    # Symmetric with add_sub_issues.
+    partial_success_warning: str | None = None
+    if divergence:
+        if outcome == "partial":
+            partial_success_warning = (
+                f"API returned successCount={success_count} but inferred "
+                f"succeeded set has {len(inferred_succeeded)} entries "
+                "(divergence). Cannot identify which inputs succeeded. "
+                "Re-list the parent's children to determine actual state."
+            )
+        elif outcome == "noop":
+            partial_success_warning = (
+                "API returned strict no-op (successCount=0, "
+                f"failedIssues=[]) despite {len(child_numbers)} input(s). "
+                "The mutation may have silently rejected all inputs, or "
+                "the inputs were already in the requested state. Re-list "
+                "to confirm."
+            )
+        elif outcome == "fail":
+            unaccounted_count = len(child_numbers) - failed_count
+            partial_success_warning = (
+                f"API reported {failed_count} failure(s) but did not "
+                f"report on {unaccounted_count} input(s) (neither "
+                "succeeded nor in failedIssues). Those inputs' state "
+                "is undetermined. Re-list to confirm."
+            )
+
+    # Round-8 #2: explicit accounting of inputs the API neither
+    # confirmed succeeded nor reported as failed.
+    accounted: set[int] = set(failed_numbers) | set(succeeded)
+    unaccounted: list[int] = sorted(set(child_numbers) - accounted)
+
     return {
         "ok": outcome == "ok",
         "parent_number": parent_number,
@@ -730,6 +786,7 @@ def remove_sub_issues(
         "failed_count": failed_count,
         "succeeded": succeeded,
         "failed": failed_serialized,
+        "unaccounted": unaccounted,
         "github_errors": github_errors,
         "partial_success_warning": partial_success_warning,
         "error": None,
