@@ -513,6 +513,87 @@ class TestReorderSubIssue:
         assert out["ok"] is True
         assert out["outcome"] == "ok"
 
+    def test_reorder_top_refuses_under_partial_walk(self):
+        """Round-6 #5 SPEC pin: when the sibling listing bailed mid-
+        walk, top/bottom anchoring is unsafe — the "first" sibling in
+        a partial set isn't the workspace-global first, so the
+        mutation would silently corrupt sub-issue order. Refuse the
+        mutation; surface the pagination warning in the error.
+        """
+        ctx = make_ctx()
+        parent = self._parent_node(42)
+        with patch_ctx_query(ctx, [
+            issue_by_info_response(100, issue_id="issue-gid-100",
+                                   parent=parent),
+            # Sibling listing bails on stuck cursor — coverage is
+            # partial.
+            subissue_list_response(
+                parent_number=42,
+                nodes=[
+                    child_node(100, node_id="issue-gid-100"),
+                    child_node(101, node_id="issue-gid-101"),
+                ],
+                has_next=True, end_cursor=None,  # stuck cursor
+            ),
+        ]):
+            out = zh_graphql_ops.reorder_sub_issue(ctx, 100, "top")
+        assert out["ok"] is False
+        assert out["outcome"] == "fail"
+        err = (out.get("error") or "").lower()
+        assert "partial pagination" in err, (
+            f"expected partial-pagination message; got: {err!r}"
+        )
+
+    def test_reorder_bottom_refuses_under_partial_walk(self):
+        """Round-6 #5 — same SPEC for bottom."""
+        ctx = make_ctx()
+        parent = self._parent_node(42)
+        with patch_ctx_query(ctx, [
+            issue_by_info_response(100, issue_id="issue-gid-100",
+                                   parent=parent),
+            subissue_list_response(
+                parent_number=42,
+                nodes=[
+                    child_node(100, node_id="issue-gid-100"),
+                    child_node(101, node_id="issue-gid-101"),
+                ],
+                has_next=True, end_cursor=None,
+            ),
+        ]):
+            out = zh_graphql_ops.reorder_sub_issue(ctx, 100, "bottom")
+        assert out["ok"] is False
+        assert "partial pagination" in (out.get("error") or "").lower()
+
+    def test_reorder_after_still_works_under_partial_walk(self):
+        """Round-6 #5 — `after` / `before` with an explicit sibling
+        number stays valid under partial coverage: the user named
+        a specific anchor; if it's in the partial set we use it,
+        otherwise we fail with anchor-not-found. Asymmetry vs
+        top/bottom is intentional and pinned by this test.
+        """
+        ctx = make_ctx()
+        parent = self._parent_node(42)
+        with patch_ctx_query(ctx, [
+            issue_by_info_response(100, issue_id="issue-gid-100",
+                                   parent=parent),
+            # Anchor #101 is in the partial set — the partial walk
+            # is fine for an explicit-anchor lookup.
+            subissue_list_response(
+                parent_number=42,
+                nodes=[
+                    child_node(100, node_id="issue-gid-100"),
+                    child_node(101, node_id="issue-gid-101"),
+                ],
+                has_next=True, end_cursor=None,  # stuck cursor
+            ),
+            reprioritize_sub_issue_response(success=True),
+        ]):
+            out = zh_graphql_ops.reorder_sub_issue(
+                ctx, 100, "after", sibling_number=101,
+            )
+        assert out["ok"] is True
+        assert out["outcome"] == "ok"
+
 
 # =============================================================================
 # `list_sprints`
@@ -711,28 +792,44 @@ class TestGetSprintDetail:
         already enforce this; the sprint-issues walker historically
         appended `{number: None, title: ""}` for nulls because the
         loop body did `(wrapper or {}).get("issue") or {}`.
-        Round-4 finding #4."""
+        Round-4 finding #4.
+
+        Round-6 #6 extension: also pin the `[{"issue": null}, real]`
+        shape — a wrapper that's a dict but contains a null `issue`
+        field. Pre-round-6 the idiom `(wrapper or {}).get("issue")
+        or {}` coalesced None to `{}` and still leaked a phantom.
+        """
         ctx = make_ctx()
         with patch_ctx_query(ctx, [
             sprints_page([sprint_node("sprint-7", "Sprint 7")]),
             sprint_header_response(),
-            sprint_issues_page([None, sprint_issue_wrapper(100)]),
+            # Two phantom shapes: wrapper=None AND wrapper={"issue": None}
+            sprint_issues_page([
+                None,
+                {"issue": None},  # round-6 #6 phantom shape
+                sprint_issue_wrapper(100),
+            ]),
         ]):
             out = zh_graphql_ops.get_sprint_detail(ctx, "current")
         assert out["ok"] is True
         nums = [i["number"] for i in out["issues"]]
         assert 100 in nums
         # SPEC tightening: there should be exactly ONE issue (#100).
-        # A phantom record from the None wrapper would show up as a
-        # 2nd entry with `number == None` and empty title. Pin that
-        # the phantom is NOT emitted.
+        # A phantom record from the None wrapper OR the null-issue
+        # wrapper would show up as extra entries. Pin that no
+        # phantom is emitted from either shape.
         assert out["issue_count"] == 1, (
             f"phantom record leaked: issues={out['issues']!r}"
         )
-        # Belt-and-suspenders: every issue must have a valid number.
+        # Belt-and-suspenders: every emitted issue must have a valid
+        # int number AND a non-empty repository (round-6 #6 SPEC).
         for i in out["issues"]:
             assert isinstance(i["number"], int), (
                 f"non-int number leaked from null wrapper: {i!r}"
+            )
+            rep = i.get("repository") or {}
+            assert rep.get("owner") or rep.get("name"), (
+                f"phantom record with empty repo leaked: {i!r}"
             )
 
     def test_null_pipeline_node_entry_does_not_crash(self):

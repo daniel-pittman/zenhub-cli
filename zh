@@ -249,8 +249,10 @@ zh_workspaces_fetch_all() {
         local response
         response=$(zh_graphql "$query" "$variables")
 
+        # Round-6 #8: `select(. != null)` strips null page entries
+        # at aggregation, matching the other three walkers.
         local page_nodes
-        page_nodes=$(echo "$response" | jq -c '.data.repositoriesByGhId[0].workspacesConnection.nodes // []')
+        page_nodes=$(echo "$response" | jq -c '[(.data.repositoriesByGhId[0].workspacesConnection.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
@@ -3411,8 +3413,8 @@ Examples:
            .data.addIssuesToSprints.sprintIssues[]
            | select(.sprint.id == $sid)
            | select(
-               (.issue.repository.ownerName | ascii_downcase) == ($owner | ascii_downcase)
-               and (.issue.repository.name | ascii_downcase) == ($repo | ascii_downcase)
+               ((.issue.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+               and ((.issue.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
              )
            | .issue.number
          ] | map(tostring) | join(",")')
@@ -3591,8 +3593,8 @@ Examples:
         '[
            .nodes[]
            | select(
-               (.issue.repository.ownerName | ascii_downcase) == ($owner | ascii_downcase)
-               and (.issue.repository.name | ascii_downcase) == ($repo | ascii_downcase)
+               ((.issue.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+               and ((.issue.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
              )
            | .issue.number
          ] | map(tostring) | join(",")')
@@ -5079,12 +5081,18 @@ zh_subissue_fetch_ids_only() {
     local all_nodes="[]"
     local total_count=0
     local first_page=true
+    # Round-6 #10: emit a `pagination_bailed` sentinel mirroring
+    # zh_sprint_issues_fetch_all's pattern, so cmd_subissue_reorder
+    # can refuse top/bottom mutations under partial coverage (same
+    # SPEC as the Python round-6 #5 fix in reorder_sub_issue).
+    local pagination_bailed=""
 
     while :; do
         # Same stuck-cursor / iteration-cap defense as zh_subissue_fetch_all.
         iterations=$((iterations + 1))
         if [[ "$iterations" -gt 200 ]]; then
             warn "Pagination iteration cap (200) hit on parent — returning partial result"
+            pagination_bailed="iteration_cap"
             break
         fi
 
@@ -5111,20 +5119,23 @@ zh_subissue_fetch_ids_only() {
             first_page=false
         fi
 
+        # Round-6 #7: `select(. != null)` strips null page entries
+        # at aggregation, matching the other three walkers. Last
+        # walker without the filter.
         local page_nodes
-        page_nodes=$(echo "$issue_json" | jq -c '.zenhubChildIssues.nodes // []')
+        page_nodes=$(echo "$issue_json" | jq -c '[(.zenhubChildIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
         has_next=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.hasNextPage // false')
         end_cursor=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.endCursor // empty')
 
-        if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
+        if [[ "$has_next" != "true" ]]; then
             break
         fi
-
-        if [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]]; then
-            warn "Pagination cursor did not advance (endCursor=${end_cursor:0:16}…) — returning partial result"
+        if [[ -z "$end_cursor" ]] || ( [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]] ); then
+            warn "Pagination cursor did not advance — returning partial result"
+            pagination_bailed="stuck_cursor"
             break
         fi
         prev_cursor="$end_cursor"
@@ -5135,7 +5146,8 @@ zh_subissue_fetch_ids_only() {
     jq -n \
         --argjson nodes "$all_nodes" \
         --argjson total "$total_count" \
-        '{totalCount: $total, nodes: $nodes}'
+        --arg pagination_bailed "$pagination_bailed" \
+        '{totalCount: $total, nodes: $nodes, pagination_bailed: $pagination_bailed}'
 }
 
 cmd_subissue_list() {
@@ -5367,6 +5379,23 @@ Use 'zh subissue add <parent#> ${child_num}' first."
     if [[ "$sibling_ids_json" == "null" ]]; then
         error "Could not load siblings of #${child_num} (parent #${parent_num} not found?)"
     fi
+
+    # Round-6 #10: when the sibling walk bailed mid-coverage,
+    # top/bottom anchoring is unsafe — the "first" or "last" sibling
+    # in a partial set isn't the workspace-global first/last, so the
+    # mutation would silently corrupt order. Refuse the mutation for
+    # top/bottom; allow after/before since the user named an
+    # explicit anchor we'll either find or fail on cleanly. Mirrors
+    # the Python round-6 #5 fix in reorder_sub_issue.
+    local sibling_pagination_bailed
+    sibling_pagination_bailed=$(echo "$sibling_ids_json" | jq -r '.pagination_bailed // ""')
+    case "$position" in
+        top|first|bottom|last)
+            if [[ -n "$sibling_pagination_bailed" ]]; then
+                error "Cannot determine sibling order for '${position}' under partial pagination — sub-issue listing bailed: ${sibling_pagination_bailed}. Re-list ('zh subissue list ${parent_num}') and retry once full coverage is available, OR use 'after' / 'before' with an explicit sibling number."
+            fi
+            ;;
+    esac
 
     # Resolve the position keyword to an afterId or beforeId. ZenHub treats
     # `afterId: null` and `beforeId: null` specially:

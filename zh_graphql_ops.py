@@ -824,6 +824,36 @@ def reorder_sub_issue(
             "error": sibling_listing.get("error") or "Could not list siblings",
         }
     siblings = sibling_listing.get("children") or []
+    sibling_pagination_warning = sibling_listing.get("pagination_warning")
+
+    # Round-6 #5: when the sibling listing bailed mid-walk on stuck
+    # cursor / iteration cap, top/bottom anchoring is unsafe — the
+    # "first" or "last" sibling in a PARTIAL set isn't the
+    # workspace-global first/last, so the mutation would silently
+    # corrupt sub-issue order. Refuse the mutation and surface the
+    # pagination warning in the error.
+    #
+    # `after` / `before` with an explicit sibling_number stay valid:
+    # the user named a specific sibling and we either find it in
+    # the partial set (anchor is correct regardless of pagination
+    # state) or fail with anchor-not-found (correct error). The
+    # asymmetry is deliberate.
+    if sibling_pagination_warning and pos in {"top", "bottom"}:
+        return {
+            "ok": False,
+            "child_number": child_number,
+            "parent_number": parent_number,
+            "position": pos,
+            "outcome": "fail",
+            "error": (
+                f"Cannot determine sibling order for '{pos}' under "
+                f"partial pagination — sub-issue listing bailed: "
+                f"{sibling_pagination_warning}. Re-list "
+                f"('zh subissue list #{parent_number}') and retry "
+                f"once full coverage is available, OR use 'after' / "
+                f"'before' with an explicit sibling number."
+            ),
+        }
 
     after_id: str | None = None
     before_id: str | None = None
