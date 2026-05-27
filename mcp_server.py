@@ -64,13 +64,23 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 
 
-def _default_venv_dir() -> Path:
+def _default_venv_dir() -> tuple[Path, bool]:
     """Compute the default venv location.
 
+    Returns `(venv_dir, user_supplied)`. `user_supplied` is True when
+    the path came from the explicit `ZH_MCP_VENV` env var (subject to
+    strict typo protection downstream) and False when the path is the
+    server-chosen XDG default (subject to permissive auto-mkdir).
+    Threading the flag through to downstream callers (rather than
+    re-reading the env in each consumer) keeps the classification
+    coupled to the path it produced — env mutation between calls
+    can't defeat the typo guard.
+
     Priority:
-      1. ZH_MCP_VENV environment variable (full path).
+      1. ZH_MCP_VENV environment variable (full path) → user_supplied=True
       2. $XDG_DATA_HOME/zh/venv (standard XDG; defaults to
-         ~/.local/share/zh/venv when XDG_DATA_HOME is unset).
+         ~/.local/share/zh/venv when XDG_DATA_HOME is unset) →
+         user_supplied=False
     """
     raw_override = os.environ.get("ZH_MCP_VENV")
     if raw_override is not None and not raw_override.strip():
@@ -98,7 +108,7 @@ def _default_venv_dir() -> Path:
                 f"ZH_MCP_VENV={override!r} (HOME is unset). Set HOME or "
                 f"give ZH_MCP_VENV an absolute path."
             )
-        return expanded.resolve()
+        return expanded.resolve(), True
     xdg_raw = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
     xdg_data = os.path.expanduser(xdg_raw)
     if xdg_data.startswith("~"):
@@ -118,7 +128,7 @@ def _default_venv_dir() -> Path:
     # MCP doesn't thrash between projects when it launches from
     # different cwds, and produces consistent paths in error messages
     # regardless of which branch was taken.
-    return (Path(xdg_data) / "zh" / "venv").resolve()
+    return (Path(xdg_data) / "zh" / "venv").resolve(), False
 
 
 _VENV_DEPS = (
@@ -311,12 +321,13 @@ def _looks_like_zh_venv(venv_dir: Path) -> bool:
     )
 
 
-def _ensure_safe_parent(venv_dir: Path) -> None:
+def _ensure_safe_parent(venv_dir: Path, *, user_supplied: bool) -> None:
     """Validate the path's parent before any mkdir.
 
-    Two modes, distinguished by whether `ZH_MCP_VENV` is set:
+    Two modes, distinguished by the explicit `user_supplied` flag from
+    `_default_venv_dir`:
 
-    1. **Server-chosen default** (no `ZH_MCP_VENV`): the path comes
+    1. **Server-chosen default** (`user_supplied=False`): the path comes
        from `_default_venv_dir`'s XDG branch — `$XDG_DATA_HOME/zh/venv`,
        typically `~/.local/share/zh/venv`. `~/.local/share` is NOT
        guaranteed to exist on fresh macOS accounts, minimal Linux
@@ -325,12 +336,17 @@ def _ensure_safe_parent(venv_dir: Path) -> None:
        create the full ancestor tree; the path is server-controlled
        and not subject to typo risk.
 
-    2. **User-supplied** (`ZH_MCP_VENV` is set): apply strict typo
+    2. **User-supplied** (`user_supplied=True`): apply strict typo
        protection. Require the grandparent to pre-exist and only
        create ONE new directory level. A typo'd path like
        `ZH_MCP_VENV=~/something-typo/sub/venv` refuses rather than
        silently materializing a 500MB venv tree at an unexpected
        location.
+
+    The flag is threaded as a parameter (not re-read from env at each
+    call boundary) so the classification stays coupled to the path
+    `_default_venv_dir` produced. Env mutation between calls can't
+    defeat the typo guard.
 
     In both modes, a pre-existing regular file at the parent path
     raises a clear RuntimeError (avoiding the unhelpful
@@ -346,7 +362,6 @@ def _ensure_safe_parent(venv_dir: Path) -> None:
                 f"XDG_DATA_HOME to point elsewhere."
             )
         return
-    user_supplied = bool(os.environ.get("ZH_MCP_VENV", "").strip())
     if not user_supplied:
         # Server-chosen XDG default. Auto-create the ancestor tree;
         # the path is server-controlled. Without this, a fresh user
@@ -364,7 +379,13 @@ def _ensure_safe_parent(venv_dir: Path) -> None:
             f"silently pollute user space — create the parent "
             f"directory manually and retry."
         )
-    parent.mkdir()  # single new level only
+    # `exist_ok=True` because _ensure_safe_parent runs BEFORE the
+    # bootstrap lock is acquired — two concurrent launches can both
+    # pass the `parent.exists()` check above; the second one would
+    # otherwise raise FileExistsError. The single-level-creation
+    # safety property is enforced by the `grandparent.exists()` check
+    # above, not by mkdir's mode.
+    parent.mkdir(exist_ok=True)
 
 
 def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
@@ -403,6 +424,16 @@ def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
             path.unlink()
             return
 
+        # Bind the rmtree root in the closure so the chmod-parent
+        # retry below can verify the parent it's about to chmod is
+        # INSIDE the cleanup target. Round-3 #1: when shutil.rmtree
+        # fails at the root itself (e.g. `os.scandir(venv_dir)` raises),
+        # `os.path.dirname(p)` is `venv_dir.parent` — a directory
+        # OUTSIDE our cleanup scope. Chmod-ing it silently downgrades
+        # perms on a shared `~/.local/share/zh` or `/srv/shared/...`.
+        # Never modify dirs outside the rmtree root.
+        rmtree_root = path
+
         def _on_error(func, p, exc_info):
             # `onerror` (not `onexc`) for Python 3.10 / 3.11 compat.
             exc_type = exc_info[0]
@@ -412,13 +443,15 @@ def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
             # the real exception.
             if exc_type is not None and issubclass(exc_type, PermissionError):
                 # Permission to unlink depends on the PARENT dir's
-                # write+execute bits, not on the file's mode. Try
-                # chmod-ing the parent first, then the file itself
-                # (in case it's a sub-dir we need to recurse into).
-                try:
-                    os.chmod(os.path.dirname(p), 0o700)
-                except OSError:
-                    pass
+                # write+execute bits, not on the file's mode. Chmod the
+                # parent ONLY if it sits at or inside the rmtree root —
+                # never the root's own parent.
+                p_parent = Path(p).parent
+                if p_parent == rmtree_root or rmtree_root in p_parent.parents:
+                    try:
+                        os.chmod(str(p_parent), 0o700)
+                    except OSError:
+                        pass
                 try:
                     os.chmod(p, 0o700)
                     func(p)
@@ -433,7 +466,7 @@ def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
             raise
 
 
-def _build_venv(venv_dir: Path, deps_hash: str) -> None:
+def _build_venv(venv_dir: Path, deps_hash: str, *, user_supplied: bool) -> None:
     """Tear down (if present and safe) and rebuild the venv at `venv_dir`.
 
     Refuses to rebuild a directory that doesn't look like a venv (no
@@ -469,7 +502,7 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             file=sys.stderr,
             flush=True,
         )
-    _ensure_safe_parent(venv_dir)
+    _ensure_safe_parent(venv_dir, user_supplied=user_supplied)
     try:
         # rmtree lives INSIDE the try so a partial rmtree failure
         # (EACCES on a root-owned `__pycache__/*.pyc`, NFS stale
@@ -572,7 +605,7 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
 
 
 @contextmanager
-def _venv_build_lock(venv_dir: Path):
+def _venv_build_lock(venv_dir: Path, *, user_supplied: bool):
     """Serialize concurrent `_build_venv` invocations via fcntl.flock.
 
     Two MCP launches that fire within seconds (Claude Code session
@@ -588,15 +621,30 @@ def _venv_build_lock(venv_dir: Path):
     Calls `_ensure_safe_parent` BEFORE creating the lock file so a
     typo'd `ZH_MCP_VENV` doesn't materialize an unintended ancestor
     tree just to host the lockfile. The lock file lands at
-    `venv_dir.parent / _BOOTSTRAP_LOCK` — guaranteeing the parent
-    exists as a directory is the safety guarantee that `_build_venv`
-    later depends on.
+    `venv_dir.parent / _BOOTSTRAP_LOCK`.
+
+    `user_supplied` is threaded from `_default_venv_dir` so the
+    typo-protection in `_ensure_safe_parent` stays coupled to the
+    path's origin.
     """
-    _ensure_safe_parent(venv_dir)
+    _ensure_safe_parent(venv_dir, user_supplied=user_supplied)
     lock_path = venv_dir.parent / _BOOTSTRAP_LOCK
-    # Open with O_CREAT so the lock file appears the first time; keep
-    # it open across the lock window so the fd stays valid.
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    # `O_NOFOLLOW` defeats the symlink-redirect attack vector that's
+    # widest when ZH_MCP_VENV points at a shared-writable parent
+    # (`/tmp`, `/srv/shared`, `/var/cache`). Without it, a local user
+    # with write access to the parent could plant a symlink at
+    # `_BOOTSTRAP_LOCK` → `~/.bashrc` (or any sensitive file).
+    # Currently harmless because we only flock and never write, but
+    # safe against future diagnostic-write additions.
+    # `O_CLOEXEC` ensures the fd doesn't leak into the re-exec'd venv
+    # python or any subprocess pip spawns.
+    # Mode `0o600` keeps the lockfile single-user since it's per-process
+    # coordination state, not data anyone else needs to read.
+    fd = os.open(
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+    )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
@@ -612,7 +660,7 @@ def _bootstrap_venv() -> None:
     # test that monkeypatches the env vars sees them — and so an
     # unreadable parent path doesn't crash module import for tests
     # that set ZH_MCP_SKIP_BOOTSTRAP=1.
-    venv_dir = _default_venv_dir()
+    venv_dir, user_supplied = _default_venv_dir()
     venv_py = venv_dir / "bin" / "python3"
     deps_hash = _deps_hash()
     if not _venv_is_valid(venv_dir, deps_hash):
@@ -620,9 +668,9 @@ def _bootstrap_venv() -> None:
         # re-check validity — another process may have finished while
         # we were waiting, in which case skipping the rebuild saves
         # ~5 minutes of redundant torch download.
-        with _venv_build_lock(venv_dir):
+        with _venv_build_lock(venv_dir, user_supplied=user_supplied):
             if not _venv_is_valid(venv_dir, deps_hash):
-                _build_venv(venv_dir, deps_hash)
+                _build_venv(venv_dir, deps_hash, user_supplied=user_supplied)
     # Re-exec into the venv if we're not already running under it.
     # Compare sys.prefix (the canonical "which prefix am I running under")
     # to the venv dir, NOT realpath(sys.executable) vs realpath(venv_py)
@@ -651,9 +699,9 @@ def _bootstrap_venv() -> None:
                 file=sys.stderr,
                 flush=True,
             )
-            with _venv_build_lock(venv_dir):
+            with _venv_build_lock(venv_dir, user_supplied=user_supplied):
                 if not _venv_is_valid(venv_dir, deps_hash):
-                    _build_venv(venv_dir, deps_hash)
+                    _build_venv(venv_dir, deps_hash, user_supplied=user_supplied)
             sys.stderr.flush()
             sys.stdout.flush()
             os.execv(str(venv_py), argv)

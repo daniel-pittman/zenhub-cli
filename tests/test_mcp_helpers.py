@@ -43,13 +43,17 @@ def test_deps_hash_changes_when_deps_change(monkeypatch):
 def test_default_venv_dir_uses_zh_mcp_venv_when_set(monkeypatch, tmp_path):
     custom = tmp_path / "custom-venv"
     monkeypatch.setenv("ZH_MCP_VENV", str(custom))
-    assert mcp_server._default_venv_dir() == custom.resolve()
+    venv_dir, user_supplied = mcp_server._default_venv_dir()
+    assert venv_dir == custom.resolve()
+    assert user_supplied is True
 
 
 def test_default_venv_dir_uses_xdg_data_home(monkeypatch, tmp_path):
     monkeypatch.delenv("ZH_MCP_VENV", raising=False)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    assert mcp_server._default_venv_dir() == (tmp_path / "zh" / "venv").resolve()
+    venv_dir, user_supplied = mcp_server._default_venv_dir()
+    assert venv_dir == (tmp_path / "zh" / "venv").resolve()
+    assert user_supplied is False
 
 
 def test_default_venv_dir_fallback(monkeypatch):
@@ -58,7 +62,9 @@ def test_default_venv_dir_fallback(monkeypatch):
     expected = (
         Path(os.path.expanduser("~/.local/share")) / "zh" / "venv"
     ).resolve()
-    assert mcp_server._default_venv_dir() == expected
+    venv_dir, user_supplied = mcp_server._default_venv_dir()
+    assert venv_dir == expected
+    assert user_supplied is False
 
 
 def test_default_venv_dir_resolves_relative_xdg(monkeypatch, tmp_path):
@@ -68,9 +74,10 @@ def test_default_venv_dir_resolves_relative_xdg(monkeypatch, tmp_path):
     monkeypatch.delenv("ZH_MCP_VENV", raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("XDG_DATA_HOME", "local-data")
-    result = mcp_server._default_venv_dir()
-    assert result.is_absolute()
-    assert result == (tmp_path / "local-data" / "zh" / "venv").resolve()
+    venv_dir, user_supplied = mcp_server._default_venv_dir()
+    assert venv_dir.is_absolute()
+    assert venv_dir == (tmp_path / "local-data" / "zh" / "venv").resolve()
+    assert user_supplied is False
 
 
 # -----------------------------------------------------------------------------
@@ -466,9 +473,11 @@ def test_parse_new_epic_number_returns_none_without_success_line():
 def test_default_venv_dir_warns_on_empty_zh_mcp_venv(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("ZH_MCP_VENV", "")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    result = mcp_server._default_venv_dir()
-    # Falls through to XDG default.
-    assert result == (tmp_path / "zh" / "venv").resolve()
+    venv_dir, user_supplied = mcp_server._default_venv_dir()
+    # Falls through to XDG default (NOT user-supplied — set-but-empty
+    # is treated as unset).
+    assert venv_dir == (tmp_path / "zh" / "venv").resolve()
+    assert user_supplied is False
     # ...but warns to stderr so the user notices the empty value.
     err = capsys.readouterr().err
     assert "ZH_MCP_VENV" in err
@@ -537,53 +546,65 @@ def test_looks_like_zh_venv_still_refuses_foreign_venv_with_no_sentinel(tmp_path
 
 
 def test_ensure_safe_parent_accepts_existing_dir(tmp_path):
-    # Parent already exists as a directory — proceed silently.
+    # Parent already exists as a directory — proceed silently. Either
+    # mode (user-supplied or server-default) accepts.
     parent = tmp_path / "existing"
     parent.mkdir()
     venv_dir = parent / "venv"
-    mcp_server._ensure_safe_parent(venv_dir)  # no raise
+    mcp_server._ensure_safe_parent(venv_dir, user_supplied=True)
+    mcp_server._ensure_safe_parent(venv_dir, user_supplied=False)
 
 
-def test_ensure_safe_parent_creates_one_level(tmp_path):
-    # Grandparent (tmp_path) exists, parent doesn't — create ONE level.
+def test_ensure_safe_parent_user_supplied_creates_one_level(tmp_path):
+    # User-supplied mode: grandparent exists, parent doesn't — create
+    # ONE level only.
     venv_dir = tmp_path / "zh" / "venv"
-    mcp_server._ensure_safe_parent(venv_dir)
+    mcp_server._ensure_safe_parent(venv_dir, user_supplied=True)
     assert (tmp_path / "zh").is_dir()
 
 
-def test_ensure_safe_parent_refuses_deep_ancestor_creation(tmp_path, monkeypatch):
-    # Round-2 fix: typo protection now only applies when ZH_MCP_VENV
-    # is explicitly set. Without it, the path is server-chosen and
-    # auto-created. With it, deep ancestors are refused.
-    monkeypatch.setenv("ZH_MCP_VENV", str(tmp_path / "deep" / "nested" / "tree"))
-    venv_dir = tmp_path / "deep" / "nested" / "tree"
+def test_ensure_safe_parent_user_supplied_refuses_deep_creation(tmp_path):
+    # Round-2 (still): user-supplied mode with missing grandparent
+    # must refuse rather than auto-create deep tree. Round-3 fix:
+    # no longer depends on env state — passed as parameter.
+    venv_dir = tmp_path / "deep" / "nested" / "tree" / "venv"
     with pytest.raises(RuntimeError, match="ancestor"):
-        mcp_server._ensure_safe_parent(venv_dir)
+        mcp_server._ensure_safe_parent(venv_dir, user_supplied=True)
     assert not (tmp_path / "deep").exists()  # nothing was created
 
 
-def test_ensure_safe_parent_creates_deep_tree_for_xdg_default(tmp_path, monkeypatch):
-    # Round-2 CRITICAL fix: on a fresh macOS / minimal container,
-    # `~/.local/share` doesn't exist yet. The server-chosen XDG default
-    # must auto-create the ancestor tree without refusing. Typo
-    # protection only kicks in when ZH_MCP_VENV is explicitly set.
-    monkeypatch.delenv("ZH_MCP_VENV", raising=False)
+def test_ensure_safe_parent_server_default_creates_deep_tree(tmp_path):
+    # Round-2 CRITICAL fix (still): server-chosen XDG default must
+    # auto-create the ancestor tree on fresh macOS / minimal container.
+    # Round-3 fix: explicit `user_supplied=False` (no env coupling).
     venv_dir = tmp_path / "share" / "zh" / "venv"
     assert not (tmp_path / "share").exists()
-    mcp_server._ensure_safe_parent(venv_dir)
-    # Full ancestor chain created.
+    mcp_server._ensure_safe_parent(venv_dir, user_supplied=False)
     assert (tmp_path / "share" / "zh").is_dir()
 
 
 def test_ensure_safe_parent_refuses_regular_file_parent(tmp_path):
-    # User typo'd ZH_MCP_VENV to point at a file's child path
-    # (e.g. ZH_MCP_VENV=~/.bashrc/foo). `mkdir(exist_ok=True)` would
-    # raise an unhelpful FileExistsError; we raise a clear message.
+    # Stray file at the parent path raises a clear error in BOTH modes
+    # (avoiding the unhelpful FileExistsError from mkdir).
     parent_file = tmp_path / "stray-file"
     parent_file.write_text("not a directory")
     venv_dir = parent_file / "venv"
     with pytest.raises(RuntimeError, match="is not a directory"):
-        mcp_server._ensure_safe_parent(venv_dir)
+        mcp_server._ensure_safe_parent(venv_dir, user_supplied=True)
+    with pytest.raises(RuntimeError, match="is not a directory"):
+        mcp_server._ensure_safe_parent(venv_dir, user_supplied=False)
+
+
+def test_ensure_safe_parent_user_supplied_idempotent_on_concurrent_parent_create(tmp_path):
+    # Round-3 #2: the user-supplied branch's `parent.mkdir(exist_ok=True)`
+    # must tolerate a concurrent sibling process having already created
+    # the parent dir between our `parent.exists()` check and the mkdir.
+    # Simulate by pre-creating the parent.
+    venv_dir = tmp_path / "zh" / "venv"
+    (tmp_path / "zh").mkdir()  # "race winner" already created it
+    # If exist_ok were missing, this would FileExistsError.
+    mcp_server._ensure_safe_parent(venv_dir, user_supplied=True)
+    assert (tmp_path / "zh").is_dir()
 
 
 # -----------------------------------------------------------------------------
@@ -653,7 +674,7 @@ def test_full_probe_recomputes_from_venv_deps(monkeypatch):
 def test_venv_build_lock_acquires_and_releases(tmp_path):
     venv_dir = tmp_path / "zh-venv"
     lock_path = venv_dir.parent / mcp_server._BOOTSTRAP_LOCK
-    with mcp_server._venv_build_lock(venv_dir):
+    with mcp_server._venv_build_lock(venv_dir, user_supplied=False):
         # Lock file exists during the with-block.
         assert lock_path.exists()
     # After release, the lock file remains (we don't clean it up — that
@@ -662,30 +683,67 @@ def test_venv_build_lock_acquires_and_releases(tmp_path):
 
 
 def test_venv_build_lock_creates_parent_dir(tmp_path):
-    # When grandparent exists, the lock context creates exactly one
-    # new parent level via `_ensure_safe_parent`, so subsequent
-    # acquisitions don't fail.
+    # When grandparent exists, the lock context creates the parent
+    # via `_ensure_safe_parent` so subsequent acquisitions don't fail.
     venv_dir = tmp_path / "new-parent" / "venv"
     assert not venv_dir.parent.exists()
-    with mcp_server._venv_build_lock(venv_dir):
+    with mcp_server._venv_build_lock(venv_dir, user_supplied=False):
         assert venv_dir.parent.is_dir()
 
 
-def test_venv_build_lock_refuses_typo_paths_before_mkdir(tmp_path, monkeypatch):
-    # PR #15 round-1 CRITICAL: the lock used to call mkdir(parents=True)
-    # before `_ensure_safe_parent` could fire, so a typo'd path like
-    # `~/something-typo/sub/venv` would silently create the whole tree.
-    # The lock now calls _ensure_safe_parent FIRST.
-    #
-    # Round-2 refinement: typo protection only applies when ZH_MCP_VENV
-    # is explicitly set — so set it here to exercise the strict path.
+def test_venv_build_lock_refuses_typo_paths_before_mkdir(tmp_path):
+    # PR #15 round-1 CRITICAL (still): the lock calls _ensure_safe_parent
+    # BEFORE creating the lock file, so a typo'd ZH_MCP_VENV doesn't
+    # materialize an ancestor tree. Round-3 fix: passes user_supplied
+    # explicitly instead of re-reading env.
     venv_dir = tmp_path / "deep" / "nested" / "tree" / "venv"
-    monkeypatch.setenv("ZH_MCP_VENV", str(venv_dir))
     with pytest.raises(RuntimeError, match="ancestor"):
-        with mcp_server._venv_build_lock(venv_dir):
+        with mcp_server._venv_build_lock(venv_dir, user_supplied=True):
             pass  # should not reach this
     # Nothing got auto-created on disk — the safety check fired early.
     assert not (tmp_path / "deep").exists()
+
+
+def test_venv_build_lock_classification_decoupled_from_env(tmp_path, monkeypatch):
+    # Round-3 #4: the lock's safety classification must NOT re-read
+    # env. Verify by setting ZH_MCP_VENV='something-typo-y' but passing
+    # user_supplied=False — the server-default permissive mode applies,
+    # so a deep tree is created without complaint. Conversely, unsetting
+    # the env but passing user_supplied=True forces the strict refusal.
+    deep = tmp_path / "deep-tree" / "venv"
+    monkeypatch.setenv("ZH_MCP_VENV", "/some/unrelated/typo/path/venv")
+    # user_supplied=False overrides env — server-default mode auto-creates.
+    with mcp_server._venv_build_lock(deep, user_supplied=False):
+        pass
+    assert deep.parent.is_dir()
+    # Conversely:
+    other_deep = tmp_path / "other-deep-tree" / "child" / "venv"
+    monkeypatch.delenv("ZH_MCP_VENV", raising=False)
+    # user_supplied=True forces strict mode even though env is unset.
+    with pytest.raises(RuntimeError, match="ancestor"):
+        with mcp_server._venv_build_lock(other_deep, user_supplied=True):
+            pass
+    assert not (tmp_path / "other-deep-tree").exists()
+
+
+def test_venv_build_lock_uses_o_nofollow(tmp_path):
+    # Round-3 #3: lockfile fd is opened with O_NOFOLLOW so a planted
+    # symlink at the lock path can't redirect the bootstrap's fd.
+    venv_dir = tmp_path / "zh" / "venv"
+    venv_dir.parent.mkdir(parents=True)
+    # Plant a symlink where the lockfile would land.
+    decoy_target = tmp_path / "decoy-target"
+    decoy_target.write_text("would be overwritten without O_NOFOLLOW")
+    lock_path = venv_dir.parent / mcp_server._BOOTSTRAP_LOCK
+    lock_path.symlink_to(decoy_target)
+    # Acquiring the lock through the symlink must fail with ELOOP
+    # (POSIX errno 62 / 40 depending on platform) — proving O_NOFOLLOW
+    # is honored. Without O_NOFOLLOW we'd silently open `decoy-target`.
+    with pytest.raises(OSError):
+        with mcp_server._venv_build_lock(venv_dir, user_supplied=False):
+            pass
+    # And the decoy is untouched (mode + contents unchanged).
+    assert decoy_target.read_text() == "would be overwritten without O_NOFOLLOW"
 
 
 # -----------------------------------------------------------------------------
