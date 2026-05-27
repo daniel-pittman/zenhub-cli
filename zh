@@ -3729,9 +3729,20 @@ Examples:
     # pre-fix `if .walked_nums then ...` short-circuited on the
     # empty list `[]` because jq treats `[]` as falsy in `if`,
     # mis-classifying empty as missing. Use a type check instead.
+    # Round-10 Pattern C (round-9 #7): broaden the missing-field
+    # guard to also catch the case where jq itself errored out.
+    # Pre-fix: jq's stderr went to /dev/null implicitly and the
+    # command substitution produced "" — which doesn't match
+    # "__MISSING__", so the structural-bug branch never fired.
+    # The script runs under `set -euo pipefail` but `inherit_errexit`
+    # is NOT set, so subshells like `$(echo ... | jq ...)` don't
+    # propagate jq's non-zero exit to the parent shell. Catching
+    # the empty-string case here is a belt-and-suspenders fix that
+    # avoids needing `shopt -s inherit_errexit` (which would have
+    # widespread effects on other subshells in this script).
     local walked_nums_csv
-    walked_nums_csv=$(echo "$post_state" | jq -r 'if (.walked_nums | type) == "array" then (.walked_nums | map(tostring) | join(",")) else "__MISSING__" end')
-    if [[ "$walked_nums_csv" == "__MISSING__" ]]; then
+    walked_nums_csv=$(echo "$post_state" | jq -r 'if (.walked_nums | type) == "array" then (.walked_nums | map(tostring) | join(",")) else "__MISSING__" end' 2>/dev/null || echo "__MISSING__")
+    if [[ -z "$walked_nums_csv" || "$walked_nums_csv" == "__MISSING__" ]]; then
         echo ""
         warn "Mutation landed (removeIssuesFromSprints succeeded), but post-state could not be confirmed:"
         warn "  Walker output is missing the 'walked_nums' field (internal bug)"
@@ -4761,11 +4772,22 @@ Example: zh subissue add 42 100 101"
         if [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
             warn "  githubErrors: ${gh_errors}"
         fi
+        # Round-10 Pattern C (round-9 #4): surface the fail-divergence
+        # case — API reported failures but didn't account for every
+        # input. Mirrors the Python `partial_success_warning` fail
+        # variant.
+        local unaccounted_count=$((total_inputs - failed_count - success_count))
+        if [[ "$unaccounted_count" -gt 0 ]]; then
+            warn "  ${unaccounted_count} input(s) un-reported (neither succeeded nor in failedIssues). Re-list to confirm."
+        fi
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
-        # Some ZenHub mutations silently no-op when the child already has the
-        # same parent. Surface that rather than claiming false success.
-        warn "No sub-issues added — already linked or no-op"
+        # Some ZenHub mutations silently no-op when the child already
+        # has the same parent. Round-10 Pattern C (round-9 #4): name
+        # the strict-noop-divergence shape distinctly so the operator
+        # knows to re-list. cmd_subissue_add requires total_inputs >= 1,
+        # so this is always a strict no-op despite N inputs.
+        warn "No sub-issues added — API returned strict no-op (successCount=0, failedIssues=[]) despite ${total_inputs} input(s). Re-list to confirm."
     fi
 
     # v1.6.0 removed the `RESULT:add` machine-summary line. The sole
@@ -4775,6 +4797,13 @@ Example: zh subissue add 42 100 101"
     # We still classify the outcome here for the exit-code contract that
     # scripted callers (humans + CI) rely on. Precedence (round-5 #5):
     # real failure > coverage/divergence warning > success.
+    #
+    # Round-10 Pattern C (round-9 #5): align exit-code semantics with
+    # cmd_sprint_remove (canonical 0/1/2 convention). Divergence-only
+    # partial means "the API claimed N succeeded but we can't identify
+    # which inputs" — that's coverage-incomplete (re-verify with
+    # `zh subissue list`), not a real failure. Exit 2 disambiguates
+    # this from `failed_count > 0` (real rejections).
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -4789,8 +4818,14 @@ Example: zh subissue add 42 100 101"
     else
         outcome="ok"
     fi
-    if [[ "$outcome" != "ok" ]]; then
-        exit 1
+    if [[ "$outcome" == "ok" ]]; then
+        :  # exit 0 (implicit)
+    elif [[ "$failed_count" -gt 0 ]]; then
+        exit 1  # real failure
+    elif [[ "$outcome" == "noop" ]]; then
+        exit 1  # zero positives = real failure (mirrors cmd_sprint_remove)
+    else
+        exit 2  # divergence-only partial = coverage incomplete
     fi
 }
 
@@ -5006,6 +5041,12 @@ parent relationship before retrying."
         if [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
             warn "  githubErrors: ${gh_errors}"
         fi
+        # Round-10 Pattern C (round-9 #4): symmetric fail-divergence
+        # surface with cmd_subissue_add.
+        local unaccounted_count=$((total_inputs - failed_count - success_count))
+        if [[ "$unaccounted_count" -gt 0 ]]; then
+            warn "  ${unaccounted_count} input(s) un-reported (neither succeeded nor in failedIssues). Re-list to confirm."
+        fi
     fi
     if [[ "$success_count" -eq 0 ]] && [[ "$failed_count" -eq 0 ]]; then
         # We pre-validated every child belongs to this parent, so a zero
@@ -5021,6 +5062,9 @@ state with 'zh subissue list ${stripped_parent}'."
     # consumer (the MCP server) now reads successCount / failedIssues
     # directly from the GraphQL response. Exit-code contract preserved
     # for scripted callers. Round-6 #4: divergence forces partial.
+    #
+    # Round-10 Pattern C (round-9 #5): symmetric exit-code update with
+    # cmd_subissue_add — divergence-only partial → exit 2.
     local outcome
     if [[ "$failed_count" -gt 0 ]] && [[ "$success_count" -gt 0 ]]; then
         outcome="partial"
@@ -5033,8 +5077,14 @@ state with 'zh subissue list ${stripped_parent}'."
     else
         outcome="ok"
     fi
-    if [[ "$outcome" != "ok" ]]; then
-        exit 1
+    if [[ "$outcome" == "ok" ]]; then
+        :  # exit 0 (implicit)
+    elif [[ "$failed_count" -gt 0 ]]; then
+        exit 1  # real failure
+    elif [[ "$outcome" == "noop" ]]; then
+        exit 1  # zero positives = real failure
+    else
+        exit 2  # divergence-only partial = coverage incomplete
     fi
 }
 
@@ -5806,6 +5856,28 @@ Run 'zh epic help' for usage information."
 # =============================================================================
 # Main
 # =============================================================================
+#
+# Exit-code convention for mutation-emitting subcommands (round-10
+# Pattern C / round-9 #5):
+#
+#   0 — clean success: outcome == "ok", no warnings, full coverage.
+#   1 — real failure: at least one input rejected by the API
+#        (failed_count > 0), OR zero positives confirmed under
+#        full coverage. "Definitely wrong" takes precedence over
+#        coverage warnings.
+#   2 — coverage incomplete / re-verify: divergence-only partial
+#        (API count disagrees with inferred set), walker bailed
+#        mid-walk, OR post-state can't be confirmed after a
+#        successful mutation. Scripted callers should re-verify
+#        before retrying.
+#
+# `error` (zh utility func, line ~30) exits 1 for pre-mutation
+# validation failures (bad usage, parent-not-found, etc.) — those
+# don't get their own tier because no mutation has fired and the
+# caller can fix and retry without coverage concerns.
+#
+# This convention is observed by: cmd_subissue_add, cmd_subissue_remove,
+# cmd_sprint_add, cmd_sprint_remove.
 
 main() {
     # Global flag parsing (peel off `-r` / `--repo` and `-w` /
