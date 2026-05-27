@@ -194,6 +194,27 @@ ZH_TOKEN=...        # GraphQL API token (most commands)
 ZH_REST_TOKEN=...   # REST API token (unblock command only)
 ```
 
+### Additional environment variables
+
+`zh` and the MCP server honor these env vars; mirror in sync with the README's env-vars table and `mcp_server.py`'s module docstring.
+
+**CLI**
+
+| Variable | Purpose |
+|---|---|
+| `ZH_REPO` | Default `owner/repo` for `zh` invocations; overridden by `-r owner/repo`. |
+| `ZH_WORKSPACE` | Default workspace name; overridden by `-w "Workspace Name"`. Precedence: flag > env / config > git-remote + first-workspace fallback. |
+
+**MCP server**
+
+| Variable | Purpose |
+|---|---|
+| `ZH_DEFAULT_REPO_PATH` | Default git checkout directory the MCP runs `zh` from when a tool call omits `repo_path`. |
+| `ZH_BIN_PATH` | Path to the `zh` bash script (default: peer to `mcp_server.py`). Useful for testing alternate `zh` builds. |
+| `ZH_MCP_VENV` | Full absolute path of the venv the MCP server bootstraps and re-execs into. Overrides the XDG default. Empty / whitespace values are warned and ignored. |
+| `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/zh/venv` (default `~/.local/share/zh/venv`). |
+| `ZH_MCP_SKIP_BOOTSTRAP` | Test-mode escape hatch. Setting `=1` skips the venv build + execv and substitutes a no-op `FastMCP` stub so the pytest suite can exercise the MCP tool functions without pulling in `mcp` / `torch` / `transformers`. **Never set in production.** |
+
 ## Development Notes
 
 - Single bash script, no build process
