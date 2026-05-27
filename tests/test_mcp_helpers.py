@@ -305,3 +305,68 @@ def test_parse_mine_listing_title_starting_with_hash():
     issues = mcp_server._parse_mine_listing(sample)
     assert len(issues) == 1
     assert issues[0]["title"] == "#perf-2026Q2: rework batching across hot paths"
+
+
+# -----------------------------------------------------------------------------
+# _parse_pipeline_listing — the 4-field `#N │ repo │ N pts │ assignee`
+# parser shipped in v1.5.0. The PR tightened its title-walker (require
+# indentation, match full `#NNN │` header shape); these tests pin that
+# behavior so a future regression surfaces in CI instead of as silent
+# data corruption in the pipeline MCP tool.
+# -----------------------------------------------------------------------------
+
+
+_PIPELINE_SAMPLE = """\
+Info: Getting issues in 'In Progress'...
+
+Pipeline: In Progress (3 issues)
+
+  #108 │ acme/widget-server │ — pts │ acme-user
+    fix: badge tier filter uses startsWith
+    → https://app.zenhub.com/workspaces/W/issues/gh/acme/widget-server/108
+
+  #646 │ acme/widget-app │ 3 pts │ acme-user
+    fix: admin wizard bottom-action Row overflows
+    → https://app.zenhub.com/workspaces/W/issues/gh/acme/widget-app/646
+
+  #613 │ acme/widget-app │ — pts │ unassigned
+    Implement Leaderboard & Rewards screens
+    → https://app.zenhub.com/workspaces/W/issues/gh/acme/widget-app/613
+"""
+
+
+def test_parse_pipeline_listing_extracts_all_four_fields():
+    issues = mcp_server._parse_pipeline_listing(_PIPELINE_SAMPLE)
+    assert len(issues) == 3
+    assert issues[0] == {
+        "number": 108,
+        "repo": "acme/widget-server",
+        "estimate": None,
+        "assignee": "acme-user",
+        "title": "fix: badge tier filter uses startsWith",
+    }
+    assert issues[1]["estimate"] == "3"
+    assert issues[2]["assignee"] is None  # "unassigned" normalized
+
+
+def test_parse_pipeline_listing_skips_unindented_banner():
+    sample = (
+        "  #108 │ acme/widget-server │ — pts │ acme-user\n"
+        "WARNING: gh emitted a banner here without indentation\n"
+        "    fix: badge tier filter uses startsWith\n"
+        "    → https://app.zenhub.com/anywhere/108\n"
+    )
+    issues = mcp_server._parse_pipeline_listing(sample)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "fix: badge tier filter uses startsWith"
+
+
+def test_parse_pipeline_listing_title_starting_with_hash():
+    sample = (
+        "  #108 │ acme/widget-server │ — pts │ acme-user\n"
+        "    #perf-2026Q2: rework hot-path batching\n"
+        "    → https://app.zenhub.com/anywhere/108\n"
+    )
+    issues = mcp_server._parse_pipeline_listing(sample)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "#perf-2026Q2: rework hot-path batching"

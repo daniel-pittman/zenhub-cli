@@ -694,8 +694,11 @@ claude mcp add --scope user zenhub \
 #    matches the current dependency tuple); if any check fails, the venv
 #    is rebuilt automatically.
 #
-#    To force a clean rebuild: `rm -rf ~/.local/share/zh/venv` and relaunch
-#    the MCP server.
+#    To force a clean rebuild: delete the venv directory shown in the
+#    `[zenhub-mcp] bootstrapping <path> with ...` stderr line at startup,
+#    then relaunch. The default is ~/.local/share/zh/venv but is overridden
+#    by $ZH_MCP_VENV or $XDG_DATA_HOME; rely on the log line for the
+#    actual path on your machine.
 
 # 4. Verify:
 claude mcp list

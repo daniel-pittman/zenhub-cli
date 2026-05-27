@@ -83,8 +83,6 @@ def _default_venv_dir() -> Path:
     return (Path(xdg_data) / "zh" / "venv").resolve()
 
 
-_VENV_DIR = _default_venv_dir()
-_VENV_PY = _VENV_DIR / "bin" / "python3"
 _VENV_DEPS = (
     "mcp",
     # similarity search: sentence-transformers brings in torch + transformers
@@ -96,22 +94,26 @@ _VENV_DEPS = (
 _VENV_MIN_PY = (3, 10)  # mcp package requires >= 3.10
 _VENV_MARKER = ".zh-deps-hash"  # records the _VENV_DEPS hash this venv was built for
 
-# Probe command used to validate that a venv can actually load every
-# declared dep — not just `mcp`. Catches half-installed venvs where the
-# torch download for sentence-transformers failed mid-stream but `mcp`
-# landed cleanly. Derived from `_VENV_DEPS` (s/-/_/) so the source of
-# truth stays in one tuple. If a future dep has a non-trivial PyPI →
-# import name mapping (`Pillow` → `PIL`), this assumption breaks
-# loudly when the probe fails.
-_VENV_IMPORT_PROBE = "; ".join(
-    f"import {name.replace('-', '_')}" for name in _VENV_DEPS
-)
-
 # Subprocess timeouts. The probe must stay snappy because it runs on
 # every MCP launch; build steps can take longer (pip + torch download).
 _VENV_PROBE_TIMEOUT = 30        # seconds for `python -c "import ..."`
 _VENV_BUILD_TIMEOUT = 60        # seconds for `python -m venv ...`
 _VENV_PIP_TIMEOUT = 600         # seconds for `pip install ...` (torch is ~400MB)
+
+
+def _venv_import_probe() -> str:
+    """Build the import-probe command from `_VENV_DEPS` at call time.
+
+    Recomputes on every call so a test that monkeypatches `_VENV_DEPS`
+    sees a matching probe (mirrors `_deps_hash()`'s lazy pattern).
+    Maps PyPI names to module names by `s/-/_/`. If a future dep has
+    a non-trivial mapping (`Pillow` → `PIL`), the probe fails loudly
+    at the call site, which is the desired behavior — we want a hard
+    error before we certify a half-importable venv as valid.
+    """
+    return "; ".join(
+        f"import {name.replace('-', '_')}" for name in _VENV_DEPS
+    )
 
 
 def _deps_hash() -> str:
@@ -148,7 +150,7 @@ def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
     if not marker.exists():
         return False
     try:
-        marker_value = marker.read_text().strip()
+        marker_value = marker.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
         # Corrupt, root-owned, or non-UTF-8 marker → treat as invalid so
         # the bootstrap rebuilds instead of crashing with a traceback.
@@ -157,7 +159,7 @@ def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
         return False
     try:
         subprocess.check_call(
-            [str(venv_py), "-c", _VENV_IMPORT_PROBE],
+            [str(venv_py), "-c", _venv_import_probe()],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=_VENV_PROBE_TIMEOUT,
@@ -169,11 +171,13 @@ def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
     return True
 
 
-def _find_builder_python() -> str:
-    """Return a python3 executable suitable for building the venv.
+def _find_builder_python(venv_dir: Path) -> str:
+    """Return a python3 executable suitable for building the venv at `venv_dir`.
 
     Prefer the interpreter that invoked us; fall back to common Homebrew /
-    pyenv locations. Skips anything below `_VENV_MIN_PY`.
+    pyenv locations. Skips anything below `_VENV_MIN_PY`. `venv_dir` is
+    used only for the error message — passed as a parameter so the
+    function doesn't depend on a module-level `_VENV_DIR` snapshot.
     """
     if sys.version_info >= _VENV_MIN_PY:
         return sys.executable
@@ -205,7 +209,7 @@ def _find_builder_python() -> str:
             continue
     raise RuntimeError(
         f"No python3 >= {_VENV_MIN_PY[0]}.{_VENV_MIN_PY[1]} found to build "
-        f"{_VENV_DIR}; install one (e.g. via pyenv or `brew install python`) "
+        f"{venv_dir}; install one (e.g. via pyenv or `brew install python`) "
         f"and retry."
     )
 
@@ -256,23 +260,25 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
         raise RuntimeError(
             f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: it "
             f"exists but does not look like a venv we built (no "
-            f"pyvenv.cfg, no {_VENV_MARKER} marker). Check your "
-            f"ZH_MCP_VENV / XDG_DATA_HOME settings; remove the directory "
-            f"manually if you really want it rebuilt."
+            f"{_VENV_MARKER} marker). Check your ZH_MCP_VENV / "
+            f"XDG_DATA_HOME settings; remove the directory manually "
+            f"if you really want it rebuilt."
         )
-    builder = _find_builder_python()
+    builder = _find_builder_python(venv_dir)
     venv_py = venv_dir / "bin" / "python3"
     if venv_dir.exists():
         print(
             f"[zenhub-mcp] rebuilding {venv_dir} "
             f"(missing/broken or _VENV_DEPS changed)",
             file=sys.stderr,
+            flush=True,
         )
         shutil.rmtree(venv_dir)
     else:
         print(
             f"[zenhub-mcp] bootstrapping {venv_dir} with {builder}",
             file=sys.stderr,
+            flush=True,
         )
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -290,20 +296,31 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
              "--quiet", "--no-cache-dir", *_VENV_DEPS],
             timeout=_VENV_PIP_TIMEOUT,
         )
-    except subprocess.TimeoutExpired as exc:
+    except (subprocess.TimeoutExpired,
+            subprocess.CalledProcessError,
+            OSError) as exc:
+        # Build crashed mid-flight — wipe the partial venv so the next
+        # launch's _looks_like_zh_venv sees a missing path (safe to
+        # rebuild) instead of a markerless non-empty dir (refused).
+        # Without this cleanup, a single transient PyPI 502 would
+        # permanently brick bootstrap until the user `rm -rf`s manually.
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = (f"timed out after {exc.timeout}s "
+                      f"({exc.cmd[0] if exc.cmd else '?'} ...)")
+        else:
+            reason = f"build subprocess failed: {exc}"
         raise RuntimeError(
-            f"[zenhub-mcp] venv build at {venv_dir} timed out after "
-            f"{exc.timeout}s ({exc.cmd[0]} ...). Check your network "
-            f"(slow PyPI mirror?) and retry."
+            f"[zenhub-mcp] venv build at {venv_dir} {reason}. Cleaned "
+            f"up partial state; check your network (slow PyPI mirror?) "
+            f"and Python installation, then retry."
         ) from exc
     # Post-build sanity check BEFORE writing the marker. Probes EVERY
     # declared dep (not just `mcp`) so a half-installed venv where
     # `sentence-transformers` failed mid-stream isn't certified good.
-    # If the probe fails, the next launch rebuilds from scratch instead
-    # of trusting a stale marker.
     try:
         subprocess.check_call(
-            [str(venv_py), "-c", _VENV_IMPORT_PROBE],
+            [str(venv_py), "-c", _venv_import_probe()],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=_VENV_PROBE_TIMEOUT,
@@ -311,27 +328,53 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
     except (subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
             OSError) as exc:
+        # Same recovery story as the build except above: clean up so
+        # the next launch can rebuild cleanly without manual intervention.
+        shutil.rmtree(venv_dir, ignore_errors=True)
         raise RuntimeError(
             f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
             f"import all declared deps ({', '.join(_VENV_DEPS)}). "
-            f"Delete {venv_dir} and retry; check your network and "
+            f"Cleaned up; retry the launch. Check your network and "
             f"Python installation."
         ) from exc
-    (venv_dir / _VENV_MARKER).write_text(deps_hash)
+    # Atomic marker write: write to tmp, then os.replace. A SIGKILL
+    # between the probe success and the marker landing would otherwise
+    # leave a fully-working venv that fails validity checks forever,
+    # forcing manual rm. Tmp-and-rename closes that window.
+    marker = venv_dir / _VENV_MARKER
+    tmp_marker = marker.with_suffix(".tmp")
+    tmp_marker.write_text(deps_hash, encoding="utf-8")
+    os.replace(tmp_marker, marker)
 
 
 def _bootstrap_venv() -> None:
+    # Compute paths at call time (not at module import) so a future
+    # test that monkeypatches the env vars sees them — and so an
+    # unreadable parent path doesn't crash module import for tests
+    # that set ZH_MCP_SKIP_BOOTSTRAP=1.
+    venv_dir = _default_venv_dir()
+    venv_py = venv_dir / "bin" / "python3"
     deps_hash = _deps_hash()
-    if not _venv_is_valid(_VENV_DIR, deps_hash):
-        _build_venv(_VENV_DIR, deps_hash)
+    if not _venv_is_valid(venv_dir, deps_hash):
+        _build_venv(venv_dir, deps_hash)
     # Re-exec into the venv if we're not already running under it.
     # Compare sys.prefix (the canonical "which prefix am I running under")
-    # to the venv dir, NOT realpath(sys.executable) vs realpath(_VENV_PY)
+    # to the venv dir, NOT realpath(sys.executable) vs realpath(venv_py)
     # — those resolve to the same target on Linux when the venv's bin/python
     # is a symlink to the same builder interpreter as the launcher, which
     # incorrectly skips the re-exec and leaves us running outside the venv.
-    if Path(sys.prefix).resolve() != _VENV_DIR.resolve():
-        os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
+    if Path(sys.prefix).resolve() != venv_dir.resolve():
+        # Flush before execv: stderr is block-buffered under the MCP stdio
+        # transport, so the "bootstrapping" / "rebuilding" messages would
+        # otherwise be lost. `__file__` is resolved to an absolute path so
+        # the child works even if a wrapper script changes cwd between
+        # launch and bootstrap.
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os.execv(
+            str(venv_py),
+            [str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
 
 
 # Test-mode escape hatch: setting ZH_MCP_SKIP_BOOTSTRAP=1 in the
