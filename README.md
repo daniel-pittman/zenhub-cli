@@ -1,5 +1,7 @@
 # ZenHub CLI (`zh`)
 
+![ZenHub CLI — manage ZenHub issues, pipelines, sprints, and sub-issues from your terminal](docs/img/social-preview.png)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/daniel-pittman/zenhub-cli)](https://github.com/daniel-pittman/zenhub-cli/releases)
 [![CI](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml)
