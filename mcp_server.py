@@ -69,7 +69,20 @@ def _default_venv_dir() -> Path:
       2. $XDG_DATA_HOME/zh/venv (standard XDG; defaults to
          ~/.local/share/zh/venv when XDG_DATA_HOME is unset).
     """
-    override = os.environ.get("ZH_MCP_VENV")
+    raw_override = os.environ.get("ZH_MCP_VENV")
+    if raw_override is not None and not raw_override.strip():
+        # Distinguish unset from set-to-empty so a CI/Docker config that
+        # did `ENV ZH_MCP_VENV=` (clearing an inherited value) or
+        # `ZH_MCP_VENV="$UNSET_VAR"` doesn't silently fall through to
+        # XDG. Surface the situation; still fall through so the launch
+        # can succeed.
+        print(
+            "[zenhub-mcp] warning: ZH_MCP_VENV is set but empty / "
+            "whitespace; ignoring and using XDG_DATA_HOME default.",
+            file=sys.stderr,
+            flush=True,
+        )
+    override = (raw_override or "").strip()
     if override:
         return Path(override).expanduser().resolve()
     xdg_data = os.path.expanduser(
@@ -203,9 +216,12 @@ def _find_builder_python(venv_dir: Path) -> str:
                 [cand, "-c", probe],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=10,  # probe is `sys.exit(0 if ver >= ...)` — <100ms in practice
             )
             return cand
-        except (subprocess.CalledProcessError, OSError):
+        except (subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError):
             continue
     raise RuntimeError(
         f"No python3 >= {_VENV_MIN_PY[0]}.{_VENV_MIN_PY[1]} found to build "
@@ -273,7 +289,6 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
             file=sys.stderr,
             flush=True,
         )
-        shutil.rmtree(venv_dir)
     else:
         print(
             f"[zenhub-mcp] bootstrapping {venv_dir} with {builder}",
@@ -282,6 +297,12 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
         )
     venv_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
+        # rmtree lives INSIDE the try so a partial rmtree failure
+        # (EACCES on a root-owned `__pycache__/*.pyc`, NFS stale
+        # handle, antivirus quarantine race) hits the cleanup path
+        # rather than escaping uncaught and bricking the next launch.
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir)
         subprocess.check_call(
             [builder, "-m", "venv", str(venv_dir)],
             timeout=_VENV_BUILD_TIMEOUT,
@@ -296,14 +317,20 @@ def _build_venv(venv_dir: Path, deps_hash: str) -> None:
              "--quiet", "--no-cache-dir", *_VENV_DEPS],
             timeout=_VENV_PIP_TIMEOUT,
         )
+    except (KeyboardInterrupt, SystemExit):
+        # First-time bootstrap takes minutes (torch is ~400MB). User
+        # Ctrl-C / SIGTERM / sleep mid-install must wipe the partial
+        # venv so the next launch isn't blocked by a markerless
+        # non-empty dir. KeyboardInterrupt is BaseException, not
+        # Exception — it must be caught BEFORE the wider except below.
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        raise
     except (subprocess.TimeoutExpired,
             subprocess.CalledProcessError,
             OSError) as exc:
         # Build crashed mid-flight — wipe the partial venv so the next
         # launch's _looks_like_zh_venv sees a missing path (safe to
         # rebuild) instead of a markerless non-empty dir (refused).
-        # Without this cleanup, a single transient PyPI 502 would
-        # permanently brick bootstrap until the user `rm -rf`s manually.
         shutil.rmtree(venv_dir, ignore_errors=True)
         if isinstance(exc, subprocess.TimeoutExpired):
             reason = (f"timed out after {exc.timeout}s "
@@ -426,10 +453,12 @@ if str(HERE) not in sys.path:
 # ANSI color code regex — zh emits colored output for terminals; strip for MCP.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
-# `  #645 │ owner/repo │ ...`. Used to detect "next issue starts here"
-# when walking title-continuation lines, so titles that legitimately
-# start with `#` aren't mistaken for a new header.
-_ISSUE_HEADER_RE = re.compile(r"^\s*#\d+\s*│")
+# `  #645 │ owner/repo │ ...` (2-space indent). Bounded to 0-3 leading
+# spaces so a 4-space-indented title line that legitimately starts with
+# `#NNN │` (a cross-reference convention some teams use, e.g.
+# `    #1234 │ blocker note for OAuth retry path`) isn't mistaken for
+# the next issue's header.
+_ISSUE_HEADER_RE = re.compile(r"^ {0,3}#\d+\s*│")
 
 
 # =============================================================================
@@ -644,15 +673,30 @@ def _parse_mine_listing(plain: str) -> list[dict]:
 # was a recurring source of drift; v1.6.0 retires it entirely.
 
 
+# `zh` emits the success line with a ✓ prefix (after ANSI is stripped):
+#   ✓ Created issue #42: <title>
+# An unanchored search across stdout would also match titles that
+# legitimately contain "Created issue #NN" (e.g. a bug report whose
+# title quotes an earlier ticket), or the preceding `Info: Creating
+# issue: <title>...` line. Anchor at line-start + ✓ + ws so the
+# captured number is the one immediately after the ✓ marker.
+_SUCCESS_ISSUE_RE = re.compile(
+    r"^\s*✓\s*Created issue #(\d+)", re.MULTILINE,
+)
+_SUCCESS_EPIC_RE = re.compile(
+    r"^\s*✓\s*Created epic #(\d+)", re.MULTILINE,
+)
+
+
 def _parse_new_issue_number(plain: str) -> int | None:
-    """Extract issue number from 'Created issue #NNN' output."""
-    m = re.search(r"Created issue #(\d+)", plain)
+    """Extract issue number from the `✓ Created issue #NNN` success line."""
+    m = _SUCCESS_ISSUE_RE.search(plain)
     return int(m.group(1)) if m else None
 
 
 def _parse_new_epic_number(plain: str) -> int | None:
-    """Extract epic number from 'Created epic #NNN' output."""
-    m = re.search(r"Created epic #(\d+)", plain)
+    """Extract epic number from the `✓ Created epic #NNN` success line."""
+    m = _SUCCESS_EPIC_RE.search(plain)
     return int(m.group(1)) if m else None
 
 

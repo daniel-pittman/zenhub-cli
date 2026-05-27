@@ -370,3 +370,106 @@ def test_parse_pipeline_listing_title_starting_with_hash():
     issues = mcp_server._parse_pipeline_listing(sample)
     assert len(issues) == 1
     assert issues[0]["title"] == "#perf-2026Q2: rework hot-path batching"
+
+
+# -----------------------------------------------------------------------------
+# _ISSUE_HEADER_RE bounded-indent check — round-4 #2.
+# zh emits headers at 2-space indent, titles at 4-space indent. The
+# regex must NOT match a 4-space-indented title that legitimately
+# starts with `#NNN │ ...` (cross-reference convention some teams use).
+# -----------------------------------------------------------------------------
+
+
+def test_parse_mine_listing_title_with_hash_pipe_pattern():
+    # A title like `#1234 │ blocker note` at 4-space indent must NOT
+    # trigger the "next issue header" bail-out. The header regex is
+    # bounded to 0-3 leading spaces; titles at 4 spaces fall through.
+    sample = (
+        "  #645 │ acme/widget-app │ Product Backlog\n"
+        "    #1234 │ blocker note for OAuth retry path\n"
+        "    → https://app.zenhub.com/anywhere/645\n"
+    )
+    issues = mcp_server._parse_mine_listing(sample)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "#1234 │ blocker note for OAuth retry path"
+
+
+def test_parse_pipeline_listing_title_with_hash_pipe_pattern():
+    sample = (
+        "  #108 │ acme/widget-server │ — pts │ acme-user\n"
+        "    #1234 │ blocker note for OAuth retry path\n"
+        "    → https://app.zenhub.com/anywhere/108\n"
+    )
+    issues = mcp_server._parse_pipeline_listing(sample)
+    assert len(issues) == 1
+    assert issues[0]["title"] == "#1234 │ blocker note for OAuth retry path"
+
+
+# -----------------------------------------------------------------------------
+# _parse_new_issue_number / _parse_new_epic_number — round-4 #3.
+# Anchor on the ✓ success marker so an adversarial title containing
+# `Created issue #NN` (or the preceding `Info: Creating issue: ...`
+# line) doesn't trick the parser into returning the wrong number.
+# -----------------------------------------------------------------------------
+
+
+def test_parse_new_issue_number_returns_the_success_line_number():
+    stdout = (
+        "Info: Creating issue: Bug: Created issue #99 has wrong fix...\n"
+        "✓ Created issue #42: Bug: Created issue #99 has wrong fix\n"
+    )
+    assert mcp_server._parse_new_issue_number(stdout) == 42
+
+
+def test_parse_new_issue_number_returns_none_without_success_line():
+    # No ✓ line means the create command never reported success — must
+    # return None, not whatever number the Info line echoed from the
+    # user's title.
+    stdout = (
+        "Info: Creating issue: Bug: Created issue #99 has wrong fix...\n"
+        "Error: GraphQL mutation failed\n"
+    )
+    assert mcp_server._parse_new_issue_number(stdout) is None
+
+
+def test_parse_new_epic_number_returns_the_success_line_number():
+    stdout = (
+        "Info: Creating epic: Bug: see Created epic #99 for context...\n"
+        "✓ Created epic #42: Bug: see Created epic #99 for context\n"
+    )
+    assert mcp_server._parse_new_epic_number(stdout) == 42
+
+
+def test_parse_new_epic_number_returns_none_without_success_line():
+    stdout = "Error: epic creation failed; see Created epic #99 in audit\n"
+    assert mcp_server._parse_new_epic_number(stdout) is None
+
+
+# -----------------------------------------------------------------------------
+# _default_venv_dir empty ZH_MCP_VENV — round-4 #10.
+# An empty / whitespace value must NOT silently fall through to XDG
+# without diagnostic. The fall-through is preserved (so CI configs
+# that clear inherited env vars still work) but a warning is emitted.
+# -----------------------------------------------------------------------------
+
+
+def test_default_venv_dir_warns_on_empty_zh_mcp_venv(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("ZH_MCP_VENV", "")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    result = mcp_server._default_venv_dir()
+    # Falls through to XDG default.
+    assert result == (tmp_path / "zh" / "venv").resolve()
+    # ...but warns to stderr so the user notices the empty value.
+    err = capsys.readouterr().err
+    assert "ZH_MCP_VENV" in err
+    assert "empty" in err.lower()
+
+
+def test_default_venv_dir_warns_on_whitespace_zh_mcp_venv(monkeypatch, capsys, tmp_path):
+    # A common shell-quoting accident: ZH_MCP_VENV="$UNSET_VAR" expands
+    # to empty; ZH_MCP_VENV="   " expands to whitespace. Both must warn.
+    monkeypatch.setenv("ZH_MCP_VENV", "   ")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    mcp_server._default_venv_dir()
+    err = capsys.readouterr().err
+    assert "ZH_MCP_VENV" in err
