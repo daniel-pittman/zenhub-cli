@@ -56,10 +56,29 @@ zh subissue list <parent#>                    # List sub-issues of a parent
 zh subissue reorder <child#> top|bottom|after <sib#>|before <sib#>
                                               # Reorder among siblings (sibling-anchored, not integer positions)
 
+# Sprints — read
+zh sprints [--all]                            # List sprints (● marks active; --all includes closed)
+zh sprint <name>                              # Sprint detail + issues
+zh sprint current                             # Active sprint
+zh sprint                                     # Defaults to current
+zh sprint <name> --no-urls                    # Compact output
+
+# Sprints — write
+zh sprint add <name> <issue#> [<issue#> ...]    # Add issues to a sprint
+zh sprint remove <name> <issue#> [<issue#> ...] # Remove issues from a sprint
+zh sa current 42                              # Top-level alias for sprint add
+zh sr current 42                              # Top-level alias for sprint remove
+
+# Global flags (peeled off before any subcommand)
+zh -r owner/repo <cmd>                        # Target a specific repo
+zh -w "Backend Team" <cmd>                    # Target a specific workspace
+# Or set ZH_REPO / ZH_WORKSPACE in env or ~/.config/zh/config
+
 # Discovery
 zh types                # List issue types
 zh labels               # List labels
 zh pipelines            # List pipelines
+zh workspaces           # List workspaces (● marks active target)
 ```
 
 ### Important Patterns
@@ -69,6 +88,7 @@ zh pipelines            # List pipelines
 3. **Closed issues**: Use `--all` flag to include closed: `zh board --all`
 4. **ZenHub URLs**: Shown by default in `mine` and `pipeline`; use `--no-urls` to hide
 5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
+6. **Repo / workspace overrides**: `-r owner/repo` and `-w "Name"` work in front of any subcommand. Persist via `ZH_REPO` / `ZH_WORKSPACE` in `~/.config/zh/config`.
 
 ## For AI Assistants
 
@@ -149,12 +169,20 @@ zh reopen 123
 
 ```
 zenhub-cli/
-├── zh              # Main executable (bash script)
-├── README.md       # User documentation
-├── CLAUDE.md       # This file (AI assistant guidance)
-├── LICENSE         # MIT license
-├── VERSION         # Current version number
-└── .gitignore      # Git ignore patterns
+├── zh                  # Main executable (bash script)
+├── mcp_server.py       # MCP server entry point (FastMCP + tool defs)
+├── zh_api.py           # GraphQL client + auth/repo/workspace resolution
+├── zh_graphql_ops.py   # ZenHub GraphQL ops (sub-issues + sprints)
+├── similarity.py       # Sentence-embedding duplicate detection
+├── tests/              # pytest suite (mocks the network)
+├── agents/zenhub.md    # Generic agent definition (copy to ~/.claude/agents/)
+├── README.md           # User documentation
+├── CLAUDE.md           # This file (AI assistant guidance)
+├── CONTRIBUTING.md     # Contribution workflow
+├── SECURITY.md         # Security posture
+├── LICENSE             # MIT license
+├── VERSION             # Current version number
+└── .github/workflows/  # CI + Claude review workflows
 ```
 
 ## Configuration

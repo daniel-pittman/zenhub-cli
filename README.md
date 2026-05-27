@@ -1,5 +1,7 @@
 # ZenHub CLI (`zh`)
 
+![ZenHub CLI — manage ZenHub issues, pipelines, sprints, and sub-issues from your terminal](docs/img/social-preview.png)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/daniel-pittman/zenhub-cli)](https://github.com/daniel-pittman/zenhub-cli/releases)
 [![CI](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/daniel-pittman/zenhub-cli/actions/workflows/ci.yml)
@@ -99,11 +101,34 @@ mkdir -p ~/.config/zh
 cat > ~/.config/zh/config << 'EOF'
 ZH_TOKEN=your_graphql_token_here
 ZH_REST_TOKEN=your_rest_token_here
+# Optional: default repo + workspace (override with -r / -w on any call)
+# ZH_REPO=owner/repo
+# ZH_WORKSPACE="My Workspace"
 EOF
 
 # Secure the file (tokens are sensitive!)
 chmod 600 ~/.config/zh/config
 ```
+
+### Repo + workspace targeting
+
+`zh` infers the GitHub owner/repo from `git remote get-url origin` and picks the first ZenHub workspace the repo is connected to. Override either with global flags or config:
+
+```bash
+# One-off override on a single invocation
+zh -r owner/repo board
+zh -w "Backend Team" sprints
+zh -r owner/repo -w "Backend Team" sprint current
+
+# Per-shell or persistent defaults
+export ZH_REPO="acme/widgets"
+export ZH_WORKSPACE="Backend Team"
+# or write them into ~/.config/zh/config
+```
+
+Precedence (highest first): `-r` / `-w` flag → `ZH_REPO` / `ZH_WORKSPACE` env or config → git-remote + first-workspace fallback.
+
+`zh workspaces` shows every workspace the repo is connected to and marks which one the rest of the CLI would currently target.
 
 ### Alternative: Project-level Config
 
@@ -139,6 +164,10 @@ ZH_REST_TOKEN=your_rest_token_here
 | `priority <issue> [level]` | `prio` | Set or view issue priority |
 | `epic <subcommand>` | `epics` | Manage ZenHub native epics (see [Epics](#epics)) |
 | `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
+| `sprints [--all]` | `sp` | List sprints in workspace (see [Sprints](#sprints)) |
+| `sprint <name>` | | View sprint details and issues |
+| `sprint add <name> <issue#> [...]` | `sa` (top-level) | Add one or more issues to a sprint |
+| `sprint remove <name> <issue#> [...]` | `sr` (top-level), `rm` | Remove one or more issues from a sprint |
 | `types` | | List available issue types |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -404,6 +433,72 @@ $ zh issue 100
 
 > **Multi-repo workspaces:** `zh subissue` commands resolve issue numbers via the *current git checkout's* GitHub repo. In a ZenHub workspace that spans multiple GitHub repos, a parent in repo A with sub-issues in repo B can't be managed from a single working directory — each `zh subissue` invocation has to be run from a checkout of the repo whose issue numbers are being passed. The 3-tier framing (Epic → Issue → Sub-issue) often invites cross-repo grouping; plan parent/child placement with that limitation in mind, or do the cross-repo plumbing via the ZenHub web UI. Epic operations have the same scope limitation; sub-issues just feel it more often because the hierarchy is tighter.
 
+### Sprints
+
+ZenHub workspaces can have sprints with start/end dates, member assignments, and progress tracking (completed vs total points, closed issue count). `zh` exposes a read-only window into them — useful for "what's in the active sprint?" check-ins, retrospectives, and feeding sprint planning conversations.
+
+```bash
+# List open sprints (● marks the active sprint)
+zh sprints
+
+# Include closed sprints
+zh sprints --all
+
+# View active sprint details and issues
+zh sprint current
+zh sprint            # (also defaults to current)
+zh sprint active     # alias for current
+
+# View a specific sprint by name (case-insensitive)
+zh sprint "Sprint 5"
+
+# Compact output (no per-issue URLs)
+zh sprint current --no-urls
+```
+
+Sample output:
+
+```
+Sprint: Sprint 7
+
+  State:     OPEN
+  Period:    2026-05-12 → 2026-05-26
+  Points:    8/13 completed
+  Closed:    3 issues
+
+Issues (5):
+
+  #100 │ acme/widgets │ 3 pts │ alice │ In Progress
+    Add token rotation
+    → https://github.com/acme/widgets/issues/100
+
+  #101 │ acme/widgets │ 5 pts │ bob │ In Review
+    ✓ Wire up refresh-token endpoint
+    → https://github.com/acme/widgets/issues/101
+```
+
+Sprint membership mutations:
+
+```bash
+# Add one or more issues to a sprint
+zh sprint add "Sprint 5" 42 43 44
+zh sprint add current 42                # Active sprint
+zh sa active 42                         # Top-level alias
+
+# Remove one or more issues from a sprint
+zh sprint remove "Sprint 5" 42
+zh sprint rm current 42 43              # `rm` is an alias for `remove`
+zh sr current 42                        # Top-level alias
+
+# Move an issue between sprints
+zh sprint remove "Sprint 4" 42
+zh sprint add "Sprint 5" 42
+```
+
+The mutations report per-issue success / failure. An issue can fail to link for several reasons the API doesn't differentiate (already in the sprint, archived, otherwise ineligible) — `zh` surfaces the count and the affected issue numbers so you can investigate.
+
+> Sprint functionality is inspired by the design proposed in [#2](https://github.com/daniel-pittman/zenhub-cli/pull/2) by [@jeremiahrose](https://github.com/jeremiahrose). The sprint queries (list / show / current) and mutations (add / remove) are credited to that design via `Co-Authored-By` trailers on the commits.
+
 ### Discovery Commands
 
 ```bash
@@ -538,22 +633,25 @@ The issue must exist in a repository that's part of your ZenHub workspace.
 
 ## MCP Server (for Claude Code / AI agents)
 
-A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. It wraps `zh` over stdio so any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
+A Python MCP server (`mcp_server.py`) ships as a peer to the `zh` bash script. Most tools wrap `zh` over stdio for the human-facing read/write surface, while the sub-issue and sprint families call ZenHub's GraphQL API directly from Python (since v1.6.0) — sourcing structured data straight from the API rather than parsing terminal output. Any [Claude Code](https://docs.claude.com/en/docs/claude-code) session — or any other MCP-aware client — can drive ZenHub backlog operations as native MCP tools without shelling out.
 
 ### What it exposes
 
-Roughly 30 tools covering the same surface as `zh`:
+Roughly 35 tools covering the same surface as `zh`:
 
 | Category | Tools |
 |---|---|
-| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `list_users`, `list_labels`, `list_types` |
+| Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `sprint_list`, `sprint_show`, `sprint_current`, `list_users`, `list_labels`, `list_types` |
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
 | Sub-issue management | `subissue_add_children`, `subissue_remove_children`, `subissue_reorder` |
+| Sprint membership | `sprint_add_issues`, `sprint_remove_issues` |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
+
+> **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) and the sprint family (`sprint_list`, `sprint_show`, `sprint_current`, `sprint_add_issues`, `sprint_remove_issues`) talk to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
 
 ### Similarity search (duplicate detection)
 
@@ -589,9 +687,18 @@ claude mcp add --scope user zenhub \
     /usr/bin/python3 \
     /absolute/path/to/zenhub-cli/mcp_server.py
 
-# 3. On first invocation, the server self-bootstraps a venv at /tmp/zhenv
-#    and installs the `mcp` package there. /tmp is wiped on reboot, so the
-#    server will re-bootstrap automatically next time it's launched.
+# 3. On first invocation, the server self-bootstraps a durable venv at
+#    $XDG_DATA_HOME/zh/venv (default: ~/.local/share/zh/venv) and installs
+#    mcp + sentence-transformers + numpy into it. Subsequent launches
+#    validate the venv (pyvenv.cfg present, `import mcp` works, deps-hash
+#    matches the current dependency tuple); if any check fails, the venv
+#    is rebuilt automatically.
+#
+#    To force a clean rebuild: delete the venv directory shown in the
+#    `[zenhub-mcp] bootstrapping <path> with ...` stderr line at startup,
+#    then relaunch. The default is ~/.local/share/zh/venv but is overridden
+#    by $ZH_MCP_VENV or $XDG_DATA_HOME; rely on the log line for the
+#    actual path on your machine.
 
 # 4. Verify:
 claude mcp list
@@ -614,12 +721,14 @@ For multi-project use, the typical pattern is to pass `repo_path` explicitly on 
 |---|---|
 | `ZH_DEFAULT_REPO_PATH` | Default git checkout directory to run `zh` from when `repo_path` arg is omitted. |
 | `ZH_BIN_PATH` | Path to the `zh` bash script (default: peer to `mcp_server.py`). Useful if you want to test against an alternate `zh` build. |
+| `ZH_MCP_VENV` | Full path of the venv the MCP server bootstraps and re-execs into. Overrides the default location. Useful for pinning to a project-local venv during development. |
+| `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/zh/venv` (default `~/.local/share/zh/venv`). |
 
 ### Requirements
 
 - Python 3.10+ available on PATH (the server probes common locations: PATH default, Homebrew, pyenv shims, system Python).
 - All the same requirements as `zh` itself (authenticated `gh` CLI, `ZH_TOKEN` configured, `jq`, `curl`).
-- For the similarity-search tools: ~500MB of disk space the first time it runs — `sentence-transformers` installs `torch` + `transformers` into the venv (~400MB) and the embedding model itself caches under `~/.cache/huggingface/` (~80MB).
+- For the similarity-search tools: ~500MB of disk space the first time it runs — `sentence-transformers` installs `torch` + `transformers` into the MCP venv (~400MB) and the embedding model itself caches under `~/.cache/huggingface/` (~80MB).
 
 ### Optional: install the bundled `zenhub` agent for delegated use
 
