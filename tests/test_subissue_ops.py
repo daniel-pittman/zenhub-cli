@@ -842,6 +842,146 @@ def test_remove_sub_issues_succeeded_divergence_returns_empty_succeeded():
     assert out["ok"] is False
 
 
+def test_remove_sub_issues_divergence_noop_preserved():
+    """Round-7 #1 SPEC pin: when `successCount=0, failedIssues=[]`
+    on `remove`, the divergence guard fires (succeeded=[] vs
+    inferred=inputs ≠ 0) AND outcome MUST stay `noop` — not get
+    clobbered to `partial`.
+
+    Pre-round-7 the remove path's override was unconditional, so
+    a strict no-op got mis-signaled as partial + empty succeeded +
+    empty failed (internally inconsistent). The `outcome == "ok"`
+    guard from the `add` side fixes the asymmetry.
+    """
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101])
+    assert out["outcome"] == "noop", (
+        f"Round-7 #1: strict no-op (success=0, failed=0) must stay "
+        f"`noop` even when divergence guard fires; got {out['outcome']!r}"
+    )
+    assert out["succeeded"] == []
+    assert out["failed"] == []
+    # The divergence guard still fires (succeeded=[] inferred-from
+    # length mismatch), so the warning is still set — what matters
+    # is the outcome label.
+    assert out["partial_success_warning"] is not None
+
+
+def test_remove_sub_issues_divergence_fail_preserved():
+    """Round-7 #1: when `successCount=0, failedIssues=[100]` and
+    we have >1 inputs, outcome MUST stay `fail` — divergence
+    guard does not override real failure.
+    """
+    ctx = _ctx()
+    correct_parent = {
+        "id": "issue-gid-42",
+        "number": 42,
+        "title": "Parent",
+        "repository": {"ownerName": "acme", "name": "widgets"},
+    }
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100, parent=correct_parent),
+        _issue_by_info(101, parent=correct_parent),
+        {
+            "data": {
+                "removeSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.remove_sub_issues(ctx, 42, [100, 101])
+    assert out["outcome"] == "fail", (
+        f"Round-7 #1: real failure must stay `fail` — divergence "
+        f"warning does not downgrade it; got {out['outcome']!r}"
+    )
+    assert out["succeeded"] == []
+    # Divergence fires (success=0, failed=1, but 2 inputs → mismatch)
+    assert out["partial_success_warning"] is not None
+
+
+def test_add_sub_issues_divergence_noop_preserved():
+    """Round-7 #1 symmetric pin: the `add` side already has the
+    `outcome == "ok"` guard, but pin it explicitly so a future
+    regression mirroring the round-6 mistake on the `add` side
+    is caught.
+    """
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    assert out["outcome"] == "noop"
+    assert out["succeeded"] == []
+    assert out["failed"] == []
+
+
+def test_add_sub_issues_divergence_fail_preserved():
+    """Round-7 #1 symmetric: real failure stays `fail` on add."""
+    ctx = _ctx()
+    responses = [
+        _issue_by_info(42),
+        _issue_by_info(100),
+        _issue_by_info(101),
+        {
+            "data": {
+                "addSubIssues": {
+                    "successCount": 0,
+                    "failedIssues": [{
+                        "number": 100,
+                        "repository": {"ownerName": "acme", "name": "widgets"},
+                    }],
+                    "githubErrors": {},
+                }
+            }
+        },
+    ]
+    with _patch_ctx_query(ctx, responses):
+        out = zh_graphql_ops.add_sub_issues(ctx, 42, [100, 101])
+    assert out["outcome"] == "fail"
+    assert out["succeeded"] == []
+
+
 def test_add_sub_issues_full_success_when_count_matches():
     """Sanity: when successCount equals inferred set, we DO trust it."""
     ctx = _ctx()

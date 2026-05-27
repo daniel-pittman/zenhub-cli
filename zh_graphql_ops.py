@@ -706,8 +706,21 @@ def remove_sub_issues(
 
     outcome = _classify_outcome(success_count, failed_count)
     # Round-6 #3: force partial when divergence guard fires. See
-    # add_sub_issues for the rationale — signal must match data.
-    if partial_success_warning is not None:
+    # add_sub_issues for the full rationale — signal must match data.
+    #
+    # Round-7 #1: only override when outcome was "ok". The `add`
+    # counterpart had this `outcome == "ok"` guard; the round-6
+    # patch on the `remove` side dropped it, asymmetrically. The
+    # bare override clobbered:
+    #   - `noop`  (success=0, failed=0) → partial + empty
+    #     succeeded + empty failed (internally inconsistent)
+    #   - `fail`  (success=0, failed>0) → partial + empty
+    #     succeeded + non-empty failed (mis-signals real failure
+    #     as a "couldn't identify" warning)
+    # The `outcome == "ok"` guard preserves the dedicated semantics
+    # for those cases; divergence only overrides the "ok"
+    # misclassification.
+    if partial_success_warning is not None and outcome == "ok":
         outcome = "partial"
     return {
         "ok": outcome == "ok",
