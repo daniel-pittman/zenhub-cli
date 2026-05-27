@@ -22,9 +22,10 @@ from its working directory. If omitted, falls back to:
 Run as a subprocess (stdio transport):
     /usr/bin/python3 mcp_server.py
 
-The script self-bootstraps /tmp/zhenv (mcp package) on first run and on
-reboot when /tmp is wiped, then re-execs under that venv. Any python3 on PATH
-that can run `python3 -m venv` works as the launcher.
+The script self-bootstraps a durable venv under XDG_DATA_HOME (default
+`~/.local/share/zh/venv`) on first run, validates it on every launch, and
+re-execs under that venv. Any python3 on PATH that can run `python3 -m venv`
+works as the launcher.
 
 Register user-scope so every Claude Code session sees it:
     claude mcp add --scope user zenhub \\
@@ -35,44 +36,162 @@ Environment overrides:
   ZH_DEFAULT_REPO_PATH — default git-checkout dir to run zh from
                          (otherwise uses MCP server cwd at launch)
   ZH_BIN_PATH          — path to zh bash script (default: peer to this file)
+  ZH_MCP_VENV          — full path of the venv directory to use; overrides
+                         the XDG_DATA_HOME-derived default. Useful for
+                         pinning to a project-local venv during development.
+  XDG_DATA_HOME        — standard XDG override for the data root; the venv
+                         is created at `$XDG_DATA_HOME/zh/venv`.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 # -----------------------------------------------------------------------------
-# Self-bootstrap: /tmp gets wiped on reboot. If our venv is missing, build it
-# with stdlib-only code and re-exec under it. Must run before any third-party
-# import (mcp).
+# Self-bootstrap: build (or rebuild, if broken / stale) a durable venv under
+# XDG_DATA_HOME, validate it, and re-exec under it. Must run before any
+# third-party import (mcp).
 # -----------------------------------------------------------------------------
 
-_VENV_DIR = Path("/tmp/zhenv")
-_VENV_PY = _VENV_DIR / "bin" / "python3"
+
+def _default_venv_dir() -> Path:
+    """Compute the default venv location.
+
+    Priority:
+      1. ZH_MCP_VENV environment variable (full path).
+      2. $XDG_DATA_HOME/zh/venv (standard XDG; defaults to
+         ~/.local/share/zh/venv when XDG_DATA_HOME is unset).
+    """
+    raw_override = os.environ.get("ZH_MCP_VENV")
+    if raw_override is not None and not raw_override.strip():
+        # Distinguish unset from set-to-empty so a CI/Docker config that
+        # did `ENV ZH_MCP_VENV=` (clearing an inherited value) or
+        # `ZH_MCP_VENV="$UNSET_VAR"` doesn't silently fall through to
+        # XDG. Surface the situation; still fall through so the launch
+        # can succeed.
+        print(
+            "[zenhub-mcp] warning: ZH_MCP_VENV is set but empty / "
+            "whitespace; ignoring and using XDG_DATA_HOME default.",
+            file=sys.stderr,
+            flush=True,
+        )
+    override = (raw_override or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    xdg_data = os.path.expanduser(
+        os.environ.get("XDG_DATA_HOME") or "~/.local/share"
+    )
+    # `.resolve()` on both branches — pins relative paths (e.g. a
+    # mis-configured `XDG_DATA_HOME=./local-data`) at startup so the
+    # MCP doesn't thrash between projects when it launches from
+    # different cwds, and produces consistent paths in error messages
+    # regardless of which branch was taken.
+    return (Path(xdg_data) / "zh" / "venv").resolve()
+
+
 _VENV_DEPS = (
     "mcp",
     # similarity search: sentence-transformers brings in torch + transformers
     # + huggingface_hub. The model weights themselves are cached under
-    # ~/.cache/huggingface/ so they survive reboots even when /tmp/zhenv
-    # is wiped.
+    # ~/.cache/huggingface/ so they survive even if the venv is rebuilt.
     "sentence-transformers",
     "numpy",
 )
 _VENV_MIN_PY = (3, 10)  # mcp package requires >= 3.10
+_VENV_MARKER = ".zh-deps-hash"  # records the _VENV_DEPS hash this venv was built for
+
+# Subprocess timeouts. The probe must stay snappy because it runs on
+# every MCP launch; build steps can take longer (pip + torch download).
+_VENV_PROBE_TIMEOUT = 30        # seconds for `python -c "import ..."`
+_VENV_BUILD_TIMEOUT = 60        # seconds for `python -m venv ...`
+_VENV_PIP_TIMEOUT = 600         # seconds for `pip install ...` (torch is ~400MB)
 
 
-def _find_builder_python() -> str:
-    """Return a python3 executable suitable for building the venv.
+def _venv_import_probe() -> str:
+    """Build the import-probe command from `_VENV_DEPS` at call time.
+
+    Recomputes on every call so a test that monkeypatches `_VENV_DEPS`
+    sees a matching probe (mirrors `_deps_hash()`'s lazy pattern).
+    Maps PyPI names to module names by `s/-/_/`. If a future dep has
+    a non-trivial mapping (`Pillow` → `PIL`), the probe fails loudly
+    at the call site, which is the desired behavior — we want a hard
+    error before we certify a half-importable venv as valid.
+    """
+    return "; ".join(
+        f"import {name.replace('-', '_')}" for name in _VENV_DEPS
+    )
+
+
+def _deps_hash() -> str:
+    """Stable hash of _VENV_DEPS — used to detect dep changes between launches.
+
+    A 16-char SHA-256 prefix is plenty: collisions don't matter for a
+    cache-invalidation token that's only compared against itself.
+    """
+    return hashlib.sha256("|".join(_VENV_DEPS).encode()).hexdigest()[:16]
+
+
+def _venv_is_valid(venv_dir: Path, deps_hash: str) -> bool:
+    """Return True iff `venv_dir` is a working venv built for `deps_hash`.
+
+    Catches all the failure modes that have happened in practice:
+      - bin/python missing (venv never built, or partial wipe)
+      - pyvenv.cfg missing (venv structure incomplete — Python won't add
+        the venv's site-packages to sys.path, so installed wheels are
+        unreachable)
+      - deps-hash marker missing or mismatched (deps tuple changed since
+        the venv was built — needs reinstall)
+      - `import mcp` fails under the venv's python (interpreter or
+        site-packages broken, e.g. pyenv updated underneath us)
+
+    `venv_dir` and `deps_hash` are arguments (not module globals) so this
+    function is unit-testable with synthetic temp-dir fixtures.
+    """
+    venv_py = venv_dir / "bin" / "python3"
+    if not venv_py.exists():
+        return False
+    if not (venv_dir / "pyvenv.cfg").exists():
+        return False
+    marker = venv_dir / _VENV_MARKER
+    if not marker.exists():
+        return False
+    try:
+        marker_value = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        # Corrupt, root-owned, or non-UTF-8 marker → treat as invalid so
+        # the bootstrap rebuilds instead of crashing with a traceback.
+        return False
+    if marker_value != deps_hash:
+        return False
+    try:
+        subprocess.check_call(
+            [str(venv_py), "-c", _venv_import_probe()],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_VENV_PROBE_TIMEOUT,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        # Probe failed, timed out, or interpreter is unrunnable —
+        # rebuild rather than try to limp along.
+        return False
+    return True
+
+
+def _find_builder_python(venv_dir: Path) -> str:
+    """Return a python3 executable suitable for building the venv at `venv_dir`.
 
     Prefer the interpreter that invoked us; fall back to common Homebrew /
-    pyenv locations. Skips anything below `_VENV_MIN_PY`.
+    pyenv locations. Skips anything below `_VENV_MIN_PY`. `venv_dir` is
+    used only for the error message — passed as a parameter so the
+    function doesn't depend on a module-level `_VENV_DIR` snapshot.
     """
-    import shutil
     if sys.version_info >= _VENV_MIN_PY:
         return sys.executable
     candidates = [
@@ -97,36 +216,192 @@ def _find_builder_python() -> str:
                 [cand, "-c", probe],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=10,  # probe is `sys.exit(0 if ver >= ...)` — <100ms in practice
             )
             return cand
-        except (subprocess.CalledProcessError, OSError):
+        except (subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError):
             continue
     raise RuntimeError(
         f"No python3 >= {_VENV_MIN_PY[0]}.{_VENV_MIN_PY[1]} found to build "
-        f"{_VENV_DIR}; install one (e.g. via pyenv or `brew install python`) "
+        f"{venv_dir}; install one (e.g. via pyenv or `brew install python`) "
         f"and retry."
     )
 
 
-def _bootstrap_venv() -> None:
-    if not _VENV_PY.exists():
-        builder = _find_builder_python()
-        # Log to stderr so MCP stdio transport isn't corrupted.
+def _looks_like_zh_venv(venv_dir: Path) -> bool:
+    """Return True iff `venv_dir` is safe for `_build_venv` to rmtree.
+
+    A user-controlled `ZH_MCP_VENV` (or a typo'd `XDG_DATA_HOME`) could
+    point the venv path at any directory on disk — including `$HOME`, a
+    project venv, or a regular file. Without this guard, a stale/wrong
+    path plus a routine "venv looks invalid" verdict would silently
+    `shutil.rmtree` arbitrary user data on the next launch.
+
+    Safe to delete only when:
+      - the path doesn't exist yet (nothing to remove)
+      - the path is a directory AND empty (nothing to lose)
+      - the path is a directory AND carries our `_VENV_MARKER` file
+        (definitely a venv we built — `pyvenv.cfg` alone is NOT
+        sufficient, since the user may have pointed ZH_MCP_VENV at
+        their own project's venv)
+
+    Anything else (a regular file, an unreadable dir, a foreign venv,
+    `~/Documents`) must be removed by the user explicitly.
+    """
+    if not venv_dir.exists():
+        return True
+    if not venv_dir.is_dir():
+        return False  # regular file, FIFO, etc.
+    try:
+        is_empty = not any(venv_dir.iterdir())
+    except OSError:
+        return False  # unreadable, race-deleted, etc.
+    if is_empty:
+        return True
+    return (venv_dir / _VENV_MARKER).exists()
+
+
+def _build_venv(venv_dir: Path, deps_hash: str) -> None:
+    """Tear down (if present and safe) and rebuild the venv at `venv_dir`.
+
+    Refuses to rebuild a directory that doesn't look like a venv (no
+    `pyvenv.cfg`, no `_VENV_MARKER`) to prevent destroying user data
+    pointed at by a typo'd `ZH_MCP_VENV`. Marker is written only AFTER
+    the post-build `import mcp` sanity check passes — so a half-built
+    venv is never certified good.
+    """
+    if not _looks_like_zh_venv(venv_dir):
+        raise RuntimeError(
+            f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: it "
+            f"exists but does not look like a venv we built (no "
+            f"{_VENV_MARKER} marker). Check your ZH_MCP_VENV / "
+            f"XDG_DATA_HOME settings; remove the directory manually "
+            f"if you really want it rebuilt."
+        )
+    builder = _find_builder_python(venv_dir)
+    venv_py = venv_dir / "bin" / "python3"
+    if venv_dir.exists():
         print(
-            f"[zenhub-mcp] bootstrapping {_VENV_DIR} with {builder}",
+            f"[zenhub-mcp] rebuilding {venv_dir} "
+            f"(missing/broken or _VENV_DEPS changed)",
             file=sys.stderr,
+            flush=True,
         )
-        subprocess.check_call([builder, "-m", "venv", str(_VENV_DIR)])
+    else:
+        print(
+            f"[zenhub-mcp] bootstrapping {venv_dir} with {builder}",
+            file=sys.stderr,
+            flush=True,
+        )
+    venv_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # rmtree lives INSIDE the try so a partial rmtree failure
+        # (EACCES on a root-owned `__pycache__/*.pyc`, NFS stale
+        # handle, antivirus quarantine race) hits the cleanup path
+        # rather than escaping uncaught and bricking the next launch.
+        if venv_dir.exists():
+            shutil.rmtree(venv_dir)
         subprocess.check_call(
-            [str(_VENV_PY), "-m", "pip", "install",
-             "--quiet", "--no-cache-dir", "--upgrade", "pip"]
+            [builder, "-m", "venv", str(venv_dir)],
+            timeout=_VENV_BUILD_TIMEOUT,
         )
         subprocess.check_call(
-            [str(_VENV_PY), "-m", "pip", "install",
-             "--quiet", "--no-cache-dir", *_VENV_DEPS]
+            [str(venv_py), "-m", "pip", "install",
+             "--quiet", "--no-cache-dir", "--upgrade", "pip"],
+            timeout=_VENV_PIP_TIMEOUT,
         )
-    if os.path.realpath(sys.executable) != os.path.realpath(str(_VENV_PY)):
-        os.execv(str(_VENV_PY), [str(_VENV_PY), __file__, *sys.argv[1:]])
+        subprocess.check_call(
+            [str(venv_py), "-m", "pip", "install",
+             "--quiet", "--no-cache-dir", *_VENV_DEPS],
+            timeout=_VENV_PIP_TIMEOUT,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        # First-time bootstrap takes minutes (torch is ~400MB). User
+        # Ctrl-C / SIGTERM / sleep mid-install must wipe the partial
+        # venv so the next launch isn't blocked by a markerless
+        # non-empty dir. KeyboardInterrupt is BaseException, not
+        # Exception — it must be caught BEFORE the wider except below.
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        raise
+    except (subprocess.TimeoutExpired,
+            subprocess.CalledProcessError,
+            OSError) as exc:
+        # Build crashed mid-flight — wipe the partial venv so the next
+        # launch's _looks_like_zh_venv sees a missing path (safe to
+        # rebuild) instead of a markerless non-empty dir (refused).
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = (f"timed out after {exc.timeout}s "
+                      f"({exc.cmd[0] if exc.cmd else '?'} ...)")
+        else:
+            reason = f"build subprocess failed: {exc}"
+        raise RuntimeError(
+            f"[zenhub-mcp] venv build at {venv_dir} {reason}. Cleaned "
+            f"up partial state; check your network (slow PyPI mirror?) "
+            f"and Python installation, then retry."
+        ) from exc
+    # Post-build sanity check BEFORE writing the marker. Probes EVERY
+    # declared dep (not just `mcp`) so a half-installed venv where
+    # `sentence-transformers` failed mid-stream isn't certified good.
+    try:
+        subprocess.check_call(
+            [str(venv_py), "-c", _venv_import_probe()],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_VENV_PROBE_TIMEOUT,
+        )
+    except (subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError) as exc:
+        # Same recovery story as the build except above: clean up so
+        # the next launch can rebuild cleanly without manual intervention.
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"[zenhub-mcp] venv at {venv_dir} was built but cannot "
+            f"import all declared deps ({', '.join(_VENV_DEPS)}). "
+            f"Cleaned up; retry the launch. Check your network and "
+            f"Python installation."
+        ) from exc
+    # Atomic marker write: write to tmp, then os.replace. A SIGKILL
+    # between the probe success and the marker landing would otherwise
+    # leave a fully-working venv that fails validity checks forever,
+    # forcing manual rm. Tmp-and-rename closes that window.
+    marker = venv_dir / _VENV_MARKER
+    tmp_marker = marker.with_suffix(".tmp")
+    tmp_marker.write_text(deps_hash, encoding="utf-8")
+    os.replace(tmp_marker, marker)
+
+
+def _bootstrap_venv() -> None:
+    # Compute paths at call time (not at module import) so a future
+    # test that monkeypatches the env vars sees them — and so an
+    # unreadable parent path doesn't crash module import for tests
+    # that set ZH_MCP_SKIP_BOOTSTRAP=1.
+    venv_dir = _default_venv_dir()
+    venv_py = venv_dir / "bin" / "python3"
+    deps_hash = _deps_hash()
+    if not _venv_is_valid(venv_dir, deps_hash):
+        _build_venv(venv_dir, deps_hash)
+    # Re-exec into the venv if we're not already running under it.
+    # Compare sys.prefix (the canonical "which prefix am I running under")
+    # to the venv dir, NOT realpath(sys.executable) vs realpath(venv_py)
+    # — those resolve to the same target on Linux when the venv's bin/python
+    # is a symlink to the same builder interpreter as the launcher, which
+    # incorrectly skips the re-exec and leaves us running outside the venv.
+    if Path(sys.prefix).resolve() != venv_dir.resolve():
+        # Flush before execv: stderr is block-buffered under the MCP stdio
+        # transport, so the "bootstrapping" / "rebuilding" messages would
+        # otherwise be lost. `__file__` is resolved to an absolute path so
+        # the child works even if a wrapper script changes cwd between
+        # launch and bootstrap.
+        sys.stderr.flush()
+        sys.stdout.flush()
+        os.execv(
+            str(venv_py),
+            [str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
 
 
 # Test-mode escape hatch: setting ZH_MCP_SKIP_BOOTSTRAP=1 in the
@@ -177,6 +452,13 @@ if str(HERE) not in sys.path:
 
 # ANSI color code regex — zh emits colored output for terminals; strip for MCP.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
+# `  #645 │ owner/repo │ ...` (2-space indent). Bounded to 0-3 leading
+# spaces so a 4-space-indented title line that legitimately starts with
+# `#NNN │` (a cross-reference convention some teams use, e.g.
+# `    #1234 │ blocker note for OAuth retry path`) isn't mistaken for
+# the next issue's header.
+_ISSUE_HEADER_RE = re.compile(r"^ {0,3}#\d+\s*│")
 
 
 # =============================================================================
@@ -307,14 +589,20 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
             repo = m.group(2)
             pts = m.group(3)
             assignee = m.group(4)
-            # Title is on the next non-empty line, indented
+            # Title is on the next indented non-empty line. Bail out
+            # only when we see a real `#NNN │` header. Require the
+            # candidate to actually start with whitespace so an
+            # interstitial unindented banner (group header, gh warning,
+            # progress note) can't be silently consumed as the title.
             title = ""
             j = i + 1
-            while j < len(lines) and not lines[j].strip().startswith("#"):
-                stripped = lines[j].strip()
-                if stripped and not stripped.startswith("→"):
-                    title = stripped
-                    break
+            while j < len(lines) and not _ISSUE_HEADER_RE.match(lines[j]):
+                line = lines[j]
+                if line.startswith((" ", "\t")):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("→"):
+                        title = stripped
+                        break
                 j += 1
             issues.append({
                 "number": number,
@@ -327,21 +615,88 @@ def _parse_pipeline_listing(plain: str) -> list[dict]:
     return issues
 
 
+def _parse_mine_listing(plain: str) -> list[dict]:
+    """Parse `zh mine` output into list of {number, repo, pipeline, title}.
+
+    `zh mine` uses a different per-issue shape than `zh pipeline`: three
+    fields (`#N │ owner/repo │ pipeline`) instead of four (`#N │ repo │
+    N pts │ assignee`), because the assignee is implied by the command
+    and the pipeline is the differentiating field. Separate parser keeps
+    each regex specific rather than gluing both shapes into one
+    branchier pattern.
+    """
+    issues: list[dict] = []
+    lines = plain.splitlines()
+    i = 0
+    while i < len(lines):
+        # Pipeline capture group is `[^│]+?` (not `.+?`) so it can't
+        # cross another `│` separator. If `zh mine` ever grows a 4th
+        # column the line stops matching here — better than the lazy
+        # `.+?` silently swallowing `"<pipeline> │ <title>"` into
+        # `pipeline` and leaving `title=""` (silent data corruption).
+        m = re.match(
+            r"^\s*#(\d+)\s*│\s*(\S+/\S+)\s*│\s*([^│]+?)\s*$",
+            lines[i],
+        )
+        if m:
+            number = int(m.group(1))
+            repo = m.group(2)
+            pipeline = m.group(3).strip()
+            # Title is the next indented non-empty non-arrow line. Bail
+            # only on a real `#NNN │ ...` header (titles can start with
+            # `#`), and require the candidate to start with whitespace
+            # so an interstitial unindented banner can't be silently
+            # swallowed as the title.
+            title = ""
+            j = i + 1
+            while j < len(lines) and not _ISSUE_HEADER_RE.match(lines[j]):
+                line = lines[j]
+                if line.startswith((" ", "\t")):
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("→"):
+                        title = stripped
+                        break
+                j += 1
+            issues.append({
+                "number": number,
+                "repo": repo,
+                "pipeline": pipeline,
+                "title": title,
+            })
+        i += 1
+    return issues
+
+
 # Sub-issue helpers moved to zh_graphql_ops.py — the MCP server now talks
 # directly to ZenHub's GraphQL API for the sub-issue family of tools
 # (list / add / remove / reorder). The bash text contract used in v1.5.0
 # was a recurring source of drift; v1.6.0 retires it entirely.
 
 
+# `zh` emits the success line with a ✓ prefix (after ANSI is stripped):
+#   ✓ Created issue #42: <title>
+# An unanchored search across stdout would also match titles that
+# legitimately contain "Created issue #NN" (e.g. a bug report whose
+# title quotes an earlier ticket), or the preceding `Info: Creating
+# issue: <title>...` line. Anchor at line-start + ✓ + ws so the
+# captured number is the one immediately after the ✓ marker.
+_SUCCESS_ISSUE_RE = re.compile(
+    r"^\s*✓\s*Created issue #(\d+)", re.MULTILINE,
+)
+_SUCCESS_EPIC_RE = re.compile(
+    r"^\s*✓\s*Created epic #(\d+)", re.MULTILINE,
+)
+
+
 def _parse_new_issue_number(plain: str) -> int | None:
-    """Extract issue number from 'Created issue #NNN' output."""
-    m = re.search(r"Created issue #(\d+)", plain)
+    """Extract issue number from the `✓ Created issue #NNN` success line."""
+    m = _SUCCESS_ISSUE_RE.search(plain)
     return int(m.group(1)) if m else None
 
 
 def _parse_new_epic_number(plain: str) -> int | None:
-    """Extract epic number from 'Created epic #NNN' output."""
-    m = re.search(r"Created epic #(\d+)", plain)
+    """Extract epic number from the `✓ Created epic #NNN` success line."""
+    m = _SUCCESS_EPIC_RE.search(plain)
     return int(m.group(1)) if m else None
 
 
@@ -460,7 +815,11 @@ def mine(user: str = "", repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, issues (parsed listing), raw, stderr.
+        dict with:
+            ok: bool
+            issues: list of {number, repo, pipeline, title}
+            raw: full stdout for display
+            stderr: any error output
     """
     args = ["mine"]
     if user:
@@ -468,7 +827,7 @@ def mine(user: str = "", repo_path: str = "") -> dict:
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     return {
         "ok": r["ok"],
-        "issues": _parse_pipeline_listing(r["stdout_plain"]) if r["ok"] else [],
+        "issues": _parse_mine_listing(r["stdout_plain"]) if r["ok"] else [],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
