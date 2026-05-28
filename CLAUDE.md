@@ -211,8 +211,9 @@ ZH_REST_TOKEN=...   # REST API token (unblock command only)
 |---|---|
 | `ZH_DEFAULT_REPO_PATH` | Default git checkout directory the MCP runs `zh` from when a tool call omits `repo_path`. |
 | `ZH_BIN_PATH` | Path to the `zh` bash script (default: peer to `mcp_server.py`). Useful for testing alternate `zh` builds. |
-| `ZH_MCP_VENV` | Full absolute path of the venv the MCP server bootstraps and re-execs into. Overrides the XDG default. Empty / whitespace values are warned and ignored. |
+| `ZH_MCP_VENV` | Full absolute path of the venv the MCP server bootstraps and re-execs into. Overrides the XDG default. Empty / whitespace values are warned and ignored; relative paths are rejected. |
 | `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/zh/venv` (default `~/.local/share/zh/venv`). |
+| `ZH_MCP_PROBE_TIMEOUT` | Seconds for the per-launch `import` probe that validates the venv (default 30). Widen on slow media (NFS home, FileVault cold cache) to avoid a probe timeout triggering a needless rebuild. |
 | `ZH_MCP_SKIP_BOOTSTRAP` | Test-mode escape hatch. Setting `=1` skips the venv build + execv and substitutes a no-op `FastMCP` stub so the pytest suite can exercise the MCP tool functions without pulling in `mcp` / `torch` / `transformers`. **Never set in production.** |
 
 ## Development Notes

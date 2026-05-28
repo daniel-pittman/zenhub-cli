@@ -36,11 +36,17 @@ Environment overrides:
   ZH_DEFAULT_REPO_PATH — default git-checkout dir to run zh from
                          (otherwise uses MCP server cwd at launch)
   ZH_BIN_PATH          — path to zh bash script (default: peer to this file)
-  ZH_MCP_VENV          — full path of the venv directory to use; overrides
-                         the XDG_DATA_HOME-derived default. Useful for
-                         pinning to a project-local venv during development.
+  ZH_MCP_VENV          — full ABSOLUTE path of the venv directory to use;
+                         overrides the XDG_DATA_HOME-derived default. Useful
+                         for pinning to a project-local venv during
+                         development. Relative paths are rejected.
   XDG_DATA_HOME        — standard XDG override for the data root; the venv
                          is created at `$XDG_DATA_HOME/zh/venv`.
+  ZH_MCP_PROBE_TIMEOUT — seconds for the per-launch `import` probe that
+                         validates the venv (default 30). Widen on slow
+                         media (NFS home, FileVault cold cache) where the
+                         import can otherwise time out and trigger a
+                         needless rebuild.
 """
 
 from __future__ import annotations
@@ -53,7 +59,6 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -99,24 +104,37 @@ def _default_venv_dir() -> tuple[Path, bool]:
     if override:
         expanded = Path(override).expanduser()
         if str(expanded).startswith("~"):
-            # Same protection as the XDG branch below: HOME unset →
-            # expanduser leaves `~` unchanged → resolve() pins it to
-            # cwd, producing a literal `~` directory + rebuild loop
-            # across cwds.
+            # HOME unset → expanduser leaves `~` unchanged → resolve()
+            # would pin it to cwd, producing a literal `~` directory +
+            # rebuild loop across cwds.
             raise RuntimeError(
                 f"[zenhub-mcp] cannot resolve home directory in "
                 f"ZH_MCP_VENV={override!r} (HOME is unset). Set HOME or "
                 f"give ZH_MCP_VENV an absolute path."
             )
+        if not expanded.is_absolute():
+            # A relative ZH_MCP_VENV (e.g. `./venv` or `venv`) would be
+            # `.resolve()`-d against whatever cwd the MCP launched from.
+            # Claude Code launches the server from different project
+            # repo_paths, so a relative path produces a DIFFERENT venv
+            # per project — orphaned ~500MB venvs scattered across
+            # trees. Require an absolute (or `~`-prefixed) path.
+            raise RuntimeError(
+                f"[zenhub-mcp] ZH_MCP_VENV must be an absolute path "
+                f"(or start with `~`); got {override!r}. A relative "
+                f"path would resolve differently per launch cwd."
+            )
         return expanded.resolve(), True
     xdg_raw = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
     xdg_data = os.path.expanduser(xdg_raw)
     if xdg_data.startswith("~"):
-        # `expanduser` returns the input unchanged when HOME is unset
-        # (sandboxed CI, certain systemd / launchd configurations).
-        # `Path("~/...").resolve()` would then resolve against cwd and
-        # produce a literal `~` directory under the working directory —
-        # different across launches, triggering rebuild loops.
+        # `expanduser` leaves `~` unchanged only when it can resolve
+        # neither HOME nor a passwd entry for the uid — i.e. HOME is
+        # unset AND `pwd.getpwuid(os.getuid())` has no home dir
+        # (distroless / scratch containers, `nobody`, some sandboxes).
+        # In that case `Path("~/...").resolve()` would pin against cwd
+        # and produce a literal `~` directory, different across
+        # launches → rebuild loops. Raise instead.
         raise RuntimeError(
             f"[zenhub-mcp] cannot resolve home directory in {xdg_raw!r} "
             f"(HOME is unset). Set HOME, set XDG_DATA_HOME to an "
@@ -131,6 +149,12 @@ def _default_venv_dir() -> tuple[Path, bool]:
     return (Path(xdg_data) / "zh" / "venv").resolve(), False
 
 
+# INVARIANT: keep the LIGHTEST dependency first. `_venv_per_launch_probe`
+# imports `_VENV_DEPS[0]` on every MCP launch to validate the venv, so
+# the first entry must be cheap to import. Reordering this so
+# `sentence-transformers` (→ torch, multi-second cold import) lands at
+# [0] would make every launch slow without tripping any error — exactly
+# the cost the per-launch/full probe split exists to avoid.
 _VENV_DEPS = (
     "mcp",
     # similarity search: sentence-transformers brings in torch + transformers
@@ -144,25 +168,49 @@ _VENV_MARKER = ".zh-deps-hash"  # records the _VENV_DEPS hash this venv was buil
 _BUILD_SENTINEL = ".zh-build-in-progress"  # written during _build_venv; absent on success
 _BOOTSTRAP_LOCK = ".zh-bootstrap.lock"     # fcntl.flock file for concurrent-launch serialization
 
-# Subprocess timeouts. The per-launch probe stays snappy (mcp only) so
+def _probe_timeout_default() -> int:
+    """Per-launch probe timeout, overridable via ZH_MCP_PROBE_TIMEOUT.
+
+    Defaults to 30s. The probe (`import mcp` and its ~30 transitive
+    modules — pydantic, httpx, anyio, sse-starlette, …) can exceed a
+    tight bound on a cold disk (FileVault sleep/wake, NFS-mounted home,
+    Docker bind mount, AV-scanning laptop, Spotlight first read), and a
+    timeout there triggers a needless multi-minute rebuild. 30s is a
+    safer floor than the original 15s; the env var lets operators on
+    slow media widen it further.
+    """
+    raw = os.environ.get("ZH_MCP_PROBE_TIMEOUT", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 30
+
+
+# Subprocess timeouts. The per-launch probe stays snappy (one import) so
 # slow cold-disk transformers imports don't trigger needless rebuild
 # loops; the post-build probe runs once when caches are warm anyway.
-_VENV_PER_LAUNCH_PROBE_TIMEOUT = 15   # `import mcp` only — fast
+# Captured once at import. The env override (ZH_MCP_PROBE_TIMEOUT) must
+# therefore be set BEFORE the process starts — it won't pick up a
+# mid-process change. That's correct for a real MCP server (env comes
+# from the launch config), and the unit tests call _probe_timeout_default()
+# directly so they're unaffected.
+_VENV_PER_LAUNCH_PROBE_TIMEOUT = _probe_timeout_default()
 _VENV_FULL_PROBE_TIMEOUT = 60         # all _VENV_DEPS — cold-cache torch import can take ~30s
 _VENV_BUILD_TIMEOUT = 60              # `python -m venv ...`
 _VENV_PIP_TIMEOUT = 600               # `pip install ...` (torch is ~400MB)
 
 
 def _venv_per_launch_probe() -> str:
-    """Lightweight probe — just `import mcp` — runs on every MCP launch.
+    """Lightweight probe — imports just the first declared dep (`mcp`) —
+    runs on every MCP launch.
 
     Importing the full _VENV_DEPS tuple (sentence_transformers + torch +
     numpy) takes seconds on a warm cache and tens of seconds on a cold
     one — far too costly to pay on every launch. The post-build probe
     (`_venv_full_probe`) catches half-installed venvs once; per-launch
-    just confirms the interpreter still runs and mcp still imports.
+    just confirms the interpreter still runs and the primary dep
+    imports. Derived from `_VENV_DEPS[0]` (not hardcoded) so a future
+    rename/reorder of the deps tuple can't leave this probing a module
+    that no longer exists.
     """
-    return "import mcp"
+    return f"import {_VENV_DEPS[0].replace('-', '_')}"
 
 
 def _venv_full_probe() -> str:
@@ -354,6 +402,14 @@ def _ensure_safe_parent(venv_dir: Path, *, user_supplied: bool) -> None:
     """
     parent = venv_dir.parent
     if parent.exists():
+        # NOTE: `exists()` / `is_dir()` follow symlinks. A symlinked
+        # parent (e.g. `~/.local/share` → a tmpfs-backed dir, or a
+        # bespoke dotfile layout) is accepted as-is — we deliberately
+        # do NOT reject symlinked parents, since that's a legitimate
+        # and common setup. The downstream consequence is that if the
+        # symlink's target vanishes between launches (tmpfs cleared on
+        # reboot), the venv is simply rebuilt at the new target — no
+        # data loss, just a one-time rebuild.
         if not parent.is_dir():
             raise RuntimeError(
                 f"[zenhub-mcp] refusing to bootstrap into {venv_dir}: "
@@ -434,14 +490,10 @@ def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
         # Never modify dirs outside the rmtree root.
         rmtree_root = path
 
-        def _on_error(func, p, exc_info):
-            # `onerror` (not `onexc`) for Python 3.10 / 3.11 compat.
-            exc_type = exc_info[0]
-            # Defensive `is not None` guard: some `shutil.rmtree`
-            # internals can pass `(None, ..., ...)` for non-OSError
-            # cases, and `issubclass(None, ...)` would TypeError-mask
-            # the real exception.
-            if exc_type is not None and issubclass(exc_type, PermissionError):
+        def _handle(func, p, exc):
+            # `exc` is an exception instance (the unified form). Defensive
+            # None guard: shutil can theoretically hand us something odd.
+            if exc is not None and isinstance(exc, PermissionError):
                 # Permission to unlink depends on the PARENT dir's
                 # write+execute bits, not on the file's mode. Chmod the
                 # parent ONLY if it sits at or inside the rmtree root —
@@ -458,9 +510,21 @@ def _safe_rmtree(path: Path, *, ignore_errors: bool = False) -> None:
                     return
                 except OSError:
                     pass
-            raise exc_info[1]
+            raise exc
 
-        shutil.rmtree(path, onerror=_on_error)
+        # Python 3.12 deprecated `onerror=(func, path, exc_info_tuple)`
+        # in favor of `onexc=(func, path, exc_instance)`, and emits a
+        # DeprecationWarning to stderr on every call — which lands in
+        # the MCP stdio transport's visible output. Dispatch by version
+        # so 3.12+ uses onexc and 3.10/3.11 keep onerror. Both adapt to
+        # the single `_handle(func, p, exc_instance)` shape.
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_handle)
+        else:
+            shutil.rmtree(
+                path,
+                onerror=lambda func, p, info: _handle(func, p, info[1]),
+            )
     except OSError:
         if not ignore_errors:
             raise
@@ -520,8 +584,18 @@ def _build_venv(venv_dir: Path, deps_hash: str, *, user_supplied: bool) -> None:
         # automatic.
         venv_dir.mkdir()
         sentinel = venv_dir / _BUILD_SENTINEL
+        # Sentinel CONTENT is irrelevant to correctness — only its
+        # PRESENCE matters (it marks the dir as ours so a crashed build
+        # is safely rebuildable). Deliberately no timestamp: a
+        # machine-readable `started_at` would invite a future
+        # "stale sentinel" age-check that breaks the simple
+        # presence-means-ours invariant, and would record nonsense on
+        # clock-skewed hosts. Human-readable note only.
         sentinel.write_text(
-            f"deps_hash={deps_hash}\nstarted_at={time.time()}\n",
+            "zenhub-cli MCP venv build in progress.\n"
+            "Presence of this file marks the directory as ours, so a "
+            "crashed/interrupted build can be safely wiped and rebuilt "
+            "on the next launch. Safe to delete if no build is running.\n",
             encoding="utf-8",
         )
         subprocess.check_call(
@@ -585,13 +659,32 @@ def _build_venv(venv_dir: Path, deps_hash: str, *, user_supplied: bool) -> None:
             f"Cleaned up; retry the launch. Check your network and "
             f"Python installation."
         ) from exc
-    # Atomic marker write: write to tmp, then os.replace. A SIGKILL
-    # between probe success and the marker landing would otherwise
-    # leave a working venv that fails validity checks forever.
+    # Atomic + durable marker write. os.replace makes the rename
+    # atomic w.r.t. directory-entry visibility, but NOT durable: on
+    # ext4 `data=ordered`, a power loss between the write and the
+    # metadata commit can leave a zero-byte marker post-recovery —
+    # which then fails the hash compare and triggers a rebuild loop
+    # after every unclean shutdown. fsync the file contents before the
+    # rename, and fsync the directory after, so the marker + its
+    # directory entry are both on stable storage.
     marker = venv_dir / _VENV_MARKER
     tmp_marker = marker.with_suffix(".tmp")
-    tmp_marker.write_text(deps_hash, encoding="utf-8")
+    with open(tmp_marker, "w", encoding="utf-8") as fh:
+        fh.write(deps_hash)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp_marker, marker)
+    try:
+        dir_fd = os.open(str(venv_dir), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Directory fsync is best-effort (not supported on every
+        # filesystem). The file-level fsync + atomic rename already
+        # give us the critical guarantee.
+        pass
     # Sentinel last — the build is fully certified before we declare
     # it complete. A crash here leaves the marker (good) AND the
     # sentinel (also harmless — next launch will see the marker and
@@ -704,7 +797,21 @@ def _bootstrap_venv() -> None:
                     _build_venv(venv_dir, deps_hash, user_supplied=user_supplied)
             sys.stderr.flush()
             sys.stdout.flush()
-            os.execv(str(venv_py), argv)
+            try:
+                os.execv(str(venv_py), argv)
+            except OSError as exc:
+                # Second exec failed too — the venv was rebuilt but
+                # still can't be exec'd (noexec mount, broken interpreter,
+                # SELinux/AppArmor exec denial, or a second TOCTOU race).
+                # Surface an actionable error instead of a bare OSError
+                # traceback at MCP startup.
+                raise RuntimeError(
+                    f"[zenhub-mcp] failed to re-exec into {venv_py} even "
+                    f"after rebuilding the venv: {exc}. The venv may be on "
+                    f"a noexec mount or the interpreter is broken/blocked. "
+                    f"Delete {venv_dir} and relaunch; if it persists, set "
+                    f"ZH_MCP_VENV to a path on an exec-capable filesystem."
+                ) from exc
 
 
 # Test-mode escape hatch: setting ZH_MCP_SKIP_BOOTSTRAP=1 in the
@@ -1272,7 +1379,32 @@ def _similarity_repo(repo_path: str) -> tuple[str | None, str | None]:
 
         return repo_from_cwd(_resolve_cwd(repo_path)), None
     except Exception as e:
-        return None, str(e)
+        return None, _similarity_exc_to_stderr(e)
+
+
+def _similarity_exc_to_stderr(exc: Exception) -> str:
+    """Turn a similarity-path exception into an actionable message.
+
+    A `ModuleNotFoundError` / `ImportError` here means the MCP venv's
+    embedding dependencies (sentence-transformers / torch / numpy) are
+    missing or corrupted. The per-launch bootstrap probe only checks
+    the primary dep (`mcp`), so a partial-dep corruption between
+    launches isn't caught until the first similarity call. Rather than
+    surface a bare `No module named 'sentence_transformers'`, point the
+    caller at the one-line fix (delete the venv → next launch rebuilds).
+    """
+    if isinstance(exc, (ModuleNotFoundError, ImportError)):
+        try:
+            venv_hint = str(_default_venv_dir()[0])
+        except Exception:
+            venv_hint = "the MCP venv ($ZH_MCP_VENV / $XDG_DATA_HOME/zh/venv)"
+        return (
+            f"similarity dependencies unavailable in the MCP venv "
+            f"({exc}). The venv appears to have missing or corrupted "
+            f"embedding deps. Delete it and relaunch to trigger a clean "
+            f"rebuild: rm -rf {venv_hint}"
+        )
+    return str(exc)
 
 
 @mcp.tool()
@@ -1336,7 +1468,8 @@ def zh_similar(query: str, top_k: int = 5, threshold: float = 0.35,
             "stderr": "",
         }
     except Exception as e:
-        return {"ok": False, "repo": repo, "matches": [], "stderr": str(e)}
+        return {"ok": False, "repo": repo, "matches": [],
+                "stderr": _similarity_exc_to_stderr(e)}
 
 
 @mcp.tool()
@@ -1369,7 +1502,8 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
         result["stderr"] = ""
         return result
     except Exception as e:
-        return {"ok": False, "repo": repo, "stderr": str(e)}
+        return {"ok": False, "repo": repo,
+                "stderr": _similarity_exc_to_stderr(e)}
 
 
 # -----------------------------------------------------------------------------
@@ -1433,10 +1567,14 @@ def create_issue(title: str, body: str, type: str = "Task",
 
                 dup_info = check_duplicate(title, body, repo)
             except Exception as e:
-                # Embedding failure shouldn't block create — log only.
+                # Embedding failure shouldn't block create — log only,
+                # with an actionable hint if the venv deps are corrupt.
                 dup_info = {
                     "ok": False,
-                    "stderr": f"duplicate check failed: {e}",
+                    "stderr": (
+                        "duplicate check failed: "
+                        + _similarity_exc_to_stderr(e)
+                    ),
                     "matches": [],
                 }
 

@@ -846,3 +846,86 @@ def test_safe_rmtree_does_not_chmod_above_rmtree_root(tmp_path, monkeypatch):
         f"_safe_rmtree chmod'd above the rmtree root: {sorted(leaked)} "
         f"(all chmod calls: {chmod_targets})"
     )
+
+
+# -----------------------------------------------------------------------------
+# v1.7.2 — reject relative ZH_MCP_VENV (#5)
+# -----------------------------------------------------------------------------
+
+
+def test_default_venv_dir_rejects_relative_zh_mcp_venv(monkeypatch):
+    # `./venv` would .resolve() against the launch cwd → a different
+    # venv per project → orphaned ~500MB trees. Must raise.
+    monkeypatch.setenv("ZH_MCP_VENV", "./venv")
+    with pytest.raises(RuntimeError, match="absolute"):
+        mcp_server._default_venv_dir()
+
+
+def test_default_venv_dir_rejects_bare_relative_zh_mcp_venv(monkeypatch):
+    monkeypatch.setenv("ZH_MCP_VENV", "some/relative/venv")
+    with pytest.raises(RuntimeError, match="absolute"):
+        mcp_server._default_venv_dir()
+
+
+def test_default_venv_dir_accepts_absolute_zh_mcp_venv(monkeypatch, tmp_path):
+    # Sanity: an absolute path still works and is flagged user_supplied.
+    target = tmp_path / "abs-venv"
+    monkeypatch.setenv("ZH_MCP_VENV", str(target))
+    venv_dir, user_supplied = mcp_server._default_venv_dir()
+    assert venv_dir == target.resolve()
+    assert user_supplied is True
+
+
+# -----------------------------------------------------------------------------
+# v1.7.2 — probe timeout env override (#3)
+# -----------------------------------------------------------------------------
+
+
+def test_probe_timeout_default_is_30(monkeypatch):
+    monkeypatch.delenv("ZH_MCP_PROBE_TIMEOUT", raising=False)
+    assert mcp_server._probe_timeout_default() == 30
+
+
+def test_probe_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("ZH_MCP_PROBE_TIMEOUT", "120")
+    assert mcp_server._probe_timeout_default() == 120
+
+
+def test_probe_timeout_invalid_env_falls_back_to_30(monkeypatch):
+    for bad in ("", "  ", "abc", "-5", "0", "12.5"):
+        monkeypatch.setenv("ZH_MCP_PROBE_TIMEOUT", bad)
+        assert mcp_server._probe_timeout_default() == 30, f"bad value {bad!r}"
+
+
+# -----------------------------------------------------------------------------
+# v1.7.2 — per-launch probe derived from _VENV_DEPS[0] (#7)
+# -----------------------------------------------------------------------------
+
+
+def test_per_launch_probe_derives_from_first_dep(monkeypatch):
+    assert mcp_server._venv_per_launch_probe() == "import mcp"
+    # A rename/reorder of the deps tuple must be reflected (no hardcode).
+    monkeypatch.setattr(mcp_server, "_VENV_DEPS", ("some-pkg", "numpy"))
+    assert mcp_server._venv_per_launch_probe() == "import some_pkg"
+
+
+# -----------------------------------------------------------------------------
+# v1.7.2 — corrupted-deps error gives an actionable rebuild hint (#2)
+# -----------------------------------------------------------------------------
+
+
+def test_similarity_exc_to_stderr_module_not_found_gives_rebuild_hint(monkeypatch):
+    monkeypatch.setenv("ZH_MCP_VENV", "/tmp/zh-test-venv")
+    msg = mcp_server._similarity_exc_to_stderr(
+        ModuleNotFoundError("No module named 'sentence_transformers'")
+    )
+    assert "rm -rf" in msg
+    assert "/tmp/zh-test-venv" in msg
+    assert "rebuild" in msg.lower()
+
+
+def test_similarity_exc_to_stderr_passthrough_for_other_errors():
+    # Non-import errors are surfaced verbatim (no misleading rebuild hint).
+    msg = mcp_server._similarity_exc_to_stderr(ValueError("bad query"))
+    assert msg == "bad query"
+    assert "rm -rf" not in msg
