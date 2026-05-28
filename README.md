@@ -9,6 +9,8 @@
 
 A powerful command-line interface for ZenHub. Manage issues, pipelines, sprints, and more directly from your terminal.
 
+> **Scope: GitHub-backed issues.** `zh` is designed for workspaces whose issues are backed by GitHub. It resolves issue numbers through GitHub (via `gh` and ZenHub's GitHub-issue lookups), so every issue-level command (`close`, `reopen`, `delete`, `move`, `assign`, etc.) targets the GitHub issue behind a card. ZenHub also supports **ZenHub-only cards** — cards with no GitHub issue behind them (they show as `NoOwner/<repo>` and have `…/issues/zh/<n>` URLs, e.g. the seed card ZenHub drops into a new workspace). `zh` cannot reliably address those: a number like `1` resolves to GitHub issue/PR #1, not the ZenHub-only card `zh/1`. **Manage ZenHub-only cards in the ZenHub web UI**, where commands here may not behave as expected.
+
 ## Features
 
 - 📋 **View & manage issues** - See details, move between pipelines, set estimates
@@ -158,6 +160,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `attach <issue>` | | Open issue in browser to add attachments |
 | `close <issue> [comment]` | | Close an issue |
 | `reopen <issue>` | | Reopen a closed issue |
+| `delete <issue> [-y]` | | **Permanently delete** a GitHub issue (via `gh`; needs admin/triage). Prompts to confirm when interactive; `-y`/`--yes` skips. Prefer `close`. |
 | `create <title> [options]` | `new` | Create a new issue |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
@@ -308,6 +311,16 @@ zh close 42 "Completed in PR #99"
 
 # Reopen a closed issue
 zh reopen 42
+
+# PERMANENTLY delete a GitHub issue (DANGER — prefer `close`; needs
+# admin/triage permission). Deletes via `gh issue delete`, so the card
+# also disappears from the ZenHub board. ZenHub-only cards (no GitHub
+# issue behind them) must be removed in the ZenHub web UI.
+# When run interactively you'll be asked to retype the issue number to
+# confirm; -y/--yes skips the prompt (also implied for non-interactive
+# callers such as agents, pipes, and CI).
+zh delete 42
+zh delete 42 -y   # skip the confirmation prompt
 ```
 
 ### Dependencies & Priority
