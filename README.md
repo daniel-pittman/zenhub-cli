@@ -721,8 +721,9 @@ For multi-project use, the typical pattern is to pass `repo_path` explicitly on 
 |---|---|
 | `ZH_DEFAULT_REPO_PATH` | Default git checkout directory to run `zh` from when `repo_path` arg is omitted. |
 | `ZH_BIN_PATH` | Path to the `zh` bash script (default: peer to `mcp_server.py`). Useful if you want to test against an alternate `zh` build. |
-| `ZH_MCP_VENV` | Full path of the venv the MCP server bootstraps and re-execs into. Overrides the default location. Useful for pinning to a project-local venv during development. |
+| `ZH_MCP_VENV` | Full **absolute** path of the venv the MCP server bootstraps and re-execs into. Overrides the default location. Useful for pinning to a project-local venv during development. Relative paths are rejected (they would resolve differently per launch cwd). |
 | `XDG_DATA_HOME` | Standard XDG override for the data root. The venv lives at `$XDG_DATA_HOME/zh/venv` (default `~/.local/share/zh/venv`). |
+| `ZH_MCP_PROBE_TIMEOUT` | Seconds for the per-launch `import` probe that validates the venv (default 30). Widen on slow media (NFS home, FileVault cold cache) where the import can otherwise time out and trigger a needless rebuild. |
 
 ### Requirements
 
