@@ -114,7 +114,7 @@ Use `-w` when a repo is connected to multiple workspaces — the historical defa
 
 These are exposed by the MCP server (`mcp_server.py`) on top of the `zh` CLI. Available when the zenhub MCP server is registered with Claude Code — but **not** runnable from the `zh` shell wrapper directly.
 
-- **`zh_similar(query, top_k=5, threshold=0.5)`** — semantic search across open issues using `sentence-transformers/all-MiniLM-L6-v2` embeddings over an auto-synced per-repo cache at `~/.config/zh/index/`. Returns top matches with cosine similarity scores. Use this for "is there already a ticket for X?" lookups.
+- **`zh_similar(query, top_k=5, threshold=0.35)`** — semantic search across open issues using `sentence-transformers/all-MiniLM-L6-v2` embeddings over an auto-synced per-repo cache at `~/.config/zh/index/`. **Always returns the top-K closest issues** (never a bare empty list when the repo has issues); each carries a `meets_threshold` boolean + cosine score, and the response includes `any_above_threshold`. Use this for "is there already a ticket for X?" lookups. Phrase queries as natural-language sentences — they embed more tightly and score higher than disconnected keywords. The cache auto-syncs on every call (5-min TTL delta + 7-day full-rebuild safety net); manual `zh_reindex` is essentially never needed.
 - **`zh_reindex(full=False)`** — manual cache refresh. Auto-sync runs on a 5-minute TTL on every `zh_similar` call, so this is rarely needed.
 - **Pre-flight duplicate check on `create_issue`** — every `create_issue` call (including yours) automatically runs `check_duplicate(title, body)` before invoking `zh create`. See Hard Rule #5 below for how to handle the response.
 
@@ -186,11 +186,11 @@ This is the durable record — anyone asking "why was ticket #X closed?" six mon
 
 The motivating case for this rule: a "Users randomly logged out around 5pm" ticket was filed in one project without noticing that an "Auth token refresh race condition under load" ticket was already tracking the root cause — they shared zero keywords but were the same underlying bug. The duplicate cost coordination effort and confused the backlog ordering.
 
-**Pre-draft check (always):** before spending effort drafting a full ticket body, call `zh_similar` on the candidate title (+ a one-sentence summary of the body if you have it). If a match >= 0.55 cosine comes back, surface those candidates to the orchestrator BEFORE drafting the new ticket. Three branches:
+**Pre-draft check (always):** before spending effort drafting a full ticket body, call `zh_similar` on the candidate title (+ a one-sentence summary of the body if you have it). `zh_similar` always returns the top-K closest issues with `similarity` scores and `meets_threshold` flags — read the scores and apply these judgment bars (these are YOUR decision thresholds, independent of the tool's lower `meets_threshold` cutoff which just flags "worth a glance"):
 
 - **Top match >= 0.70 cosine** ("almost certainly a duplicate"): do NOT proceed to drafting. Present the match to the orchestrator: *"This looks like #N (similarity 0.XX, title: '...'). Should I (a) abandon this draft, (b) add a comment to #N instead, or (c) file as a related but distinct ticket?"* Wait for explicit decision before doing anything else.
 - **Top match 0.55–0.70** ("probably related, possibly distinct"): proceed to drafting BUT include the candidate matches at the top of your proposed ticket draft, so the orchestrator sees them in context: *"Drafted as new ticket; possibly related: #N (0.XX), #M (0.YY). File as new, or close the loop differently?"*
-- **No matches >= 0.55**: proceed normally.
+- **Top match < 0.55**: proceed normally. (The closest candidates are still returned for your awareness, but none are close enough to act on.)
 
 **Handling `create_issue`'s blocked response:** when `create_issue` returns `{"ok": False, "blocked": True, "duplicate_check": {...}}`, the MCP server's pre-flight has caught a high-similarity match (>= 0.70) you missed. Do NOT just retry with `confirm_create=True`. Instead:
 

@@ -1276,7 +1276,7 @@ def _similarity_repo(repo_path: str) -> tuple[str | None, str | None]:
 
 
 @mcp.tool()
-def zh_similar(query: str, top_k: int = 5, threshold: float = 0.5,
+def zh_similar(query: str, top_k: int = 5, threshold: float = 0.35,
                repo_path: str = "") -> dict:
     """Find issues semantically similar to a query string.
 
@@ -1287,19 +1287,33 @@ def zh_similar(query: str, top_k: int = 5, threshold: float = 0.5,
     The cache auto-refreshes on a 5-minute TTL via GitHub's
     `?since=<ISO8601>` filter — only changed issues get re-embedded.
     First call after a wipe (or first call ever) triggers a full pull
-    and may take 30-60s depending on backlog size.
+    and may take 30-60s depending on backlog size. No manual reindex
+    is needed; the sync is transparent on every call.
+
+    ALWAYS returns the top-K closest issues (never a bare empty list
+    when the repo has any open issues). Each match carries
+    `meets_threshold`: True when its score cleared `threshold`, False
+    when it's surfaced only as a closest-candidate. Use the top-level
+    `any_above_threshold` for a quick "was there a strong match?" read.
+
+    Tip: natural-language queries ("admin wizard dark-mode contrast
+    bug") embed more tightly than keyword salads ("contrast dark admin")
+    and score higher. The default threshold (0.35) is tuned for short
+    ad-hoc lookups.
 
     Args:
-        query: text to compare against existing issues. Free-form.
+        query: text to compare against existing issues. Free-form;
+            full sentences work better than disconnected keywords.
         top_k: max results to return (default 5).
-        threshold: minimum cosine similarity (0.0-1.0) to include
-            (default 0.5 — moderate matches and above).
+        threshold: cosine similarity (0.0-1.0) at/above which a match is
+            flagged `meets_threshold=True` (default 0.35).
         repo_path: Optional absolute path of a git checkout. Used to
             derive `owner/repo` for the search.
 
     Returns:
-        dict with: ok, repo, matches (list of {number, repo, title,
-        body_preview, state, similarity}), stderr.
+        dict with: ok, repo, threshold, any_above_threshold, matches
+        (list of {number, repo, title, body_preview, state, similarity,
+        meets_threshold}), stderr.
     """
     repo, err = _similarity_repo(repo_path)
     if err:
@@ -1307,12 +1321,17 @@ def zh_similar(query: str, top_k: int = 5, threshold: float = 0.5,
     try:
         from similarity import find_similar
 
+        # min_results=top_k → always backfill to the closest top_k so the
+        # caller sees the nearest candidates (annotated) instead of [].
         results = find_similar(
-            query, repo, top_k=top_k, threshold=threshold, auto_sync=True
+            query, repo, top_k=top_k, threshold=threshold,
+            min_results=top_k, auto_sync=True,
         )
         return {
             "ok": True,
             "repo": repo,
+            "threshold": threshold,
+            "any_above_threshold": any(m.meets_threshold for m in results),
             "matches": [m.to_dict() for m in results],
             "stderr": "",
         }
