@@ -10,8 +10,13 @@ about against a query of [1, 0].
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
+
+# These tests construct fake embedding vectors, so they genuinely need
+# numpy. CI installs it (see .github/workflows/ci.yml), but skip the
+# whole module gracefully rather than erroring collection if it's
+# absent in some minimal environment.
+np = pytest.importorskip("numpy")
 
 import similarity
 from similarity import IssueEntry, Match, find_similar

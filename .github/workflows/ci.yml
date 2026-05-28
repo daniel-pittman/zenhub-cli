@@ -44,13 +44,15 @@ jobs:
       - name: Python syntax check (MCP server, GraphQL client + similarity)
         run: python -m py_compile mcp_server.py zh_api.py zh_graphql_ops.py similarity.py
 
-      # Install pytest only (the tests mock the network entirely, so they
-      # do NOT need mcp / sentence-transformers / torch / numpy at test
-      # time — keeps CI fast and avoids pulling ~1GB of wheels per row of
-      # the matrix). The bootstrap-installed deps are exercised at MCP
-      # runtime, not here.
-      - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+      # Install pytest + numpy. The tests mock the network and the
+      # embedding model entirely, so they do NOT need mcp /
+      # sentence-transformers / torch (the ~1GB of heavy wheels) — those
+      # are exercised at MCP runtime, not here. numpy IS needed: the
+      # similarity-scoring tests construct fake normalized embedding
+      # vectors to exercise find_similar's threshold + min_results math.
+      # numpy is ~15MB, so it doesn't meaningfully slow the matrix.
+      - name: Install test deps
+        run: python -m pip install --upgrade pip pytest numpy
 
       - name: Run pytest
         run: python -m pytest tests/ -v
