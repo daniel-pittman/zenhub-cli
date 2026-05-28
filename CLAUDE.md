@@ -29,6 +29,7 @@ zh unassign <issue> [user]    # Remove assignee(s)
 zh comment <issue> "text"     # Add comment
 zh close <issue> [comment]    # Close issue
 zh reopen <issue>             # Reopen closed issue
+zh delete <issue>             # DANGER: permanently delete a GitHub issue (via gh; prefer close)
 
 # Create issues
 zh create "Title" -t Bug -l "label1,label2" -e 3 -p "TO DO"
@@ -89,6 +90,7 @@ zh workspaces           # List workspaces (● marks active target)
 4. **ZenHub URLs**: Shown by default in `mine` and `pipeline`; use `--no-urls` to hide
 5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
 6. **Repo / workspace overrides**: `-r owner/repo` and `-w "Name"` work in front of any subcommand. Persist via `ZH_REPO` / `ZH_WORKSPACE` in `~/.config/zh/config`.
+7. **GitHub-backed scope**: Issue numbers resolve through GitHub, so issue-level commands target the GitHub issue behind a card. **ZenHub-only cards** (no GitHub issue; shown as `NoOwner/<repo>` with `…/issues/zh/<n>` URLs — e.g. a workspace's seed card) are not reliably addressable — `1` resolves to GitHub #1, not `zh/1`. Direct the user to the ZenHub web UI for those.
 
 ## For AI Assistants
 

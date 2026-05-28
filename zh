@@ -494,6 +494,12 @@ COMMANDS:
     reopen <issue>          Reopen a closed issue
                            Example: zh reopen 42
 
+    delete <issue>          PERMANENTLY delete a GitHub issue via gh (DANGER —
+                           prefer 'close'; needs admin/triage). Removes it
+                           from the ZenHub board too; also covers sub-issues.
+                           For epics use 'zh epic delete'.
+                           Example: zh delete 42
+
     block <issue> <blocker> Set issue as blocked by another
                            Example: zh block 123 456
                            (123 is blocked by 456)
@@ -2061,6 +2067,64 @@ Example: zh reopen 42"
         echo -e "  ${CYAN}Note:${NC} Issue moved back to New Issues pipeline in ZenHub"
     else
         error "Failed to reopen issue #${issue_num}"
+    fi
+}
+
+cmd_delete() {
+    load_config
+
+    local issue_num="${1:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh delete <issue#>
+
+PERMANENTLY delete a GitHub issue (via 'gh issue delete'). ZenHub tracks
+GitHub issues, so the card disappears from the board too. A sub-issue is
+just an issue, so this deletes sub-issues as well.
+
+DANGER: This is permanent, cannot be undone, and requires admin or triage
+permission on the repository. For the normal case use 'zh close <issue#>'
+instead. To delete an epic, use 'zh epic delete <epic#>'.
+
+NOTE: This targets GitHub issues. ZenHub's own deleteZenhubIssue mutation
+only accepts ZenHub-native cards (e.g. the onboarding sample seeded into a
+new workspace) and rejects GitHub-backed issues — so deletion is done
+through GitHub, mirroring how 'close'/'reopen' wrap gh. A purely
+ZenHub-native card with no GitHub issue behind it must be removed in the
+ZenHub web UI.
+
+Example: zh delete 42"
+    fi
+
+    # Strip # prefix if present
+    issue_num="${issue_num#\#}"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    # Fetch the title first — both for the confirmation message and to
+    # verify the issue exists before attempting deletion.
+    local issue_title
+    issue_title=$(gh issue view "$issue_num" --repo "$owner_repo" --json title --jq '.title' 2>/dev/null)
+
+    if [[ -z "$issue_title" ]]; then
+        error "Issue #${issue_num} not found in ${owner_repo}.
+(Note: 'zh delete' targets GitHub issues. A ZenHub-native card with no
+GitHub issue behind it must be removed in the ZenHub web UI.)"
+    fi
+
+    info "Deleting issue #${issue_num}: ${issue_title}..."
+
+    # Delete via GitHub (gh), mirroring how 'close' / 'reopen' wrap gh.
+    # --yes skips gh's interactive confirmation (zh is non-interactive);
+    # the DANGER banner above + the agent's propose-first protocol are
+    # the guardrails. ZenHub's board reflects GitHub issue state, so the
+    # card disappears from the board automatically.
+    if gh issue delete "$issue_num" --repo "$owner_repo" --yes 2>/dev/null; then
+        echo ""
+        success "Deleted #${issue_num}: ${issue_title}"
+    else
+        error "Failed to delete issue #${issue_num} (gh issue delete needs admin or triage permission on ${owner_repo})"
     fi
 }
 
@@ -6003,6 +6067,9 @@ main() {
             ;;
         reopen)
             cmd_reopen "$@"
+            ;;
+        delete)
+            cmd_delete "$@"
             ;;
         types)
             cmd_types "$@"
