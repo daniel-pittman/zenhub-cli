@@ -659,7 +659,7 @@ The MCP server includes a sentence-embedding-backed similarity index that finds 
 
 **Two tools + a `create_issue` pre-flight:**
 
-- **`zh_similar(query, top_k=5, threshold=0.5)`** — ad-hoc similarity search against open issues. Returns matches with cosine scores.
+- **`zh_similar(query, top_k=5, threshold=0.35)`** — ad-hoc similarity search against open issues. Always returns the top-K closest issues (never a bare empty list when issues exist); each carries a `meets_threshold` flag and a cosine score, and the response includes `any_above_threshold` for a quick strong-match read. Natural-language queries score higher than keyword salads. The cache auto-syncs on every call — no manual reindex needed.
 - **`zh_reindex(full=False)`** — manually refresh the cache. Most callers don't need this; `zh_similar` auto-syncs on a 5-minute TTL.
 - **`create_issue` pre-flight** — before creating an issue, the tool runs a similarity check on `title + body`. If any match exceeds the hard threshold (0.70 cosine), the create is **blocked** and the candidate matches are returned. Pass `confirm_create=True` to override after reviewing. Soft matches (0.55-0.70) are surfaced as warnings but don't block.
 

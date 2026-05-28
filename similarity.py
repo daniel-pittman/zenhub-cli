@@ -22,7 +22,7 @@ Architecture:
     (>7 days since last sync)
 
 Public surface:
-  find_similar(query, repo, top_k=5, threshold=0.5) -> list[Match]
+  find_similar(query, repo, top_k=5, threshold=0.35, min_results=0) -> list[Match]
   check_duplicate(title, body, repo) -> dict  # for create_issue pre-flight
   reindex(repo, full=False) -> dict           # manual cache refresh
 """
@@ -427,6 +427,11 @@ class Match:
     body_preview: str
     state: str
     similarity: float
+    # True when `similarity >= threshold` at query time. False for
+    # entries surfaced only because `min_results` backfilled the result
+    # set below the threshold — lets callers distinguish "strong match"
+    # from "closest we could find" instead of seeing a bare empty list.
+    meets_threshold: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -436,11 +441,13 @@ class Match:
             "body_preview": self.body_preview,
             "state": self.state,
             "similarity": round(self.similarity, 4),
+            "meets_threshold": self.meets_threshold,
         }
 
 
 def find_similar(query_text: str, repo: str, *, top_k: int = 5,
-                 threshold: float = 0.5,
+                 threshold: float = 0.35,
+                 min_results: int = 0,
                  auto_sync: bool = True) -> list[Match]:
     """Return top-K issues semantically similar to `query_text` from `repo`.
 
@@ -449,12 +456,26 @@ def find_similar(query_text: str, repo: str, *, top_k: int = 5,
             checks, pass `title + body` of the candidate issue.
         repo: "owner/repo"
         top_k: max results to return
-        threshold: minimum cosine similarity (0.0–1.0) to include
+        threshold: minimum cosine similarity (0.0–1.0) for a match to be
+            flagged `meets_threshold=True`. Default 0.35 — calibrated for
+            short ad-hoc `zh_similar` lookups, where a keyword-style query
+            (vs. a full title+body) embeds more diffusely and scores
+            lower. The `create_issue` duplicate pre-flight passes its own
+            higher thresholds (0.55 soft / 0.70 hard) since it feeds rich
+            title+body text.
+        min_results: backfill the result set with the highest-scoring
+            BELOW-threshold entries until it holds this many (capped at
+            `top_k`). Lets `zh_similar` always surface the closest issues
+            — annotated `meets_threshold=False` — instead of returning a
+            bare empty list when nothing clears the bar. Default 0
+            preserves the strict "matches only" behavior the
+            `create_issue` pre-flight relies on.
         auto_sync: if True, transparently delta-sync the cache before
             querying (skipped if cache is fresh per AUTO_SYNC_TTL_SECONDS).
 
     Returns:
-        List of Match objects, sorted by similarity descending.
+        List of Match objects, sorted by similarity descending. Each
+        carries a `meets_threshold` flag.
     """
     if auto_sync:
         _auto_sync(repo)
@@ -467,23 +488,36 @@ def find_similar(query_text: str, repo: str, *, top_k: int = 5,
     import numpy as np
 
     q = _embed(query_text)
-    matches: list[Match] = []
-    for entry in entries.values():
-        # Embeddings are normalized so dot product == cosine similarity.
-        sim = float(np.dot(q, entry.embedding))
-        if sim >= threshold:
-            matches.append(
-                Match(
-                    number=entry.number,
-                    repo=entry.repo,
-                    title=entry.title,
-                    body_preview=entry.body_preview[:200],
-                    state=entry.state,
-                    similarity=sim,
-                )
-            )
-    matches.sort(key=lambda m: m.similarity, reverse=True)
-    return matches[:top_k]
+    # Score every entry, then sort once. Embeddings are normalized so
+    # dot product == cosine similarity.
+    scored = sorted(
+        ((float(np.dot(q, e.embedding)), e) for e in entries.values()),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+
+    above = [(sim, e) for sim, e in scored if sim >= threshold]
+    selected = above
+    if len(selected) < min_results:
+        # Backfill from the next-highest below-threshold entries so the
+        # caller always sees the closest candidates (annotated as not
+        # meeting the threshold) rather than nothing.
+        below = [(sim, e) for sim, e in scored if sim < threshold]
+        selected = above + below[: min_results - len(above)]
+    selected = selected[:top_k]
+
+    return [
+        Match(
+            number=e.number,
+            repo=e.repo,
+            title=e.title,
+            body_preview=e.body_preview[:200],
+            state=e.state,
+            similarity=sim,
+            meets_threshold=(sim >= threshold),
+        )
+        for sim, e in selected
+    ]
 
 
 def check_duplicate(title: str, body: str, repo: str) -> dict:
