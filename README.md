@@ -160,7 +160,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `attach <issue>` | | Open issue in browser to add attachments |
 | `close <issue> [comment]` | | Close an issue |
 | `reopen <issue>` | | Reopen a closed issue |
-| `delete <issue>` | | **Permanently delete** a GitHub issue (via `gh`; needs admin/triage). Prefer `close`. |
+| `delete <issue> [-y]` | | **Permanently delete** a GitHub issue (via `gh`; needs admin/triage). Prompts to confirm when interactive; `-y`/`--yes` skips. Prefer `close`. |
 | `create <title> [options]` | `new` | Create a new issue |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
@@ -316,7 +316,11 @@ zh reopen 42
 # admin/triage permission). Deletes via `gh issue delete`, so the card
 # also disappears from the ZenHub board. ZenHub-only cards (no GitHub
 # issue behind them) must be removed in the ZenHub web UI.
+# When run interactively you'll be asked to retype the issue number to
+# confirm; -y/--yes skips the prompt (also implied for non-interactive
+# callers such as agents, pipes, and CI).
 zh delete 42
+zh delete 42 -y   # skip the confirmation prompt
 ```
 
 ### Dependencies & Priority
