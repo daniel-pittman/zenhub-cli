@@ -149,6 +149,12 @@ def _default_venv_dir() -> tuple[Path, bool]:
     return (Path(xdg_data) / "zh" / "venv").resolve(), False
 
 
+# INVARIANT: keep the LIGHTEST dependency first. `_venv_per_launch_probe`
+# imports `_VENV_DEPS[0]` on every MCP launch to validate the venv, so
+# the first entry must be cheap to import. Reordering this so
+# `sentence-transformers` (→ torch, multi-second cold import) lands at
+# [0] would make every launch slow without tripping any error — exactly
+# the cost the per-launch/full probe split exists to avoid.
 _VENV_DEPS = (
     "mcp",
     # similarity search: sentence-transformers brings in torch + transformers
@@ -180,6 +186,11 @@ def _probe_timeout_default() -> int:
 # Subprocess timeouts. The per-launch probe stays snappy (one import) so
 # slow cold-disk transformers imports don't trigger needless rebuild
 # loops; the post-build probe runs once when caches are warm anyway.
+# Captured once at import. The env override (ZH_MCP_PROBE_TIMEOUT) must
+# therefore be set BEFORE the process starts — it won't pick up a
+# mid-process change. That's correct for a real MCP server (env comes
+# from the launch config), and the unit tests call _probe_timeout_default()
+# directly so they're unaffected.
 _VENV_PER_LAUNCH_PROBE_TIMEOUT = _probe_timeout_default()
 _VENV_FULL_PROBE_TIMEOUT = 60         # all _VENV_DEPS — cold-cache torch import can take ~30s
 _VENV_BUILD_TIMEOUT = 60              # `python -m venv ...`
