@@ -119,6 +119,7 @@ def test_walked_nums_populated_array_falls_through_with_csv() -> None:
 # ---------------------------------------------------------------------------
 
 _DELETE_SNIPPET = r"""
+set -euo pipefail
 assume_yes="$1"; is_tty="$2"; gh_exit="$3"; issue_num="$4"
 issue_title="Sample title"
 
@@ -139,7 +140,8 @@ success() { echo "OK: $1"; }
 if [[ "$assume_yes" != "true" && "$is_tty" == "true" ]]; then
     warn "PERMANENTLY delete #${issue_num}: ${issue_title}"
     warn "This cannot be undone."
-    read -r reply
+    reply=""
+    read -r reply || true
     if [[ "$reply" != "$issue_num" ]]; then
         error "Aborted — confirmation did not match. Nothing was deleted."
     fi
@@ -189,6 +191,16 @@ def test_delete_yes_flag_skips_prompt_when_interactive() -> None:
 def test_delete_interactive_aborts_on_mismatched_confirmation() -> None:
     """Interactive, no -y, wrong reply -> abort, nothing deleted."""
     result = _run_delete("false", "true", "0", "42", reply="999\n")
+    assert result.returncode == 1
+    assert "Aborted" in result.stderr
+    assert "OK: Deleted" not in result.stdout
+
+
+def test_delete_interactive_aborts_on_eof() -> None:
+    """Interactive, no -y, EOF (Ctrl-D / empty stdin) -> friendly abort,
+    not a silent set -e death. Pins the `read -r reply || true` fix.
+    """
+    result = _run_delete("false", "true", "0", "42", reply="")
     assert result.returncode == 1
     assert "Aborted" in result.stderr
     assert "OK: Deleted" not in result.stdout
