@@ -1242,6 +1242,17 @@ def test_display_noun_passes_other_types_through_lowercased() -> None:
 # mismatch warning when the issue's actual type does not match the noun
 # invoked. The comparison is case-insensitive and reads issueType.name
 # from the issueByInfo payload.
+#
+# v1.9.1 round-4 finding #2: the prior version of this snippet had no
+# planning-noun gating, so the tests that ran against it asserted a
+# `zh bug show 42` redirect that round-3 #2 explicitly replaced with
+# `zh issue 42` in production (Bug/Feature/Task have no dispatcher arm,
+# so the typed redirect would error with "Unknown command: bug"). The
+# snippet and its tests have been merged with the round-3 #2 pins below
+# (`test_redirect_gates_bug_to_zh_issue` and siblings, which use the
+# `_TYPE_MISMATCH_GATED_REDIRECT_SNIPPET`). The cases retained here
+# cover the orthogonal silent-match / silent-no-type / silent-case-
+# difference paths that the gated snippet does NOT exercise.
 _TYPE_MISMATCH_WARN_SNIPPET = r"""
 set -euo pipefail
 to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
@@ -1269,8 +1280,11 @@ if [[ "$expected_lower" == "$actual_lower" ]]; then
     echo "SILENT_MATCH"
     exit 0
 fi
-actual_display=$(display_noun_for "$actual_type")
-echo "WARN:${actual_type}:zh ${actual_display} ${verb} ${issue_num}"
+# Round-3 finding #2 + round-4 #2: the gated redirect lives in
+# _TYPE_MISMATCH_GATED_REDIRECT_SNIPPET; here we only signal that the
+# mismatch was DETECTED. Removed: the assertion of a typed-noun
+# redirect, which contradicted production's planning-noun gate.
+echo "WARN_DETECTED"
 """
 
 
@@ -1282,32 +1296,6 @@ def _type_mismatch(
          expected_type, response, issue_num, verb],
         capture_output=True, text=True, check=False,
     )
-
-
-def test_type_mismatch_warns_with_correct_noun_redirect() -> None:
-    """`zh epic show 42` against a Bug surfaces a warn line with the
-    correct redirect (`zh bug show 42` would not be a valid CLI verb but
-    matches the user's mental model that bugs aren't planning issues; the
-    redirect points them at the right noun for whatever the actual type
-    is, in this case there is no `bug` planning-noun verb, so the user
-    learns the type mismatch and corrects from there).
-    """
-    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Bug"}}}}'
-    r = _type_mismatch("Epic", resp, "42")
-    assert r.returncode == 0
-    assert r.stdout.strip().startswith("WARN:Bug:")
-    assert "zh bug show 42" in r.stdout
-
-
-def test_type_mismatch_routes_subtask_via_display_noun() -> None:
-    """A Sub-task issue surfaces the redirect using `subtask`, not
-    `sub-task`. This composes items #9 and #11 explicitly.
-    """
-    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Sub-task"}}}}'
-    r = _type_mismatch("Epic", resp, "42")
-    assert r.returncode == 0
-    assert "zh subtask show 42" in r.stdout
-    assert "sub-task show" not in r.stdout
 
 
 def test_type_mismatch_silent_on_exact_match() -> None:
@@ -1339,35 +1327,15 @@ def test_type_mismatch_silent_on_untyped_issue() -> None:
     assert r.stdout.strip() == "SILENT_NO_TYPE"
 
 
-def test_type_mismatch_redirect_threads_invoking_verb_close() -> None:
-    """Round-2 finding #4: `zh epic close 42` against a Bug must
-    redirect to `zh bug close 42`, not `zh bug show 42`. The verb is
-    passed into the helper and interpolated into the warn line.
+def test_type_mismatch_detects_when_types_differ() -> None:
+    """A clear mismatch (Bug vs Epic) reaches the WARN branch. The
+    redirect shape is pinned in test_redirect_gates_* below, which
+    runs against the gated production snippet (round-3 #2).
     """
     resp = '{"data":{"issueByInfo":{"issueType":{"name":"Bug"}}}}'
-    r = _type_mismatch("Epic", resp, "42", verb="close")
+    r = _type_mismatch("Epic", resp, "42")
     assert r.returncode == 0
-    assert "zh bug close 42" in r.stdout
-    assert "zh bug show 42" not in r.stdout
-
-
-def test_type_mismatch_redirect_threads_invoking_verb_update() -> None:
-    """Symmetric pin for the update verb."""
-    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Task"}}}}'
-    r = _type_mismatch("Epic", resp, "42", verb="update")
-    assert r.returncode == 0
-    assert "zh task update 42" in r.stdout
-
-
-def test_type_mismatch_redirect_defaults_to_show_when_verb_omitted() -> None:
-    """Back-compat: the default verb is `show` so the v1.9.1 round-1
-    behavior (called from cmd_hierarchy_show without an explicit verb)
-    still works.
-    """
-    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Bug"}}}}'
-    r = _type_mismatch("Epic", resp, "42")  # no verb arg
-    assert r.returncode == 0
-    assert "zh bug show 42" in r.stdout
+    assert r.stdout.strip() == "WARN_DETECTED"
 
 
 # ===========================================================================
@@ -1936,3 +1904,240 @@ def test_flag_arity_returns_not_found_when_only_flag_values_are_numeric() -> Non
     """If every numeric token is a flag value, no issue-number found."""
     r = _flag_arity_scan("Epic", "update", "-t", "42", "-d", "100")
     assert r.stdout.strip() == "NOT_FOUND"
+
+
+# ===========================================================================
+# v1.9.1 round-4 fixes (PR #25 round-3 review findings 1, 3, 4, 5).
+# ===========================================================================
+
+
+# Round-4 finding #1: every post-createIssue zh_graphql call in
+# cmd_create must fail-soft, not just the priority block. The estimate
+# mutation, pipelines lookup, and moveIssue mutation now all use the
+# `if zh_graphql ...; then ... else warn ... fi` envelope.
+_POST_CREATE_ZH_GRAPHQL_ENVELOPE_SNIPPET = r"""
+set -euo pipefail
+fail="$1"  # "yes" / "no"
+new_issue_num="100"
+estimate="3"
+
+zh_graphql() {
+    if [[ "$fail" == "yes" ]]; then
+        echo "ZenHub API error: rate limited" >&2
+        return 1
+    fi
+    echo "{}"
+}
+warn() { echo "WARN: $1" >&2; }
+
+# Mirror cmd_create's round-4 #1 envelope for the estimate mutation.
+if zh_graphql "mutation" "vars" > /dev/null 2>&1; then
+    echo "ESTIMATE_OK"
+else
+    warn "Created #${new_issue_num} but the estimate mutation failed. Retry with 'zh estimate #${new_issue_num} ${estimate}'."
+fi
+
+# Caller's next line (must run regardless of the estimate outcome).
+echo "JSON_EMIT_REACHED"
+"""
+
+
+def _post_create_envelope(fail: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _POST_CREATE_ZH_GRAPHQL_ENVELOPE_SNIPPET, "_", fail],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_post_create_envelope_emits_json_on_estimate_failure() -> None:
+    """Round-4 #1: the post-create JSON emit must run even when the
+    estimate mutation hits a transient .errors. The pre-fix code
+    aborted before the JSON emit, leaving stdout empty and provoking
+    duplicate retries.
+    """
+    r = _post_create_envelope("yes")
+    assert r.returncode == 0
+    assert "JSON_EMIT_REACHED" in r.stdout
+    assert "ESTIMATE_OK" not in r.stdout
+    assert "WARN:" in r.stderr
+    assert "zh estimate #100 3" in r.stderr
+
+
+def test_post_create_envelope_clean_path_no_warn() -> None:
+    """Sanity: when the mutation succeeds, the warn does not fire."""
+    r = _post_create_envelope("no")
+    assert r.returncode == 0
+    assert "ESTIMATE_OK" in r.stdout
+    assert "JSON_EMIT_REACHED" in r.stdout
+    assert "WARN:" not in r.stderr
+
+
+# Round-4 finding #3: cmd_hierarchy_create must apply the GNU
+# normalization too, so `zh epic create "X" --description=Body
+# --type=Bug` triggers the body-rewrite and the -t conflict error
+# instead of silently forwarding tokens that lose the user's intent.
+_HIERARCHY_NORMALIZER_SNIPPET = r"""
+set -euo pipefail
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        set -- "${1%%=*}" "${1#*=}" "${@:2}"
+    fi
+    case "$1" in
+        -d|--description)
+            passthrough+=("-b" "$2"); shift 2 ;;
+        -t|--type)
+            echo "TYPE_REJECTED"
+            exit 1 ;;
+        *)
+            passthrough+=("$1"); shift ;;
+    esac
+done
+printf '%s\n' "${passthrough[@]}" -t "Epic"
+"""
+
+
+def _hierarchy_normalize(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _HIERARCHY_NORMALIZER_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_hierarchy_normalize_description_equals_form() -> None:
+    """`--description=Body` is rewritten to `-b Body` and forwarded to
+    cmd_create. Pre-round-4 the equals form fell to `*)` and was
+    forwarded verbatim; cmd_create has no `--description` arm, so the
+    body silently dropped.
+    """
+    r = _hierarchy_normalize("Title", "--description=Body")
+    assert r.returncode == 0
+    argv = r.stdout.splitlines()
+    assert argv == ["Title", "-b", "Body", "-t", "Epic"]
+
+
+def test_hierarchy_normalize_type_equals_form_rejected() -> None:
+    """`--type=Bug` is rewritten to `--type Bug` and triggers the
+    -t conflict error the user expected. Pre-round-4 it silently
+    overwrote the noun's type to Bug (cmd_create last-wins overwrote
+    it back to Epic, but the user's intent that they were on a
+    conflict path silently disappeared).
+    """
+    r = _hierarchy_normalize("Title", "--type=Bug")
+    assert r.returncode == 1
+    assert r.stdout.strip() == "TYPE_REJECTED"
+
+
+# Round-4 finding #4: `--flag=` (empty value) must be rejected up-
+# front. The pre-fix normalizer produced `--flag ""` and the arity
+# guard counted "" as a present arg, so `--type=` silently created
+# an untyped issue.
+_GNU_FLAG_EMPTY_VALUE_SNIPPET = r"""
+set -euo pipefail
+error() { echo "ERROR: $1" >&2; exit 1; }
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        _flag="${1%%=*}"
+        _val="${1#*=}"
+        if [[ -z "$_val" ]]; then
+            error "Option ${_flag} requires a value (received empty string from '${1}')"
+        fi
+        set -- "$_flag" "$_val" "${@:2}"
+    fi
+    case "$1" in
+        --priority|--type|--pipeline)
+            echo "FLAG:${1}:${2}"
+            shift 2
+            ;;
+        *) shift ;;
+    esac
+done
+"""
+
+
+def _gnu_flag_empty(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _GNU_FLAG_EMPTY_VALUE_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_gnu_flag_empty_value_rejected_for_type() -> None:
+    """`--type=` (unset shell variable expanded to nothing) used to
+    silently create an untyped issue. Now hard-error.
+    """
+    r = _gnu_flag_empty("--type=")
+    assert r.returncode == 1
+    assert "requires a value" in r.stderr
+    assert "--type" in r.stderr
+
+
+def test_gnu_flag_empty_value_rejected_for_priority() -> None:
+    """Same guard fires for --priority=, --pipeline=, etc."""
+    r = _gnu_flag_empty("--priority=")
+    assert r.returncode == 1
+    assert "requires a value" in r.stderr
+
+
+def test_gnu_flag_non_empty_value_still_works() -> None:
+    """Regression guard: the empty-value rejection doesn't break the
+    happy path.
+    """
+    r = _gnu_flag_empty("--type=Epic")
+    assert r.returncode == 0
+    assert "FLAG:--type:Epic" in r.stdout
+
+
+# Round-4 finding #5: warn wording branches on verb. `show` keeps
+# "data still rendered"; `close` / `reopen` / `update` say
+# "the {verb} still applied to #N" so the operator does not re-run
+# the redirect after the destructive op already landed.
+_VERB_WORDING_SNIPPET = r"""
+set -euo pipefail
+verb="$1"
+issue_num="42"
+redirect="zh epic ${verb} ${issue_num}"
+case "$verb" in
+    show)
+        trailing="The data still rendered, but the matching command is '${redirect}'."
+        ;;
+    *)
+        trailing="The ${verb} still applied to #${issue_num}; next time the matching command is '${redirect}'."
+        ;;
+esac
+echo "$trailing"
+"""
+
+
+def _verb_wording(verb: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _VERB_WORDING_SNIPPET, "_", verb],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_verb_wording_show_keeps_data_rendered() -> None:
+    """`show` retains the original "data still rendered" wording.
+    Symmetric regression guard so the round-4 #5 change does not
+    swallow the show-flavored case.
+    """
+    out = _verb_wording("show")
+    assert "data still rendered" in out
+
+
+def test_verb_wording_close_says_already_applied() -> None:
+    """`close` swaps to "still applied to #N" so the operator does
+    not interpret the warn as "do this instead" and re-close an
+    already-closed issue.
+    """
+    out = _verb_wording("close")
+    assert "still applied to #42" in out
+    assert "data still rendered" not in out
+
+
+def test_verb_wording_update_and_reopen_same_pattern() -> None:
+    """Symmetric pins for the other destructive verbs."""
+    for verb in ("update", "reopen"):
+        out = _verb_wording(verb)
+        assert f"{verb} still applied to #42" in out

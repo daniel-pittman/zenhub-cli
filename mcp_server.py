@@ -2074,6 +2074,16 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         "pipeline": created.get("pipeline") if created else None,
         "parent": created.get("parent") if created else None,
         "estimate": created.get("estimate") if created else None,
+        # Round-4 finding #7: propagate the priority fields so the
+        # planning-noun create returns the same key set create_issue
+        # does. Planning creates do not accept --priority today, so
+        # these will normally be null; including them keeps shape parity
+        # against the future case where they DO get a priority flag,
+        # and lets MCP clients read both entry points uniformly.
+        "priority": created.get("priority") if created else None,
+        "priority_requested": (
+            created.get("priority_requested") if created else None
+        ),
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }

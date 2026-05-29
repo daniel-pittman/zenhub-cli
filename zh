@@ -2388,9 +2388,22 @@ cmd_create() {
     # or discarded. Normalize `--flag=value` into `--flag value` at the
     # top of each iteration so every long-form GNU-style invocation is
     # accepted on the same code path.
+    #
+    # v1.9.1 round-4 finding #4: an empty value (`--type=`, `--priority=`,
+    # `--pipeline=`, often produced by an unset shell variable in a
+    # wrapper script) used to slip past the arity guard because the
+    # normalizer produced `--type ""` and the arity guard counts `""`
+    # as a present argument. Empty values are now rejected up-front so
+    # `--type=` no longer silently creates an untyped issue (the
+    # nastiest variant).
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == --*=* ]]; then
-            set -- "${1%%=*}" "${1#*=}" "${@:2}"
+            local _norm_flag="${1%%=*}"
+            local _norm_val="${1#*=}"
+            if [[ -z "$_norm_val" ]]; then
+                error "Option ${_norm_flag} requires a value (received empty string from '${1}')"
+            fi
+            set -- "$_norm_flag" "$_norm_val" "${@:2}"
         fi
         case "$1" in
             -t|--type)
@@ -2698,7 +2711,15 @@ Examples:
         fi
     fi
 
-    # Set estimate if provided
+    # Set estimate if provided.
+    # v1.9.1 round-4 finding #1: fail-soft. Round-3 #7 wrapped only the
+    # priority block's zh_graphql calls, but this estimate mutation, the
+    # pipeline lookup, and the moveIssue mutation all run AFTER
+    # createIssue succeeded and BEFORE the --json emit. A transient
+    # .errors response on any of them used to abort the script under
+    # set -e, leaving stdout empty even though the issue WAS created.
+    # A retry would then produce a duplicate. Wrap each call so any
+    # failure falls through to a warn, and the JSON still emits.
     if [[ -n "$estimate" ]]; then
         local est_mutation='
         mutation($input: SetEstimateInput!) {
@@ -2711,13 +2732,20 @@ Examples:
         est_vars=$(jq -n --arg issue_id "$new_issue_id" --argjson value "$estimate" \
             '{input: {issueId: $issue_id, value: $value}}')
 
-        zh_graphql "$est_mutation" "$est_vars" > /dev/null
-        if [[ "$human" == "true" ]]; then
-            echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
+        if zh_graphql "$est_mutation" "$est_vars" > /dev/null 2>&1; then
+            if [[ "$human" == "true" ]]; then
+                echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
+            fi
+        else
+            warn "Created #${new_issue_num} but the estimate mutation failed. Retry with 'zh estimate #${new_issue_num} ${estimate}'."
         fi
     fi
 
-    # Move to pipeline if provided
+    # Move to pipeline if provided.
+    # Same round-4 #1 envelope on the pipelines lookup AND the moveIssue
+    # mutation. An empty pipelines_response (due to a transient error)
+    # cleanly falls through to the "Pipeline not found" warn, so the
+    # downstream priority block also short-circuits correctly.
     local pipeline_set=""
     if [[ -n "$pipeline" ]]; then
         # Get pipeline ID
@@ -2736,12 +2764,14 @@ Examples:
         local pipelines_vars
         pipelines_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
 
-        local pipelines_response
-        pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars")
+        local pipelines_response=""
+        pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars" 2>/dev/null) || pipelines_response=""
 
-        local pipeline_id
-        pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline" \
-            '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .id')
+        local pipeline_id=""
+        if [[ -n "$pipelines_response" ]]; then
+            pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline" \
+                '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .id')
+        fi
 
         if [[ -n "$pipeline_id" ]]; then
             local move_mutation='
@@ -2755,10 +2785,13 @@ Examples:
             move_vars=$(jq -n --arg issue_id "$new_issue_id" --arg pipeline_id "$pipeline_id" \
                 '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: 0}}')
 
-            zh_graphql "$move_mutation" "$move_vars" > /dev/null
-            pipeline_set="$pipeline"
-            if [[ "$human" == "true" ]]; then
-                echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
+            if zh_graphql "$move_mutation" "$move_vars" > /dev/null 2>&1; then
+                pipeline_set="$pipeline"
+                if [[ "$human" == "true" ]]; then
+                    echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
+                fi
+            else
+                warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed. Retry with 'zh move #${new_issue_num} \"${pipeline}\"'."
             fi
         else
             warn "Pipeline '${pipeline}' not found"
@@ -3536,8 +3569,18 @@ cmd_hierarchy_create() {
     # Pass everything through to cmd_create with the type prepended. cmd_create
     # owns arg parsing (including --json/-q and the -d/-b body flags via -b).
     # We translate the planning-noun's -d/--description to cmd_create's -b.
+    #
+    # v1.9.1 round-4 finding #3: apply the same `--flag=value`
+    # normalization cmd_create uses, so `--description=Body` and
+    # `--type=Bug` go through our case arms (the `-d` rewrite and the
+    # `-t` conflict-detection error) instead of falling through to the
+    # `*)` arm and being silently forwarded to cmd_create as opaque
+    # tokens that lose the user's intent.
     local -a passthrough=()
     while [[ $# -gt 0 ]]; do
+        if [[ "$1" == --*=* ]]; then
+            set -- "${1%%=*}" "${1#*=}" "${@:2}"
+        fi
         case "$1" in
             -d|--description)
                 # Arity guard: a bare `-d` at end-of-args would otherwise
@@ -3785,7 +3828,22 @@ zh_hierarchy_warn_type_mismatch() {
             redirect="zh issue ${issue_num}"
             ;;
     esac
-    warn "Issue #${issue_num} is typed ${actual_type}, not ${expected_type}. The data still rendered, but the matching command is '${redirect}'."
+    # Round-4 finding #5: the "data still rendered" wording is only
+    # right for `show`. For `close` / `reopen` / `update` the
+    # destructive operation already executed (the warn fires before
+    # the verb runs, but the verb runs unconditionally). Phrase the
+    # warn so the operator does NOT re-run the redirect on a
+    # mistakenly-already-closed issue.
+    local trailing
+    case "$verb" in
+        show)
+            trailing="The data still rendered, but the matching command is '${redirect}'."
+            ;;
+        *)
+            trailing="The ${verb} still applied to #${issue_num}; next time the matching command is '${redirect}'."
+            ;;
+    esac
+    warn "Issue #${issue_num} is typed ${actual_type}, not ${expected_type}. ${trailing}"
 }
 
 # <noun> show: show an issue (with its issue-type) plus its child issues.
