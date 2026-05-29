@@ -2473,19 +2473,51 @@ Examples:
         fi
     fi
 
-    # Validate --parent format up-front (before create). The actual wiring
-    # happens AFTER create, via addSubIssues, so it lands in the same
-    # ZenHub-native sub-issue hierarchy that 'zh subissue' and the planning
-    # nouns read (zenhubChildIssues). CreateIssueInput.parentIssueId, by
-    # contrast, sets the GitHub-native parent (githubChildIssues), which
-    # 'zh epic show' / 'zh subissue list' do not read, so using it here would
-    # create children invisible to those reads.
+    # Validate --parent and --estimate up-front, BEFORE the createIssue
+    # mutation runs. Format checks happen here so a typo never produces a
+    # half-created orphan issue. The actual addSubIssues wiring still
+    # happens after create (the new child id has to exist first), but
+    # `--parent`'s EXISTENCE is also resolved here (review finding #2):
+    # zh_resolve_issue_id errors and exits 1 if the parent is missing, and
+    # under `set -e` that would otherwise kill the script in the middle of
+    # the post-create block, leaving the new issue with no JSON emit. We
+    # cache the resolved parent id so the post-create block can reuse it.
+    #
+    # Empirically (verified against a live workspace), addSubIssues writes
+    # to the GitHub-native sub-issue connection (githubChildIssues /
+    # parentIssue), which is the side cmd_hierarchy_show + cmd_issue read.
+    # The separate zenhubChildIssues that 'zh subissue list' walks is the
+    # legacy side and is left empty by the modern wiring; reconciling the
+    # two reads is tracked as a follow-up.
     local parent_stripped=""
+    local parent_id=""
     if [[ -n "$parent" ]]; then
         parent_stripped="${parent#\#}"
         if ! [[ "$parent_stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid parent issue number: ${parent}"
         fi
+        # Existence check BEFORE create so a bad parent does not orphan the
+        # new issue. Review finding #2.
+        #
+        # CRITICAL bash gotcha: `local parent_id=$(zh_resolve_issue_id ...)`
+        # would silently swallow the called function's `exit 1` because
+        # `local` ALWAYS returns 0 under `set -e`. The failing command-
+        # substitution's exit code never propagates, so the script
+        # continues and createIssue runs anyway, producing the very orphan
+        # this guard is meant to prevent. We therefore declare `parent_id`
+        # on its own line (above) and do a bare assignment here so set -e
+        # sees and acts on the failure.
+        parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_stripped")
+        if [[ -z "$parent_id" ]]; then
+            error "Could not resolve parent issue #${parent_stripped}"
+        fi
+    fi
+
+    # Validate --estimate up-front so a non-numeric value never aborts jq
+    # AFTER createIssue has run (review finding #3). Allow integer or
+    # decimal points.
+    if [[ -n "$estimate" ]] && ! [[ "$estimate" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        error "Invalid estimate: ${estimate} (must be numeric, e.g. 1, 3, 0.5)"
     fi
 
     local mutation='
@@ -2536,13 +2568,11 @@ Examples:
 
     # Wire the new issue under its parent via addSubIssues (the same mutation
     # 'zh epic add' / 'zh subissue add' use), so it shows up under
-    # 'zh <noun> show'. Done post-create because the parent id and the new
-    # child id both have to exist.
+    # 'zh <noun> show'. The parent id was already resolved up-front (see the
+    # pre-create validation block) so a bad parent could not orphan the new
+    # issue; here we just reuse it.
     local parent_wired=""
     if [[ -n "$parent_stripped" ]]; then
-        local parent_id
-        parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_stripped")
-
         local sub_mutation='
         mutation($input: AddSubIssuesInput!) {
             addSubIssues(input: $input) {
@@ -3276,6 +3306,13 @@ cmd_hierarchy_create() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -d|--description)
+                # Arity guard: a bare `-d` at end-of-args would otherwise
+                # dereference unbound $2 and die with a raw bash error under
+                # `set -u` (review finding #5). Mirror cmd_update_issue's
+                # check.
+                if [[ $# -lt 2 ]]; then
+                    error "Option ${1} requires a value"
+                fi
                 passthrough+=("-b" "$2")
                 shift 2
                 ;;
@@ -3353,6 +3390,16 @@ cmd_hierarchy_list() {
             printf "  ${BOLD}#%-5s${NC} ${state_color}%-6s${NC} %s\n" "$num" "$state" "$title"
         done
     echo ""
+
+    # Coverage warning (review finding #7). The query caps at first: 100;
+    # if totalCount exceeds the rendered set, say so explicitly rather than
+    # silently truncating. Full pagination is a separate follow-up.
+    local fetched
+    fetched=$(echo "$response" | jq -r '.data.workspace.issues.nodes | length')
+    if [[ "$total" -gt "$fetched" ]]; then
+        warn "Showing first ${fetched} of ${total} ${canonical} issues (the query caps at 100; remaining are not displayed)."
+    fi
+
     echo -e "${CYAN}Tip:${NC} 'zh $(to_lower "$type_name") show <issue#>' shows an issue and its sub-issues."
 }
 
@@ -3376,14 +3423,20 @@ cmd_hierarchy_show() {
     cmd_issue "$issue_num"
 
     load_config
-    local owner_repo repo_id
+    local owner_repo repo_id workspace_id
     owner_repo=$(get_repo_info)
     repo_id=$(get_repo_id "$owner_repo")
+    workspace_id=$(get_workspace_id "$owner_repo")
 
+    # We fetch the issue body and the per-child pipeline so the new
+    # `<noun> show` covers what the deleted cmd_epic_show used to render
+    # (review note: information regression). Body shows on the parent
+    # block; per-child pipeline is added to the children table column set.
     local query='
-    query($repoId: ID!, $issueNumber: Int!) {
+    query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!) {
         issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
             number
+            body
             githubChildIssues(first: 100) {
                 totalCount
                 nodes {
@@ -3391,6 +3444,9 @@ cmd_hierarchy_show() {
                     title
                     state
                     assignees { nodes { login } }
+                    pipelineIssue(workspaceId: $workspaceId) {
+                        pipeline { name }
+                    }
                     repository { ownerName name }
                 }
             }
@@ -3398,11 +3454,20 @@ cmd_hierarchy_show() {
     }'
 
     local variables
-    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
-        '{repoId: $repo_id, issueNumber: $issue_num}')
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" --arg ws "$workspace_id" \
+        '{repoId: $repo_id, issueNumber: $issue_num, workspaceId: $ws}')
 
     local response
     response=$(zh_graphql "$query" "$variables")
+
+    local body
+    body=$(echo "$response" | jq -r '.data.issueByInfo.body // ""')
+    if [[ -n "$body" ]] && [[ "$body" != "null" ]]; then
+        echo -e "${BOLD}Body:${NC}"
+        echo ""
+        echo "$body" | sed 's/^/  /'
+        echo ""
+    fi
 
     local child_count
     child_count=$(echo "$response" | jq -r '.data.issueByInfo.githubChildIssues.totalCount // 0')
@@ -3416,16 +3481,16 @@ cmd_hierarchy_show() {
     fi
 
     echo "$response" | jq -r '.data.issueByInfo.githubChildIssues.nodes[] |
-        "\(.number)\t\(.state)\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
-        while IFS=$'\t' read -r num istate assignees ititle; do
+        "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "-")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
+        while IFS=$'\t' read -r num istate pipeline assignees ititle; do
             local marker="  "
             local color="$NC"
             if [[ "$istate" == "CLOSED" ]]; then
                 marker="✓ "
                 color="$YELLOW"
             fi
-            printf "  ${BOLD}#%-5s${NC} │ %-15s │ ${color}%s%s${NC}\n" \
-                "$num" "${assignees:0:15}" "$marker" "$ititle"
+            printf "  ${BOLD}#%-5s${NC} │ %-18s │ %-15s │ ${color}%s%s${NC}\n" \
+                "$num" "${pipeline:0:18}" "${assignees:0:15}" "$marker" "$ititle"
         done
     echo ""
 }
@@ -3434,6 +3499,16 @@ cmd_hierarchy_show() {
 # add/remove/update/close/reopen are thin pass-throughs to the existing issue
 # and sub-issue verbs (an epic add IS a sub-issue add).
 cmd_hierarchy_dispatch() {
+    # load_config so every dispatched arm sees ZH_TOKEN from the config
+    # file. Most arms (create/list/show/update/close/reopen) call
+    # load_config themselves, but `add`/`remove` route directly to
+    # cmd_subissue_add / cmd_subissue_remove which do not (only the
+    # top-level cmd_subissue does). Without this, under `set -u` the
+    # first zh_graphql call from those arms would die on an unbound
+    # ZH_TOKEN instead of the friendly "ZH_TOKEN not set" error. Review
+    # finding #4.
+    load_config
+
     local type_name="$1"
     shift || true
 
@@ -3468,6 +3543,15 @@ cmd_hierarchy_dispatch() {
             ;;
         reopen|open)
             cmd_reopen "$@"
+            ;;
+        delete)
+            # Friendly redirect: old `zh epic delete` is gone (epics are now
+            # real issues, so deletion is the standard `zh delete <issue#>`).
+            # A user reaching for the old verb with a still-valid issue
+            # number should get an instruction, not a fall-through to the
+            # generic "Unknown subcommand" message that could mislead.
+            # Review finding #8.
+            error "'zh ${lower} delete' is no longer a verb (${type_name} is a normal issue in the v1.9.0 model). Use 'zh delete <issue#>' instead (DANGER: irreversible; prefer 'zh ${lower} close <issue#>')."
             ;;
         ""|help|-h|--help)
             cat <<EOF
@@ -6121,7 +6205,11 @@ main() {
         project|projects)
             cmd_project "$@"
             ;;
-        subtask|subtasks)
+        subtask|subtasks|sub-task|sub-tasks)
+            # `sub-task` (hyphenated) is what the noun's own help/usage lines
+            # render via to_lower("Sub-task"), so accept it as a verb too
+            # (review finding #6). subtask / subtasks remain the canonical
+            # forms.
             cmd_subtask "$@"
             ;;
         subissue|subissues|sub|child|children)

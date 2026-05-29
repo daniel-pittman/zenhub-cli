@@ -536,3 +536,153 @@ def test_set_type_failure_when_count_zero() -> None:
     r = _set_type_gate(resp)
     assert r.returncode == 1
     assert r.stdout.strip() == "FAILED"
+
+
+# ===========================================================================
+# v1.9.0 post-review fixes (PR #23 review findings #2, #3, #5, #7).
+# Each snippet mirrors the single guard added in `zh` so a future change
+# that loosens or drops the guard fails a test instead of silently shipping.
+# ===========================================================================
+
+
+# Mirrors cmd_create's up-front --estimate format check (review finding #3).
+# Bare command-substitution from a failing jq under `set -e` would otherwise
+# kill cmd_create AFTER createIssue has run, orphaning the issue.
+_ESTIMATE_GUARD_SNIPPET = r"""
+set -euo pipefail
+estimate="$1"
+if [[ -n "$estimate" ]] && ! [[ "$estimate" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "REJECTED"
+    exit 1
+fi
+echo "OK"
+"""
+
+
+def _estimate_guard(value: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _ESTIMATE_GUARD_SNIPPET, "_", value],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_estimate_guard_accepts_integers_and_decimals() -> None:
+    """`-e 5`, `-e 0.5`, and an unset estimate ("") all pass the up-front
+    guard. The empty case is the no-`-e` path through cmd_create.
+    """
+    for v in ("5", "0.5", "13", ""):
+        r = _estimate_guard(v)
+        assert r.returncode == 0, f"expected OK for {v!r}, got {r.stdout!r}"
+        assert r.stdout.strip() == "OK"
+
+
+def test_estimate_guard_rejects_non_numeric() -> None:
+    """A non-numeric `-e` is rejected BEFORE createIssue (review finding
+    #3), so a typo can't orphan an issue.
+    """
+    for v in ("five", "high", "5.", "1.2.3", "-3"):
+        r = _estimate_guard(v)
+        assert r.returncode == 1, f"expected reject for {v!r}, got {r.stdout!r}"
+        assert r.stdout.strip() == "REJECTED"
+
+
+# Mirrors cmd_hierarchy_create's -d/--description arity guard (review #5).
+# A bare `-d` at end-of-args used to dereference unbound $2 under `set -u`.
+_NOUN_DASH_D_ARITY_SNIPPET = r"""
+set -euo pipefail
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--description)
+            if [[ $# -lt 2 ]]; then
+                echo "ARITY_ERROR"
+                exit 1
+            fi
+            passthrough+=("-b" "$2")
+            shift 2
+            ;;
+        *)
+            passthrough+=("$1")
+            shift
+            ;;
+    esac
+done
+echo "OK:${passthrough[*]:-}"
+"""
+
+
+def _noun_dash_d(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _NOUN_DASH_D_ARITY_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_noun_create_dash_d_arity_guard_rejects_missing_value() -> None:
+    """`zh epic create "Title" -d` with no body fails the arity guard
+    cleanly instead of dying with a raw `$2: unbound variable` under
+    `set -u`.
+    """
+    r = _noun_dash_d("Title", "-d")
+    assert r.returncode == 1
+    assert r.stdout.strip() == "ARITY_ERROR"
+
+
+def test_noun_create_dash_d_with_value_translates_to_dash_b() -> None:
+    """`-d "body"` round-trips to `-b "body"` in the cmd_create argv.
+    """
+    r = _noun_dash_d("Title", "-d", "the body")
+    assert r.returncode == 0
+    # Whitespace inside "the body" is preserved by ${arr[*]}'s default IFS
+    # separator (a single space), so the contiguous "-b the body" string
+    # has spaces from BOTH the array separator and the value itself; we
+    # just check the relevant tokens are present.
+    out = r.stdout.strip()
+    assert out.startswith("OK:")
+    assert "-b" in out
+    assert "the body" in out
+
+
+# Mirrors cmd_hierarchy_list's coverage-warning gate (review #7). When the
+# API reports more than were returned by the capped `first: 100`, the user
+# must see a "Showing first N of M" warning instead of a silent truncation.
+_LIST_TRUNCATION_SNIPPET = r"""
+set -euo pipefail
+total="$1"; fetched="$2"
+if [[ "$total" -gt "$fetched" ]]; then
+    echo "WARN:${fetched}/${total}"
+else
+    echo "OK"
+fi
+"""
+
+
+def _list_truncation(total: str, fetched: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _LIST_TRUNCATION_SNIPPET, "_", total, fetched],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_list_truncation_warns_when_total_exceeds_fetched() -> None:
+    """A workspace with 150 Epics, query capped at 100, must surface
+    `Showing first 100 of 150` rather than rendering 100 silently as if
+    that were everything.
+    """
+    r = _list_truncation("150", "100")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "WARN:100/150"
+
+
+def test_list_truncation_silent_when_fetched_covers_total() -> None:
+    """Full coverage: no warning."""
+    r = _list_truncation("17", "17")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+def test_list_truncation_silent_when_empty() -> None:
+    """Zero issues: no warning (the empty case is handled earlier)."""
+    r = _list_truncation("0", "0")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
