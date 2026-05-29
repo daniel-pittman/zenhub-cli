@@ -1097,3 +1097,195 @@ def test_planning_list_returns_items_only(monkeypatch):
     out = mcp_server._planning_list("initiative", "")
     assert "items" in out
     assert "epics" not in out
+
+
+# ---------------------------------------------------------------------------
+# v1.9.1 item #5: duplicate-check pre-flight on planning-noun creates.
+# `_planning_create` now runs the same check that `create_issue` uses, so an
+# agent calling `epic_create("Auth redesign")` gets blocked on a near-
+# duplicate the same way `create_issue(..., type="Epic")` would.
+# ---------------------------------------------------------------------------
+
+
+def test_planning_create_blocks_on_duplicate(monkeypatch):
+    """A `recommendation == "block"` response from check_duplicate must
+    short-circuit the create. The bash side never runs; the caller sees
+    ok=False with the candidate matches and a clear retry hint.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+
+    blocked_info = {
+        "ok": True,
+        "recommendation": "block",
+        "hard_threshold": 0.7,
+        "matches": [
+            {"number": 42, "title": "Auth redesign", "similarity": 0.85},
+        ],
+    }
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate",
+        lambda title, body, repo: blocked_info,
+    )
+
+    called = {"ran": False}
+
+    def fake_run_zh(args, cwd=None):
+        called["ran"] = True
+        return {"ok": True, "stdout_plain": '{"number": 99}', "stderr": ""}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+
+    out = mcp_server._planning_create(
+        "epic", "Auth redesign", "body", "", "", "", "", 0, "",
+    )
+    assert out["ok"] is False
+    assert out.get("blocked") is True
+    assert out["number"] is None
+    assert out["duplicate_check"] == blocked_info
+    assert "confirm_create=True" in out["stderr"]
+    assert called["ran"] is False, "bash create must NOT run when blocked"
+
+
+def test_planning_create_confirm_create_overrides_block(monkeypatch):
+    """`confirm_create=True` lets the create proceed even when the
+    pre-flight reports a block, mirroring `create_issue`.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate",
+        lambda title, body, repo: {
+            "ok": True,
+            "recommendation": "block",
+            "hard_threshold": 0.7,
+            "matches": [{"number": 42, "title": "X", "similarity": 0.9}],
+        },
+    )
+
+    def fake_run_zh(args, cwd=None):
+        return {
+            "ok": True,
+            "stdout_plain": (
+                '{"number": 99, "url": "u", "title": "T",'
+                ' "type": "Epic", "pipeline": null, "estimate": null,'
+                ' "parent": null}'
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+
+    out = mcp_server._planning_create(
+        "epic", "Auth redesign", "body", "", "", "", "", 0, "",
+        confirm_create=True,
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    # duplicate_check is still surfaced so the caller can audit the
+    # override decision.
+    assert out["duplicate_check"]["recommendation"] == "block"
+
+
+def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
+    """`skip_duplicate_check=True` skips the pre-flight entirely. The
+    similarity layer is never consulted; the response carries no
+    duplicate_check key.
+    """
+    sim_called = {"ran": False}
+
+    def fake_similarity_repo(repo_path):
+        sim_called["ran"] = True
+        return ("owner/repo", None)
+
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo", fake_similarity_repo,
+    )
+
+    def fake_run_zh(args, cwd=None):
+        return {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+
+    out = mcp_server._planning_create(
+        "epic", "X", "body", "", "", "", "", 0, "",
+        skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert "duplicate_check" not in out
+    assert sim_called["ran"] is False
+
+
+def test_planning_create_warn_recommendation_does_not_block(monkeypatch):
+    """A non-block recommendation (e.g. soft match below the hard
+    threshold) must annotate the response without short-circuiting
+    the create.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate",
+        lambda title, body, repo: {
+            "ok": True,
+            "recommendation": "warn",
+            "soft_threshold": 0.5,
+            "matches": [{"number": 7, "title": "loosely related",
+                         "similarity": 0.55}],
+        },
+    )
+
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+
+    out = mcp_server._planning_create(
+        "epic", "X", "body", "", "", "", "", 0, "",
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    assert out["duplicate_check"]["recommendation"] == "warn"
+
+
+def test_planning_create_similarity_failure_does_not_block(monkeypatch):
+    """If the similarity layer errors (missing repo, embedding deps
+    unavailable, etc.) the create still proceeds. The error is logged
+    in duplicate_check.stderr; an infra outage in similarity must not
+    become a planning-noun outage.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "could not derive repo"),
+    )
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+    out = mcp_server._planning_create(
+        "epic", "X", "body", "", "", "", "", 0, "",
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    assert out["duplicate_check"]["matches"] == []
+    assert "could not derive repo" in out["duplicate_check"]["stderr"]

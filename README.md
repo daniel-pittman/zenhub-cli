@@ -311,6 +311,7 @@ NEW=$(zh create "Quick task" -q)
 - `-p, --pipeline <name>` - Pipeline to place issue in
 - `-e, --estimate <pts>` - Story points
 - `--parent <issue#>` - Wire the new issue as a sub-issue of `<issue#>`
+- `--priority <name>` - Set a configured priority by name at create time (resolved case-insensitively against `zh priorities`; same name-resolution path as `zh priority`)
 - `-b, --body <text>` - Short description inline
 - `-f, --file <path>` - Read description from file
 - `--stdin` - Read description from stdin
@@ -723,7 +724,7 @@ The MCP server includes a sentence-embedding-backed similarity index that finds 
 
 - **`zh_similar(query, top_k=5, threshold=0.35)`** — ad-hoc similarity search against open issues. Always returns the top-K closest issues (never a bare empty list when issues exist); each carries a `meets_threshold` flag and a cosine score, and the response includes `any_above_threshold` for a quick strong-match read. Natural-language queries score higher than keyword salads. The cache auto-syncs on every call — no manual reindex needed.
 - **`zh_reindex(full=False)`** — manually refresh the cache. Most callers don't need this; `zh_similar` auto-syncs on a 5-minute TTL.
-- **`create_issue` pre-flight** — before creating an issue, the tool runs a similarity check on `title + body`. If any match exceeds the hard threshold (0.70 cosine), the create is **blocked** and the candidate matches are returned. Pass `confirm_create=True` to override after reviewing. Soft matches (0.55-0.70) are surfaced as warnings but don't block.
+- **`create_issue` pre-flight** — before creating an issue, the tool runs a similarity check on `title + body`. If any match exceeds the hard threshold (0.70 cosine), the create is **blocked** and the candidate matches are returned. Pass `confirm_create=True` to override after reviewing. Soft matches (0.55-0.70) are surfaced as warnings but don't block. (v1.9.1: the same pre-flight applies to `epic_create`, `initiative_create`, `project_create`, and `subtask_create`, so the planning-noun entry points share the duplicate-safety guarantee with `create_issue`.)
 
 **How it works:**
 
@@ -737,7 +738,7 @@ The MCP server includes a sentence-embedding-backed similarity index that finds 
 - 0.60–0.70 : semantically related but distinct work → surface, don't block
 - < 0.55 : just a topic neighbor → ignore
 
-**Disabling**: pass `skip_duplicate_check=True` to `create_issue` to bypass the pre-flight entirely (useful for bulk migrations).
+**Disabling**: pass `skip_duplicate_check=True` to `create_issue` (or any of the v1.9.1 planning-noun creates: `epic_create`, `initiative_create`, `project_create`, `subtask_create`) to bypass the pre-flight entirely (useful for bulk migrations).
 
 ### Installation
 

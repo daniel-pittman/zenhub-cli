@@ -871,3 +871,463 @@ def test_noun_list_rejects_multiple_stray() -> None:
     r = _noun_list_reject_stray("Project", "42", "43", "44")
     assert r.returncode == 1
     assert r.stdout.startswith("REJECT:3:42 43 44")
+
+
+# ===========================================================================
+# v1.9.1 closeout sweep. Items 1-11 from /tmp/zh-v1.9.1-gaps.md.
+# ===========================================================================
+
+
+# v1.9.1 item #1: sub-issue add / remove guard on githubErrors must accept
+# the empty-array shape ZenHub returns when there are no GitHub-side errors.
+# The pre-fix guard compared against {} and null only, so an empty []
+# leaked into the warn line as a literal "[]".
+_GH_ERRORS_GATE_SNIPPET = r"""
+set -euo pipefail
+response="$1"
+gh_errors=$(echo "$response" | jq -c '.data.addSubIssues.githubErrors // {}')
+gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
+if [[ "$gh_errors_len" -gt 0 ]]; then
+    echo "WARN:${gh_errors}"
+else
+    echo "OK"
+fi
+"""
+
+
+def _gh_errors_gate(response: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _GH_ERRORS_GATE_SNIPPET, "_", response],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_gh_errors_gate_silent_on_empty_array() -> None:
+    """addSubIssues returns githubErrors: [] when there are no GitHub-side
+    errors. The guard must fall through; the pre-v1.9.1 string-equality
+    check against {} and null leaked a literal "[]" into the warn output.
+    """
+    resp = '{"data":{"addSubIssues":{"githubErrors":[]}}}'
+    r = _gh_errors_gate(resp)
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+def test_gh_errors_gate_silent_on_empty_object() -> None:
+    """The historical empty-object shape (the one the pre-fix guard
+    handled) still falls through, so this is not a regression of the
+    earlier intent.
+    """
+    resp = '{"data":{"addSubIssues":{"githubErrors":{}}}}'
+    r = _gh_errors_gate(resp)
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+def test_gh_errors_gate_silent_on_null() -> None:
+    """Missing key (defaults to {}) and explicit null both fall through."""
+    for resp in (
+        '{"data":{"addSubIssues":{}}}',
+        '{"data":{"addSubIssues":{"githubErrors":null}}}',
+    ):
+        r = _gh_errors_gate(resp)
+        assert r.returncode == 0
+        assert r.stdout.strip() == "OK", f"resp={resp!r} -> {r.stdout!r}"
+
+
+def test_gh_errors_gate_warns_on_populated_array() -> None:
+    """A populated githubErrors array surfaces the contents verbatim."""
+    resp = '{"data":{"addSubIssues":{"githubErrors":[{"code":"X","message":"Y"}]}}}'
+    r = _gh_errors_gate(resp)
+    assert r.returncode == 0
+    out = r.stdout.strip()
+    assert out.startswith("WARN:")
+    assert "code" in out and "X" in out
+
+
+def test_gh_errors_gate_warns_on_populated_object() -> None:
+    """A populated object form also surfaces (defensive: present in some
+    older mutation payloads).
+    """
+    resp = '{"data":{"addSubIssues":{"githubErrors":{"some_key":"value"}}}}'
+    r = _gh_errors_gate(resp)
+    assert r.returncode == 0
+    assert r.stdout.strip().startswith("WARN:")
+
+
+# v1.9.1 item #3: cmd_set_type must honor githubErrors and failedIssues even
+# when successCount is positive. A partial-failure payload (successCount=1
+# with a populated failedIssues / githubErrors) used to print "Set type" as
+# if the change had landed.
+_SET_TYPE_PARTIAL_FAILURE_SNIPPET = r"""
+set -euo pipefail
+response="$1"
+success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+failed_count=$(echo "$response" | jq -r '(.data.changeIssueTypeOfIssues.failedIssues // []) | length')
+gh_errors=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.githubErrors // {}')
+gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
+
+if [[ "$success_count" -lt 1 ]]; then
+    echo "FAIL_COUNT_ZERO"
+    exit 1
+fi
+if [[ "$failed_count" -gt 0 ]] || [[ "$gh_errors_len" -gt 0 ]]; then
+    echo "FAIL_PARTIAL"
+    exit 1
+fi
+echo "OK"
+"""
+
+
+def _set_type_partial(response: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _SET_TYPE_PARTIAL_FAILURE_SNIPPET, "_", response],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_set_type_partial_failure_with_failed_issues_is_error() -> None:
+    """successCount=1 with a populated failedIssues entry is the precise
+    shape the pre-v1.9.1 gate ignored (G8 partial failure).
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
+            '"failedIssues":[{"number":42}],"githubErrors":[]}}}')
+    r = _set_type_partial(resp)
+    assert r.returncode == 1
+    assert r.stdout.strip() == "FAIL_PARTIAL"
+
+
+def test_set_type_partial_failure_with_github_errors_is_error() -> None:
+    """successCount=1 with populated githubErrors is also a partial
+    failure.
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
+            '"failedIssues":[],"githubErrors":[{"code":"X"}]}}}')
+    r = _set_type_partial(resp)
+    assert r.returncode == 1
+    assert r.stdout.strip() == "FAIL_PARTIAL"
+
+
+def test_set_type_clean_success_still_succeeds() -> None:
+    """successCount=1 with empty failedIssues + empty githubErrors is a
+    real success (regression guard for the partial-failure tightening).
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
+            '"failedIssues":[],"githubErrors":[]}}}')
+    r = _set_type_partial(resp)
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+# v1.9.1 item #4: zh_fetch_issue_types must filter isEnabled=false rows so
+# zh_hierarchy_require_type's "Enable it..." branch is reachable. The pure-
+# jq projection (the inner pipeline of zh_fetch_issue_types) is the unit
+# under test; we feed it a payload mixing enabled and disabled rows.
+_TYPES_FILTER_SNIPPET = r"""
+set -euo pipefail
+payload="$1"
+echo "$payload" | jq -c '
+    [ (.data.repositoriesByGhId[0].assignableIssueTypes.nodes // [])[]
+      | select(.isEnabled != false)
+      | {typename: .__typename, id: .id, name: .name, level: .level,
+         disposition: .disposition, isEnabled: .isEnabled} ]'
+"""
+
+
+def _types_filter(payload: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _TYPES_FILTER_SNIPPET, "_", payload],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_types_filter_drops_disabled_rows() -> None:
+    """A type with isEnabled=false must be filtered out before any name-
+    resolution lookup runs. Otherwise zh_hierarchy_require_type's error
+    message ("Enable it... then retry") can never fire: the disabled type
+    would resolve to an id and CreateIssueInput.issueTypeId would silently
+    succeed (or fail server-side with an opaque message).
+    """
+    payload = ('{"data":{"repositoriesByGhId":[{"assignableIssueTypes":'
+               '{"nodes":['
+               '{"__typename":"ZenhubIssueType","id":"zid-epic","name":"Epic",'
+               '"level":3,"disposition":"PLANNING_PANEL","isEnabled":true},'
+               '{"__typename":"ZenhubIssueType","id":"zid-disabled","name":"Theme",'
+               '"level":1,"disposition":"PLANNING_PANEL","isEnabled":false}'
+               ']}}]}}')
+    out = _types_filter(payload)
+    import json as _json
+    types = _json.loads(out)
+    names = [t["name"] for t in types]
+    assert "Epic" in names
+    assert "Theme" not in names, (
+        f"Disabled type leaked through: {names!r}"
+    )
+
+
+def test_types_filter_keeps_enabled_rows() -> None:
+    """Sanity: every isEnabled=true row survives the filter."""
+    payload = ('{"data":{"repositoriesByGhId":[{"assignableIssueTypes":'
+               '{"nodes":['
+               '{"__typename":"GithubIssueType","id":"gid-bug","name":"Bug",'
+               '"level":4,"disposition":"BOARD","isEnabled":true},'
+               '{"__typename":"GithubIssueType","id":"gid-feat","name":"Feature",'
+               '"level":4,"disposition":"BOARD","isEnabled":true}'
+               ']}}]}}')
+    out = _types_filter(payload)
+    import json as _json
+    types = _json.loads(out)
+    assert {t["name"] for t in types} == {"Bug", "Feature"}
+
+
+def test_types_filter_treats_missing_isenabled_as_enabled() -> None:
+    """A missing isEnabled field (defensive: older payloads or partial
+    projections) must not silently drop the row. `select(.isEnabled !=
+    false)` is satisfied by null and missing both, so the row passes.
+    """
+    payload = ('{"data":{"repositoriesByGhId":[{"assignableIssueTypes":'
+               '{"nodes":['
+               '{"__typename":"GithubIssueType","id":"gid-task","name":"Task",'
+               '"level":4,"disposition":"BOARD"}'
+               ']}}]}}')
+    out = _types_filter(payload)
+    import json as _json
+    types = _json.loads(out)
+    assert types and types[0]["name"] == "Task"
+
+
+# v1.9.1 item #7 (G4): cmd_issue must surface the priority alongside
+# state/pipeline/estimate. The jq read pulls priority.name from the same
+# pipelineIssue node as pipeline.
+_ISSUE_PRIORITY_READ_SNIPPET = r"""
+set -euo pipefail
+issue="$1"
+priority=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].priority.name // "None"')
+echo "$priority"
+"""
+
+
+def _issue_priority(issue_json: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _ISSUE_PRIORITY_READ_SNIPPET, "_", issue_json],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_issue_priority_reads_configured_name() -> None:
+    """An issue with a configured priority surfaces the priority name."""
+    issue = ('{"pipelineIssues":{"nodes":[{"pipeline":{"name":"In Progress"},'
+             '"priority":{"name":"High priority"}}]}}')
+    assert _issue_priority(issue) == "High priority"
+
+
+def test_issue_priority_renders_none_when_unset() -> None:
+    """A pipelineIssue with priority=null renders as `None`, mirroring
+    the Pipeline / Estimate fields' "always-present" line.
+    """
+    issue = ('{"pipelineIssues":{"nodes":[{"pipeline":{"name":"In Progress"},'
+             '"priority":null}]}}')
+    assert _issue_priority(issue) == "None"
+
+
+def test_issue_priority_renders_none_when_no_pipeline_issue() -> None:
+    """An issue with no pipelineIssues nodes (e.g. just-created, not yet
+    placed) still renders cleanly as None instead of `null` or empty.
+    """
+    issue = '{"pipelineIssues":{"nodes":[]}}'
+    assert _issue_priority(issue) == "None"
+
+
+# v1.9.1 item #8 (G5): `--priority <name>` at create time. The cmd_create
+# flag-parser must accept `--priority` with arity 2 and capture the name.
+_CREATE_PRIORITY_PARSE_SNIPPET = r"""
+set -euo pipefail
+priority_name=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --priority)
+            if [[ $# -lt 2 ]]; then echo "ARITY_ERROR"; exit 1; fi
+            priority_name="$2"
+            shift 2
+            ;;
+        *) shift ;;
+    esac
+done
+echo "${priority_name:-NONE}"
+"""
+
+
+def _create_priority_parse(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _CREATE_PRIORITY_PARSE_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_create_priority_flag_captures_value() -> None:
+    """`zh create "Title" -t Task --priority "High priority"` captures the
+    priority name for the post-create mutation.
+    """
+    r = _create_priority_parse("--priority", "High priority", "-t", "Task")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "High priority"
+
+
+def test_create_priority_flag_absent_emits_none_sentinel() -> None:
+    """No --priority means the priority code-path is skipped post-create."""
+    r = _create_priority_parse("-t", "Task")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "NONE"
+
+
+def test_create_priority_arity_guard_rejects_missing_value() -> None:
+    """`--priority` at end-of-args is rejected up-front, not via a raw
+    `$2 unbound` under set -u.
+    """
+    r = _create_priority_parse("--priority")
+    assert r.returncode == 1
+    assert r.stdout.strip() == "ARITY_ERROR"
+
+
+# v1.9.1 item #11: subtask display-noun must be `subtask` everywhere in
+# user-facing output, even though the ZenHub issue-type name is
+# "Sub-task". A pure-bash mirror of zh_display_noun_for_type.
+_DISPLAY_NOUN_SNIPPET = r"""
+set -euo pipefail
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+type_name="$1"
+lower=$(to_lower "$type_name")
+case "$lower" in
+    sub-task) echo "subtask" ;;
+    *) echo "$lower" ;;
+esac
+"""
+
+
+def _display_noun(type_name: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _DISPLAY_NOUN_SNIPPET, "_", type_name],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_display_noun_collapses_sub_task_to_subtask() -> None:
+    """The ZenHub issue-type "Sub-task" renders as the canonical CLI noun
+    `subtask` in every Tip / Usage / hint line. Both casings of the type
+    name collapse identically.
+    """
+    assert _display_noun("Sub-task") == "subtask"
+    assert _display_noun("sub-task") == "subtask"
+    assert _display_noun("SUB-TASK") == "subtask"
+
+
+def test_display_noun_passes_other_types_through_lowercased() -> None:
+    """Initiative / Project / Epic stay as their lowercased name; no
+    over-eager collapsing.
+    """
+    assert _display_noun("Initiative") == "initiative"
+    assert _display_noun("Project") == "project"
+    assert _display_noun("Epic") == "epic"
+
+
+# v1.9.1 items #2 and #9: planning-noun show/update/close emit a type-
+# mismatch warning when the issue's actual type does not match the noun
+# invoked. The comparison is case-insensitive and reads issueType.name
+# from the issueByInfo payload.
+_TYPE_MISMATCH_WARN_SNIPPET = r"""
+set -euo pipefail
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+display_noun_for() {
+    local lower
+    lower=$(to_lower "$1")
+    case "$lower" in
+        sub-task) echo "subtask" ;;
+        *) echo "$lower" ;;
+    esac
+}
+expected_type="$1"
+response="$2"
+issue_num="$3"
+
+actual_type=$(echo "$response" | jq -r '.data.issueByInfo.issueType.name // empty')
+if [[ -z "$actual_type" ]]; then
+    echo "SILENT_NO_TYPE"
+    exit 0
+fi
+expected_lower=$(to_lower "$expected_type")
+actual_lower=$(to_lower "$actual_type")
+if [[ "$expected_lower" == "$actual_lower" ]]; then
+    echo "SILENT_MATCH"
+    exit 0
+fi
+actual_display=$(display_noun_for "$actual_type")
+echo "WARN:${actual_type}:zh ${actual_display} show ${issue_num}"
+"""
+
+
+def _type_mismatch(
+    expected_type: str, response: str, issue_num: str
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _TYPE_MISMATCH_WARN_SNIPPET, "_",
+         expected_type, response, issue_num],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_type_mismatch_warns_with_correct_noun_redirect() -> None:
+    """`zh epic show 42` against a Bug surfaces a warn line with the
+    correct redirect (`zh bug show 42` would not be a valid CLI verb but
+    matches the user's mental model that bugs aren't planning issues; the
+    redirect points them at the right noun for whatever the actual type
+    is, in this case there is no `bug` planning-noun verb, so the user
+    learns the type mismatch and corrects from there).
+    """
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Bug"}}}}'
+    r = _type_mismatch("Epic", resp, "42")
+    assert r.returncode == 0
+    assert r.stdout.strip().startswith("WARN:Bug:")
+    assert "zh bug show 42" in r.stdout
+
+
+def test_type_mismatch_routes_subtask_via_display_noun() -> None:
+    """A Sub-task issue surfaces the redirect using `subtask`, not
+    `sub-task`. This composes items #9 and #11 explicitly.
+    """
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Sub-task"}}}}'
+    r = _type_mismatch("Epic", resp, "42")
+    assert r.returncode == 0
+    assert "zh subtask show 42" in r.stdout
+    assert "sub-task show" not in r.stdout
+
+
+def test_type_mismatch_silent_on_exact_match() -> None:
+    """`zh epic show 42` against an Epic prints no warning."""
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Epic"}}}}'
+    r = _type_mismatch("Epic", resp, "42")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "SILENT_MATCH"
+
+
+def test_type_mismatch_silent_on_case_only_difference() -> None:
+    """Configured casing varies workspace-to-workspace ("epic" vs
+    "Epic"); the comparison is case-insensitive.
+    """
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"epic"}}}}'
+    r = _type_mismatch("Epic", resp, "42")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "SILENT_MATCH"
+
+
+def test_type_mismatch_silent_on_untyped_issue() -> None:
+    """An issue with no issue-type set (unusual but possible) does not
+    fire the warning; the planning-noun create path is where types get
+    enforced.
+    """
+    resp = '{"data":{"issueByInfo":{"issueType":null}}}'
+    r = _type_mismatch("Epic", resp, "42")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "SILENT_NO_TYPE"

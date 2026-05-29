@@ -40,7 +40,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh board` — overview: per-pipeline counts
 - `zh pipelines` — list pipeline names for the workspace
 - `zh pipeline "<name>"` — list issues in a pipeline (order matters; top = highest priority)
-- `zh issue <N>` — full ticket detail (title, state, body, pipeline, assignee, ZH + GH URLs)
+- `zh issue <N>` — full ticket detail (title, state, body, pipeline, priority, estimate, assignee, ZH + GH URLs)
 - `zh mine [user]` — issues assigned to current or specified user
 - `zh users` — list assignable users in workspace
 - `zh workspaces` — list workspaces for the connected repo
@@ -55,7 +55,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
 
 ### Write operations (issue lifecycle)
-- `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`. Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number.
+- `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`. Optional `--priority <name>` sets a configured priority at create time (same name-resolution path as `zh priority`; discover names with `zh priorities`). Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent, priority) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number.
 - `zh type <issue#> <type-name>`: change an existing issue's type (aliases: `set-type`, `retype`). Resolves the name via `zh types`; works for both ZenhubIssueType (Epic/Initiative/Project/Sub-task) and GithubIssueType (Bug/Feature/Task) via the unified type id.
 - `zh comment <issue#> -m "<text>" | -f <file> | --stdin` — add comment
 - `zh close <issue#> [comment]` — close (moves to Closed pipeline; optional closing comment)
@@ -212,6 +212,8 @@ The motivating case for this rule: a "Users randomly logged out around 5pm" tick
 3. Wait for an explicit decision: override (`confirm_create=True`), abandon, or link/comment elsewhere
 
 `confirm_create=True` should ONLY be set after the orchestrator has seen the matches and explicitly chosen to file the new ticket anyway.
+
+**Same gate on planning-noun creates (v1.9.1):** `epic_create`, `initiative_create`, `project_create`, and `subtask_create` run the identical duplicate-check pre-flight as `create_issue`. A blocked response carries `ok=False`, `blocked=True`, and `duplicate_check.matches`; handle it exactly the way you handle `create_issue`'s block (surface, decide together, only then retry with `confirm_create=True`).
 
 **Soft-match warnings:** when `create_issue` returns `ok=True` with `duplicate_check.recommendation == "warn"` and soft matches present, that means the ticket was created BUT there are tangentially related tickets worth flagging. Include them in your post-create report so the orchestrator can decide whether to add a cross-reference comment.
 
