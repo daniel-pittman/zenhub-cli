@@ -96,7 +96,7 @@ def issue_not_found_response() -> dict:
 
 
 # =============================================================================
-# `zenhubChildIssues` (sub-issue listing) page
+# `githubChildIssues` (sub-issue listing) page
 # =============================================================================
 
 def child_node(number: int,
@@ -108,7 +108,7 @@ def child_node(number: int,
                pipeline: str | None = None,
                owner: str = "acme",
                repo: str = "widgets") -> dict:
-    """One child node inside `zenhubChildIssues.nodes[]`."""
+    """One child node inside `githubChildIssues.nodes[]`."""
     return {
         "id": node_id or f"issue-gid-{number}",
         "number": number,
@@ -138,7 +138,7 @@ def subissue_list_response(
     has_next: bool = False,
     end_cursor: str | None = None,
 ) -> dict:
-    """Page of `issueByInfo.zenhubChildIssues`."""
+    """Page of `issueByInfo.githubChildIssues`."""
     nodes = nodes or []
     return {
         "data": {
@@ -146,7 +146,7 @@ def subissue_list_response(
                 "number": parent_number,
                 "title": parent_title,
                 "state": parent_state,
-                "zenhubChildIssues": {
+                "githubChildIssues": {
                     "totalCount": (
                         total_count if total_count is not None else len(nodes)
                     ),
@@ -162,7 +162,7 @@ def subissue_list_response(
 
 
 def subissue_parent_not_found() -> dict:
-    """Parent lookup returns null in `zenhubChildIssues`."""
+    """Parent lookup returns null in `githubChildIssues`."""
     return {"data": {"issueByInfo": None}}
 
 

@@ -1097,34 +1097,12 @@ def _parse_mine_listing(plain: str) -> list[dict]:
 # was a recurring source of drift; v1.6.0 retires it entirely.
 
 
-# `zh` emits the success line with a ✓ prefix (after ANSI is stripped):
-#   ✓ Created issue #42: <title>
-# An unanchored search across stdout would also match titles that
-# legitimately contain "Created issue #NN" (e.g. a bug report whose
-# title quotes an earlier ticket), or the preceding `Info: Creating
-# issue: <title>...` line. Anchor at line-start + ✓ + ws so the
-# captured number is the one immediately after the ✓ marker.
-# `[ \t]*` (not `\s*`) so the leading-whitespace match can't traverse
-# newlines and accidentally span multiple lines — defensive pin on the
-# "match a single line starting with ✓" contract.
-_SUCCESS_ISSUE_RE = re.compile(
-    r"^[ \t]*✓[ \t]*Created issue #(\d+)", re.MULTILINE,
-)
-_SUCCESS_EPIC_RE = re.compile(
-    r"^[ \t]*✓[ \t]*Created epic #(\d+)", re.MULTILINE,
-)
-
-
-def _parse_new_issue_number(plain: str) -> int | None:
-    """Extract issue number from the `✓ Created issue #NNN` success line."""
-    m = _SUCCESS_ISSUE_RE.search(plain)
-    return int(m.group(1)) if m else None
-
-
-def _parse_new_epic_number(plain: str) -> int | None:
-    """Extract epic number from the `✓ Created epic #NNN` success line."""
-    m = _SUCCESS_EPIC_RE.search(plain)
-    return int(m.group(1)) if m else None
+# v1.9.0 retired `_parse_new_issue_number` / `_parse_new_epic_number` and
+# their `_SUCCESS_*_RE` anchors. Every create path (issue + planning nouns)
+# now invokes `zh ... create --json`, which writes a clean JSON object to
+# stdout (human chatter goes to stderr); `_parse_create_json` below parses
+# that JSON. The colorized success-line scrape is the failure mode (G2)
+# this migration was built to eliminate.
 
 
 def _parse_create_json(plain: str) -> dict | None:
@@ -2342,12 +2320,16 @@ def _resolve_ctx(repo_path: str = ""):
 def subissue_list(parent_number: int, repo_path: str = "") -> dict:
     """List sub-issues of a parent issue.
 
-    Calls ZenHub's GraphQL `zenhubChildIssues` connection directly from
-    Python — no bash text contract. Walks pagination with the
-    stuck-cursor + iteration-cap defenses carried over from the bash
-    implementation. Each child dict carries its `repository.owner` and
-    `.name` so callers can spot cross-repo children that can't be
-    operated on from a single git checkout.
+    Calls ZenHub's GraphQL `githubChildIssues` connection directly from
+    Python (no bash text contract). v1.9.0 migrated all sub-issue reads
+    to githubChildIssues because that is the connection both
+    addSubIssues and CreateIssueInput.parentIssueId populate in
+    GitHub-backed workspaces (verified live, 2026-05-29);
+    zenhubChildIssues stays empty for those writes. Walks pagination
+    with the stuck-cursor + iteration-cap defenses carried over from
+    the bash implementation. Each child dict carries its
+    `repository.owner` and `.name` so callers can spot cross-repo
+    children that can't be operated on from a single git checkout.
 
     Args:
         parent_number: Issue number of the parent (positive int).
@@ -2360,7 +2342,7 @@ def subissue_list(parent_number: int, repo_path: str = "") -> dict:
             parent_number: int
             parent_title: str
             parent_state: str | None — "OPEN" / "CLOSED"
-            total_count: int — API's zenhubChildIssues.totalCount
+            total_count: int (the API's githubChildIssues.totalCount)
             fetched_count: int — how many CHILD nodes we walked
             children: list[dict] each with
                 number: int
@@ -2660,9 +2642,9 @@ def subissue_reorder(child_number: int, position: str,
     """Reorder a sub-issue among its siblings.
 
     Calls ZenHub's `reprioritizeSubIssue` mutation directly. Sibling
-    anchoring (top/bottom/after/before) is computed in Python from
-    `zenhubChildIssues` listing — same logic the bash implementation had,
-    just on the MCP side now.
+    anchoring (top/bottom/after/before) is computed in Python from the
+    `githubChildIssues` listing (the canonical sub-issue connection in
+    GitHub-backed workspaces; see subissue_list for the rationale).
 
     Positions:
       - "top" / "first"   — first sibling

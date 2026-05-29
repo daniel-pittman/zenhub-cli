@@ -423,50 +423,12 @@ def test_parse_pipeline_listing_title_with_hash_pipe_pattern():
 
 
 # -----------------------------------------------------------------------------
-# _parse_new_issue_number / _parse_new_epic_number — round-4 #3.
-# Anchor on the ✓ success marker so an adversarial title containing
-# `Created issue #NN` (or the preceding `Info: Creating issue: ...`
-# line) doesn't trick the parser into returning the wrong number.
-# -----------------------------------------------------------------------------
-
-
-def test_parse_new_issue_number_returns_the_success_line_number():
-    stdout = (
-        "Info: Creating issue: Bug: Created issue #99 has wrong fix...\n"
-        "✓ Created issue #42: Bug: Created issue #99 has wrong fix\n"
-    )
-    assert mcp_server._parse_new_issue_number(stdout) == 42
-
-
-def test_parse_new_issue_number_returns_none_without_success_line():
-    # No ✓ line means the create command never reported success — must
-    # return None, not whatever number the Info line echoed from the
-    # user's title.
-    stdout = (
-        "Info: Creating issue: Bug: Created issue #99 has wrong fix...\n"
-        "Error: GraphQL mutation failed\n"
-    )
-    assert mcp_server._parse_new_issue_number(stdout) is None
-
-
-def test_parse_new_epic_number_returns_the_success_line_number():
-    stdout = (
-        "Info: Creating epic: Bug: see Created epic #99 for context...\n"
-        "✓ Created epic #42: Bug: see Created epic #99 for context\n"
-    )
-    assert mcp_server._parse_new_epic_number(stdout) == 42
-
-
-def test_parse_new_epic_number_returns_none_without_success_line():
-    stdout = "Error: epic creation failed; see Created epic #99 in audit\n"
-    assert mcp_server._parse_new_epic_number(stdout) is None
-
-
-# -----------------------------------------------------------------------------
 # _parse_create_json (v1.9.0 G2). `zh create --json` emits a single JSON
 # object on stdout (human chatter goes to stderr). The MCP create_issue /
 # planning *_create tools parse the new number from this object rather than
-# scraping a colorized success line.
+# scraping a colorized success line. The v1.5-era `_parse_new_issue_number` /
+# `_parse_new_epic_number` helpers were retired with the migration and the
+# tests pinning them deleted alongside.
 # -----------------------------------------------------------------------------
 
 

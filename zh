@@ -2483,12 +2483,17 @@ Examples:
     # the post-create block, leaving the new issue with no JSON emit. We
     # cache the resolved parent id so the post-create block can reuse it.
     #
-    # Empirically (verified against a live workspace), addSubIssues writes
-    # to the GitHub-native sub-issue connection (githubChildIssues /
-    # parentIssue), which is the side cmd_hierarchy_show + cmd_issue read.
-    # The separate zenhubChildIssues that 'zh subissue list' walks is the
-    # legacy side and is left empty by the modern wiring; reconciling the
-    # two reads is tracked as a follow-up.
+    # Sub-issue connection model (verified live against a GitHub-backed
+    # workspace, 2026-05-29): BOTH addSubIssues and
+    # CreateIssueInput.parentIssueId write to the GitHub-native sub-issue
+    # connection (githubChildIssues / githubParentIssue), and the union
+    # field parentIssue resolves to the same parent. The separate
+    # zenhubChildIssues connection is for ZenHub-only cards (issues with
+    # no GitHub backing) and stays empty for our writes. The whole zh
+    # codebase therefore reads `githubChildIssues` everywhere: in
+    # cmd_subissue_list, cmd_hierarchy_show, cmd_issue, and the walker
+    # queries used by the subissue write verbs. Do not relapse to
+    # zenhubChildIssues.
     local parent_stripped=""
     local parent_id=""
     if [[ -n "$parent" ]]; then
@@ -3403,11 +3408,10 @@ cmd_hierarchy_list() {
     echo -e "${CYAN}Tip:${NC} 'zh $(to_lower "$type_name") show <issue#>' shows an issue and its sub-issues."
 }
 
-# <noun> show: show an issue (with its issue-type) plus its child issues. We
-# read the GitHub-native sub-issue connection (githubChildIssues / parentIssue),
-# which is the side ZenHub's addSubIssues mutation populates in the modern
-# model. (zenhubChildIssues, which 'zh subissue list' reads, is a separate
-# legacy connection that the modern sub-issue wiring leaves empty.)
+# <noun> show: show an issue (with its issue-type) plus its child issues.
+# Reads the canonical githubChildIssues connection (same one cmd_subissue_list
+# and cmd_issue use); see the cmd_create header comment for why every reader
+# in the codebase converged on it.
 cmd_hierarchy_show() {
     local type_name="$1"
     local issue_num="${2:-}"
@@ -4839,21 +4843,23 @@ zh_resolve_issue_ids() {
 # Sub-issue Commands
 # =============================================================================
 #
-# ZenHub native sub-issues (the 3rd tier below Epic → Issue → Sub-issue). A
-# sub-issue is an Issue whose parentIssue points to another Issue. ZenHub
-# exposes this via three GraphQL mutations:
+# Sub-issues are the 3rd hierarchy tier (Epic, then Issue, then Sub-issue). A
+# sub-issue is an Issue whose parent points to another Issue. ZenHub exposes
+# the wiring via three GraphQL mutations:
 #
-#   addSubIssues       — link one or more child issues under a parent
-#   removeSubIssues    — unlink one or more children (parent inferred)
-#   reprioritizeSubIssue — reorder a single child relative to siblings
+#   addSubIssues:         link one or more child issues under a parent
+#   removeSubIssues:      unlink one or more children (parent inferred)
+#   reprioritizeSubIssue: reorder a single child relative to siblings
 #
-# The Issue type also exposes parentIssue (singular) and zenhubChildIssues
-# (connection) so the hierarchy is queryable both directions.
-#
-# Note: ZenHub also has the separate `githubChildIssues` / `githubParentIssue`
-# fields for GitHub-native sub-issues (a parallel concept on GitHub's side).
-# `zh subissue` deliberately wraps only the ZenHub-native side — that's the
-# tier the rest of `zh` works with, and mixing the two would invite confusion.
+# Sub-issue connection model (verified live against a GitHub-backed workspace,
+# 2026-05-29): both addSubIssues and CreateIssueInput.parentIssueId write to
+# the GitHub-native connection (githubChildIssues / githubParentIssue), and
+# the union field parentIssue resolves to that same parent. The separate
+# zenhubChildIssues connection is for ZenHub-only cards and stays empty for
+# our writes. The whole zh codebase therefore reads `githubChildIssues`
+# everywhere (the walkers below, cmd_subissue_list, cmd_hierarchy_show,
+# cmd_issue). See the cmd_create header for the same note. Do not relapse to
+# zenhubChildIssues.
 
 # Resolve a single issue number to its ZenHub issue ID. Thin wrapper around
 # zh_resolve_issue_ids that returns the first element rather than a JSON
@@ -5338,7 +5344,7 @@ state with 'zh subissue list ${stripped_parent}'."
     fi
 }
 
-# Fetch ALL sub-issues for a parent issue, walking the zenhubChildIssues
+# Fetch ALL sub-issues for a parent issue, walking the githubChildIssues
 # connection with cursor pagination until pageInfo.hasNextPage is false.
 #
 # Echoes a single JSON object on stdout:
@@ -5358,7 +5364,7 @@ zh_subissue_fetch_all() {
             number
             title
             state
-            zenhubChildIssues(first: 100, after: $after) {
+            githubChildIssues(first: 100, after: $after) {
                 totalCount
                 pageInfo {
                     hasNextPage
@@ -5427,7 +5433,7 @@ zh_subissue_fetch_all() {
 
         if [[ "$first_page" == "true" ]]; then
             parent_title=$(echo "$issue_json" | jq -r '.title // ""')
-            total_count=$(echo "$issue_json" | jq -r '.zenhubChildIssues.totalCount // 0')
+            total_count=$(echo "$issue_json" | jq -r '.githubChildIssues.totalCount // 0')
             first_page=false
         fi
 
@@ -5438,12 +5444,12 @@ zh_subissue_fetch_all() {
         # list_sub_issues walker enforces. Round-5 #8 closes the
         # last walker that missed this filter.
         local page_nodes
-        page_nodes=$(echo "$issue_json" | jq -c '[(.zenhubChildIssues.nodes // [])[] | select(. != null)]')
+        page_nodes=$(echo "$issue_json" | jq -c '[(.githubChildIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
-        has_next=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.hasNextPage // false')
-        end_cursor=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.endCursor // empty')
+        has_next=$(echo "$issue_json" | jq -r '.githubChildIssues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$issue_json" | jq -r '.githubChildIssues.pageInfo.endCursor // empty')
 
         if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
             break
@@ -5488,7 +5494,7 @@ zh_subissue_fetch_ids_only() {
     local query='
     query($repoId: ID!, $issueNumber: Int!, $after: String) {
         issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
-            zenhubChildIssues(first: 100, after: $after) {
+            githubChildIssues(first: 100, after: $after) {
                 totalCount
                 pageInfo {
                     hasNextPage
@@ -5546,7 +5552,7 @@ zh_subissue_fetch_ids_only() {
         fi
 
         if [[ "$first_page" == "true" ]]; then
-            total_count=$(echo "$issue_json" | jq -r '.zenhubChildIssues.totalCount // 0')
+            total_count=$(echo "$issue_json" | jq -r '.githubChildIssues.totalCount // 0')
             first_page=false
         fi
 
@@ -5554,12 +5560,12 @@ zh_subissue_fetch_ids_only() {
         # at aggregation, matching the other three walkers. Last
         # walker without the filter.
         local page_nodes
-        page_nodes=$(echo "$issue_json" | jq -c '[(.zenhubChildIssues.nodes // [])[] | select(. != null)]')
+        page_nodes=$(echo "$issue_json" | jq -c '[(.githubChildIssues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
         local has_next end_cursor
-        has_next=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.hasNextPage // false')
-        end_cursor=$(echo "$issue_json" | jq -r '.zenhubChildIssues.pageInfo.endCursor // empty')
+        has_next=$(echo "$issue_json" | jq -r '.githubChildIssues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$issue_json" | jq -r '.githubChildIssues.pageInfo.endCursor // empty')
 
         if [[ "$has_next" != "true" ]]; then
             break
