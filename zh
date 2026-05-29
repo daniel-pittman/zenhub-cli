@@ -2534,8 +2534,8 @@ Examples:
         fi
     fi
 
-    # Wire the new issue under its parent via the ZenHub-native sub-issue
-    # relationship (addSubIssues), so it shows up in 'zh subissue list' and
+    # Wire the new issue under its parent via addSubIssues (the same mutation
+    # 'zh epic add' / 'zh subissue add' use), so it shows up under
     # 'zh <noun> show'. Done post-create because the parent id and the new
     # child id both have to exist.
     local parent_wired=""
