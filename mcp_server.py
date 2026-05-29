@@ -12,6 +12,14 @@ Wraps tools/zh so that:
     subissue_reorder, assign, unassign, estimate) are explicit verbs
     so callers can audit which destructive operations they invoked.
 
+v1.9.0 model migration: ZenHub removed Legacy Epics and ZenhubEpics in June
+2025. The epic_* tools no longer hit the dead ZenhubEpic API; an epic is now a
+normal issue whose issue-type is Epic, with children wired via Sub-Issues. The
+same machinery backs first-class tools for every planning level (initiative /
+project / epic / subtask) plus set_issue_type and list_priorities. Type
+discovery uses assignableIssueTypes (the full 5-level hierarchy), not the old
+githubIssueTypes repo query.
+
 Every tool optionally accepts a `repo_path` argument — the absolute path of a
 git checkout that the underlying `zh` invocation runs from. This is required
 because `zh` detects the GitHub repo via `git config --get remote.origin.url`
@@ -1089,34 +1097,44 @@ def _parse_mine_listing(plain: str) -> list[dict]:
 # was a recurring source of drift; v1.6.0 retires it entirely.
 
 
-# `zh` emits the success line with a ✓ prefix (after ANSI is stripped):
-#   ✓ Created issue #42: <title>
-# An unanchored search across stdout would also match titles that
-# legitimately contain "Created issue #NN" (e.g. a bug report whose
-# title quotes an earlier ticket), or the preceding `Info: Creating
-# issue: <title>...` line. Anchor at line-start + ✓ + ws so the
-# captured number is the one immediately after the ✓ marker.
-# `[ \t]*` (not `\s*`) so the leading-whitespace match can't traverse
-# newlines and accidentally span multiple lines — defensive pin on the
-# "match a single line starting with ✓" contract.
-_SUCCESS_ISSUE_RE = re.compile(
-    r"^[ \t]*✓[ \t]*Created issue #(\d+)", re.MULTILINE,
-)
-_SUCCESS_EPIC_RE = re.compile(
-    r"^[ \t]*✓[ \t]*Created epic #(\d+)", re.MULTILINE,
-)
+# v1.9.0 retired `_parse_new_issue_number` / `_parse_new_epic_number` and
+# their `_SUCCESS_*_RE` anchors. Every create path (issue + planning nouns)
+# now invokes `zh ... create --json`, which writes a clean JSON object to
+# stdout (human chatter goes to stderr); `_parse_create_json` below parses
+# that JSON. The colorized success-line scrape is the failure mode (G2)
+# this migration was built to eliminate.
 
 
-def _parse_new_issue_number(plain: str) -> int | None:
-    """Extract issue number from the `✓ Created issue #NNN` success line."""
-    m = _SUCCESS_ISSUE_RE.search(plain)
-    return int(m.group(1)) if m else None
+def _parse_create_json(plain: str) -> dict | None:
+    """Parse the JSON object emitted by `zh create --json` / `zh <noun>
+    create --json`.
 
+    With --json, `zh` sends all human chatter to stderr and writes a
+    single JSON object to stdout (number, url, title, type, pipeline,
+    estimate, parent). `_run_zh` only captures stdout in `stdout_plain`,
+    so this should be pure JSON; we still scan for the first balanced
+    object defensively in case a wrapper prepends anything.
 
-def _parse_new_epic_number(plain: str) -> int | None:
-    """Extract epic number from the `✓ Created epic #NNN` success line."""
-    m = _SUCCESS_EPIC_RE.search(plain)
-    return int(m.group(1)) if m else None
+    Returns the parsed dict, or None if no JSON object is found.
+    """
+    if not plain:
+        return None
+    text = plain.strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except (ValueError, TypeError):
+        pass
+    # Defensive: find the first {...} block and try again.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            obj = json.loads(text[start:end + 1])
+            return obj if isinstance(obj, dict) else None
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 # =============================================================================
@@ -1254,43 +1272,44 @@ def mine(user: str = "", repo_path: str = "") -> dict:
 
 @mcp.tool()
 def epic_list(repo_path: str = "") -> dict:
-    """List all ZenHub epics in the workspace (both OPEN and CLOSED).
+    """List issues of type Epic in the workspace (v1.9.0 model).
+
+    An epic is a normal issue whose ZenHub issue-type is Epic; this lists
+    every such issue. The `number` is an ordinary GitHub issue number with
+    a normal issue URL (the old ZenhubEpic id concept is gone).
+
+    v1.9.0 delegates to the generic `_planning_list` so initiative_list /
+    project_list / subtask_list all behave identically. The response
+    exposes BOTH the new noun-neutral `items` key AND a back-compat
+    `epics` alias (deprecated) for callers pinned to the v1.8.x shape.
 
     Args:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, epics (list of {number, state, title}), raw, stderr.
+        dict with: ok, items (list of {number, state, title}),
+        epics (back-compat alias for items, deprecated), raw, stderr.
     """
-    r = _run_zh(["epic", "list"], cwd=_resolve_cwd(repo_path))
-    epics = []
-    if r["ok"]:
-        for line in r["stdout_plain"].splitlines():
-            m = re.match(r"^\s*#(\d+)\s+(OPEN|CLOSED)\s+(.+?)\s*$", line)
-            if m:
-                epics.append({
-                    "number": int(m.group(1)),
-                    "state": m.group(2),
-                    "title": m.group(3).strip(),
-                })
-    return {
-        "ok": r["ok"],
-        "epics": epics,
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    result = _planning_list("epic", repo_path)
+    # Back-compat alias: every other planning noun returns `items`; v1.8.x
+    # callers of epic_list read `epics`. Carry both.
+    result["epics"] = result.get("items", [])
+    return result
 
 
 @mcp.tool()
 def epic_show(epic_number: int, repo_path: str = "") -> dict:
-    """Show full detail for a single epic (metadata + child issues).
+    """Show full detail for an epic issue (metadata + child issues).
+
+    v1.9.0: `epic_number` is an ordinary GitHub issue number (the issue
+    whose type is Epic). Children are the issue's sub-issues.
 
     Args:
-        epic_number: ZenHub epic number.
+        epic_number: Issue number of the Epic-typed issue.
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, epic_number, raw (the full formatted epic output), stderr.
+        dict with: ok, epic_number, raw (the full formatted output), stderr.
     """
     r = _run_zh(["epic", "show", str(epic_number)], cwd=_resolve_cwd(repo_path))
     return {
@@ -1339,7 +1358,13 @@ def list_labels(repo_path: str = "") -> dict:
 
 @mcp.tool()
 def list_types(repo_path: str = "") -> dict:
-    """List available issue types (Task, Feature, Bug, etc.).
+    """List the workspace's assignable issue types with level + disposition.
+
+    v1.9.0: backed by assignableIssueTypes, so this shows the full 5-level
+    hierarchy (Initiative / Project / Epic at PLANNING_PANEL, plus Bug /
+    Feature / Task / Sub-task at BOARD), each with its level (1-5),
+    disposition, and source (ZenhubIssueType vs GithubIssueType). The old
+    listing only saw the board-level GitHub types.
 
     Args:
         repo_path: Optional absolute path of a git checkout to run zh from.
@@ -1513,7 +1538,7 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
 @mcp.tool()
 def create_issue(title: str, body: str, type: str = "Task",
                  pipeline: str = "Product Backlog",
-                 labels: str = "", repo_path: str = "",
+                 labels: str = "", parent: int = 0, repo_path: str = "",
                  confirm_create: bool = False,
                  skip_duplicate_check: bool = False) -> dict:
     """Create a new ZenHub issue.
@@ -1525,13 +1550,23 @@ def create_issue(title: str, body: str, type: str = "Task",
     returned — pass `confirm_create=True` to override and create
     anyway. Soft matches are surfaced as a warning but don't block.
 
+    v1.9.0: `type` is resolved via assignableIssueTypes, so any
+    configured type works (Bug / Feature / Task at board level, plus
+    the planning-panel types Initiative / Project / Epic and Sub-task).
+    A type name that is not assignable in the workspace is now a hard
+    error (the underlying `zh create` lists the available types) rather
+    than a silently-typeless create. Use list_types to discover them.
+
     Args:
         title: Issue title (required, non-empty).
         body: Issue body / description in Markdown (required, non-empty).
-        type: Issue type (Task / Feature / Bug / Spike / Research / Sub-task).
-            Defaults to Task.
+        type: Issue type. Defaults to Task. Discover with list_types.
         pipeline: Target pipeline. Defaults to "Product Backlog".
         labels: Comma-separated label names (optional).
+        parent: Optional parent issue number. When > 0 the new issue is
+            wired as a sub-issue of that parent (ZenHub-native
+            addSubIssues, so it shows up under epic_show / subissue
+            reads).
         repo_path: Optional absolute path of a git checkout to run zh from.
         confirm_create: pass True to bypass the duplicate-check block.
             Use ONLY after reviewing the returned matches and confirming
@@ -1546,8 +1581,8 @@ def create_issue(title: str, body: str, type: str = "Task",
             candidate matches and recommendation), and a clear message
             explaining how to override.
         On success: dict with ok=True, number (new issue number), url,
-            raw, stderr, duplicate_check (informational — may include
-            soft matches).
+            type, pipeline, parent, raw, stderr, duplicate_check
+            (informational; may include soft matches).
     """
     if not title.strip():
         return {"ok": False, "stderr": "title must be non-empty"}
@@ -1593,13 +1628,24 @@ def create_issue(title: str, body: str, type: str = "Task",
                 "duplicate_check": dup_info,
             }
 
-    args = ["create", title, "-t", type, "-p", pipeline, "-b", body]
+    # v1.9.0: use --json so the new number is parsed from a clean JSON
+    # object on stdout rather than scraped from a colorized success line
+    # (the parse-miss that motivated G2).
+    args = ["create", title, "-t", type, "-p", pipeline, "-b", body, "--json"]
     if labels:
         args.extend(["-l", labels])
+    if parent and parent > 0:
+        args.extend(["--parent", str(parent)])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+
+    created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     out = {
-        "ok": r["ok"],
-        "number": _parse_new_issue_number(r["stdout_plain"]) if r["ok"] else None,
+        "ok": r["ok"] and created is not None,
+        "number": created.get("number") if created else None,
+        "url": created.get("url") if created else None,
+        "type": created.get("type") if created else None,
+        "pipeline": created.get("pipeline") if created else None,
+        "parent": created.get("parent") if created else None,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -1795,11 +1841,19 @@ def set_estimate(number: int, points: str, repo_path: str = "") -> dict:
 
 @mcp.tool()
 def set_priority(number: int, level: str, repo_path: str = "") -> dict:
-    """Set or clear an issue's priority.
+    """Set or clear an issue's priority by name.
+
+    v1.9.0 (G1): priorities are workspace-defined, not a fixed
+    high/medium/low set. `level` is matched case-insensitively against
+    the workspace's configured priority names; pass "clear" to remove.
+    Discover the configured names with list_priorities. If no priority
+    matches, this fails with the available names listed in stderr (the
+    underlying `zh priority` no longer silently sets the first priority).
 
     Args:
         number: Issue number.
-        level: One of "high", "medium", "low", "clear".
+        level: A configured priority name (e.g. "High priority") or
+            "clear" to remove the priority.
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
@@ -1811,6 +1865,58 @@ def set_priority(number: int, level: str, repo_path: str = "") -> dict:
         "ok": r["ok"],
         "number": number,
         "level": level,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+@mcp.tool()
+def list_priorities(repo_path: str = "") -> dict:
+    """List the workspace's configured priorities (G1 companion).
+
+    Priorities are workspace-defined. Use this to discover the names that
+    set_priority accepts.
+
+    Args:
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, raw (formatted priority listing), stderr.
+    """
+    r = _run_zh(["priorities"], cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+@mcp.tool()
+def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
+    """Change an existing issue's type (G8).
+
+    v1.9.0: wraps changeIssueTypeOfIssues, which accepts the unified type
+    id for both GithubIssueType and ZenhubIssueType, so this can promote a
+    board issue to a planning-panel Epic (or any configured type) and back.
+    The type name is resolved via assignableIssueTypes (discover with
+    list_types); an unknown type fails with the available names in stderr.
+
+    Args:
+        number: Issue number to retype.
+        issue_type: Target type name (e.g. "Epic", "Feature").
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, number, issue_type, raw, stderr.
+    """
+    if not issue_type.strip():
+        return {"ok": False, "stderr": "issue_type must be non-empty"}
+    r = _run_zh(["type", str(number), issue_type],
+                cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "number": number,
+        "issue_type": issue_type,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -1844,61 +1950,99 @@ def block_issue(blocked: int, blocking: int, repo_path: str = "") -> dict:
 
 
 # -----------------------------------------------------------------------------
-# WRITE TOOLS — EPIC MANAGEMENT
+# WRITE TOOLS: PLANNING HIERARCHY (issue-type + sub-issue model, v1.9.0)
+#
+# Each planning level (initiative / project / epic / subtask) is the SAME
+# machinery parameterised by a ZenHub issue-type name. The private _planning_*
+# helpers shell to the matching `zh <noun>` subcommand; the public @mcp.tool()
+# functions are thin per-noun wrappers, mirroring the data-driven bash design.
+# An "epic" is a normal issue whose issue-type is Epic; children are wired with
+# Sub-Issues, so create/add/show/etc. all act on real issue numbers and normal
+# issue URLs. The dead ZenhubEpic API the old epic_* tools targeted is gone.
 # -----------------------------------------------------------------------------
 
-@mcp.tool()
-def epic_create(title: str, description: str = "", labels: str = "",
-                repo_path: str = "") -> dict:
-    """Create a new ZenHub epic.
 
-    Args:
-        title: Epic title (required, non-empty).
-        description: Optional epic body / description.
-        labels: Optional comma-separated label names.
-        repo_path: Optional absolute path of a git checkout to run zh from.
+def _planning_create(noun: str, title: str, description: str, labels: str,
+                     pipeline: str, assignee: str, estimate: str,
+                     parent: int, repo_path: str) -> dict:
+    """Shared `zh <noun> create --json` wrapper for the planning nouns.
 
-    Returns:
-        dict with: ok, epic_number, raw, stderr.
+    Forwards every meaningful create-time flag the bash side exposes:
+    description, labels, pipeline, assignee, estimate, parent. The
+    duplicate-check pre-flight that `create_issue` runs is deliberately
+    NOT applied here (deferred to v1.9.1): planning nouns get created
+    rarely and per-noun similarity tuning is its own work item.
     """
     if not title.strip():
-        return {"ok": False, "stderr": "title must be non-empty"}
-    args = ["epic", "create", title]
+        return {"ok": False, "stderr": "title must be non-empty",
+                "number": None, "url": None, "type": None,
+                "pipeline": None, "parent": None, "estimate": None}
+    args = [noun, "create", title, "--json"]
     if description:
         args.extend(["-d", description])
     if labels:
         args.extend(["-l", labels])
+    if pipeline:
+        args.extend(["-p", pipeline])
+    if assignee:
+        args.extend(["-a", assignee])
+    if estimate:
+        args.extend(["-e", estimate])
+    if parent and parent > 0:
+        args.extend(["--parent", str(parent)])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     return {
-        "ok": r["ok"],
-        "epic_number": _parse_new_epic_number(r["stdout_plain"]) if r["ok"] else None,
+        "ok": r["ok"] and created is not None,
+        "number": created.get("number") if created else None,
+        "url": created.get("url") if created else None,
+        "type": created.get("type") if created else None,
+        "pipeline": created.get("pipeline") if created else None,
+        "parent": created.get("parent") if created else None,
+        "estimate": created.get("estimate") if created else None,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
 
 
-@mcp.tool()
-def epic_update(epic_number: int, title: str = "", description: str = "",
-                repo_path: str = "") -> dict:
-    """Update an epic's title and/or description.
+def _planning_list(noun: str, repo_path: str) -> dict:
+    """Shared `zh <noun> list` wrapper. Parses the `#NN STATE title` rows."""
+    r = _run_zh([noun, "list"], cwd=_resolve_cwd(repo_path))
+    items = []
+    if r["ok"]:
+        for line in r["stdout_plain"].splitlines():
+            m = re.match(r"^\s*#(\d+)\s+(OPEN|CLOSED)\s+(.+?)\s*$", line)
+            if m:
+                items.append({
+                    "number": int(m.group(1)),
+                    "state": m.group(2),
+                    "title": m.group(3).strip(),
+                })
+    return {
+        "ok": r["ok"],
+        "items": items,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
 
-    At least one of `title` or `description` must be provided.
 
-    Args:
-        epic_number: ZenHub epic number.
-        title: New title (optional).
-        description: New body / description (optional).
-        repo_path: Optional absolute path of a git checkout to run zh from.
+def _planning_show(noun: str, number: int, repo_path: str) -> dict:
+    r = _run_zh([noun, "show", str(number)], cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "number": number,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
 
-    Returns:
-        dict with: ok, epic_number, raw, stderr.
-    """
+
+def _planning_update(noun: str, number: int, title: str, description: str,
+                     repo_path: str) -> dict:
     if not title and not description:
-        return {
-            "ok": False,
-            "stderr": "Must provide title and/or description",
-        }
-    args = ["epic", "update", str(epic_number)]
+        return {"ok": False,
+                "stderr": "Must provide title and/or description",
+                "number": number}
+    args = [noun, "update", str(number)]
     if title:
         args.extend(["-t", title])
     if description:
@@ -1906,112 +2050,433 @@ def epic_update(epic_number: int, title: str = "", description: str = "",
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     return {
         "ok": r["ok"],
-        "epic_number": epic_number,
+        "number": number,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
+
+
+def _planning_add_children(noun: str, parent: int, children: list[int],
+                           repo_path: str) -> dict:
+    if not children:
+        return {"ok": False, "stderr": "issue_numbers must be non-empty",
+                "parent": parent, "added": []}
+    args = [noun, "add", str(parent)] + [str(n) for n in children]
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "parent": parent,
+        "added": children if r["ok"] else [],
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+def _planning_remove_children(noun: str, parent: int, children: list[int],
+                              repo_path: str) -> dict:
+    if not children:
+        return {"ok": False, "stderr": "issue_numbers must be non-empty",
+                "parent": parent, "removed": []}
+    args = [noun, "remove", str(parent)] + [str(n) for n in children]
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "parent": parent,
+        "removed": children if r["ok"] else [],
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+def _planning_close(noun: str, number: int, comment: str,
+                    repo_path: str) -> dict:
+    args = [noun, "close", str(number)]
+    if comment:
+        args.append(comment)
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "number": number,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+def _planning_reopen(noun: str, number: int, repo_path: str) -> dict:
+    r = _run_zh([noun, "reopen", str(number)], cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "number": number,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+def _with_epic_number_alias(d: dict) -> dict:
+    """Add an `epic_number` alias to an epic_* tool response (review #1).
+
+    Pre-v1.9.0 the `epic_*` MCP tools returned `epic_number` in their dict;
+    the rewrite to the generic `_planning_*` helpers uses `number` / `parent`
+    instead. To avoid silently breaking agents pinned to the v1.8.x contract,
+    every epic_* response carries an `epic_number` alias mirroring whichever
+    of `number` or `parent` is the epic's identifier in that shape. Tool
+    docstrings note the alias is for back-compat and may be removed in a
+    future major release.
+    """
+    if "number" in d and "epic_number" not in d:
+        d["epic_number"] = d.get("number")
+    elif "parent" in d and "epic_number" not in d:
+        d["epic_number"] = d.get("parent")
+    return d
+
+
+# ---- Epic (the headline noun; backward-compatible tool names) ---------------
+#
+# Every epic_* tool returns the new generic shape plus an `epic_number` alias
+# for back-compat with v1.8.x callers (see _with_epic_number_alias).
+
+@mcp.tool()
+def epic_create(title: str, description: str = "", labels: str = "",
+                pipeline: str = "", assignee: str = "", estimate: str = "",
+                parent: int = 0, repo_path: str = "") -> dict:
+    """Create an Epic (an issue with issue-type Epic).
+
+    v1.9.0: an epic is a normal issue typed Epic, with a normal issue
+    number and URL (the ZenhubEpic id concept is gone). Every `zh create`
+    flag is forwarded; the duplicate-check pre-flight that `create_issue`
+    runs is deferred to v1.9.1 (track via list_priorities-style follow-up).
+
+    Args:
+        title: Epic title (required, non-empty).
+        description: Optional epic body / description.
+        labels: Optional comma-separated label names.
+        pipeline: Optional target pipeline.
+        assignee: Optional GitHub username to assign at create time.
+        estimate: Optional story-point estimate (numeric string).
+        parent: Optional parent issue number; the new epic is wired as a
+            sub-issue of that parent via addSubIssues.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, number, epic_number (back-compat alias for number),
+        url, type, pipeline, parent, estimate, raw, stderr.
+    """
+    return _with_epic_number_alias(_planning_create(
+        "epic", title, description, labels, pipeline,
+        assignee, estimate, parent, repo_path,
+    ))
+
+
+@mcp.tool()
+def epic_update(epic_number: int, title: str = "", description: str = "",
+                repo_path: str = "") -> dict:
+    """Update an epic issue's title and/or description.
+
+    At least one of `title` or `description` must be provided.
+
+    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
+    """
+    return _with_epic_number_alias(_planning_update(
+        "epic", epic_number, title, description, repo_path,
+    ))
 
 
 @mcp.tool()
 def epic_add_children(epic_number: int, issue_numbers: list[int],
                       repo_path: str = "") -> dict:
-    """Add one or more issues to an epic.
+    """Attach one or more issues as sub-issues of an epic (addSubIssues).
 
-    Args:
-        epic_number: ZenHub epic number.
-        issue_numbers: List of issue numbers to add (single API call).
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, epic_number, added (list of issue numbers), raw, stderr.
+    Returns: dict with ok, parent, epic_number (back-compat alias for
+    parent), added (list of issue numbers), raw, stderr.
     """
-    if not issue_numbers:
-        return {"ok": False, "stderr": "issue_numbers must be non-empty"}
-    args = ["epic", "add", str(epic_number)] + [str(n) for n in issue_numbers]
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    return {
-        "ok": r["ok"],
-        "epic_number": epic_number,
-        "added": issue_numbers if r["ok"] else [],
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    return _with_epic_number_alias(_planning_add_children(
+        "epic", epic_number, issue_numbers, repo_path,
+    ))
 
 
 @mcp.tool()
 def epic_remove_children(epic_number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
-    """Remove one or more issues from an epic.
+    """Detach one or more sub-issues from an epic (removeSubIssues).
 
-    Args:
-        epic_number: ZenHub epic number.
-        issue_numbers: List of issue numbers to remove.
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, epic_number, removed (list of issue numbers), raw, stderr.
+    Returns: dict with ok, parent, epic_number (back-compat alias for
+    parent), removed (list of issue numbers), raw, stderr.
     """
-    if not issue_numbers:
-        return {"ok": False, "stderr": "issue_numbers must be non-empty"}
-    args = ["epic", "remove", str(epic_number)] + [str(n) for n in issue_numbers]
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    return {
-        "ok": r["ok"],
-        "epic_number": epic_number,
-        "removed": issue_numbers if r["ok"] else [],
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    return _with_epic_number_alias(_planning_remove_children(
+        "epic", epic_number, issue_numbers, repo_path,
+    ))
 
 
 @mcp.tool()
-def epic_close(epic_number: int, repo_path: str = "") -> dict:
-    """Close an epic.
+def epic_close(epic_number: int, comment: str = "", repo_path: str = "") -> dict:
+    """Close an epic issue.
 
-    DESTRUCTIVE — affects board visibility. Pre-confirm.
+    DESTRUCTIVE: affects board visibility and notifies watchers. Pre-confirm.
 
-    Args:
-        epic_number: ZenHub epic number.
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, epic_number, raw, stderr.
+    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
     """
-    r = _run_zh(["epic", "close", str(epic_number)],
-                cwd=_resolve_cwd(repo_path))
-    return {
-        "ok": r["ok"],
-        "epic_number": epic_number,
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    return _with_epic_number_alias(_planning_close(
+        "epic", epic_number, comment, repo_path,
+    ))
 
 
 @mcp.tool()
 def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
-    """Reopen a closed epic.
+    """Reopen a closed epic issue.
 
-    Args:
-        epic_number: ZenHub epic number.
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, epic_number, raw, stderr.
+    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
     """
-    r = _run_zh(["epic", "reopen", str(epic_number)],
-                cwd=_resolve_cwd(repo_path))
-    return {
-        "ok": r["ok"],
-        "epic_number": epic_number,
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    return _with_epic_number_alias(_planning_reopen(
+        "epic", epic_number, repo_path,
+    ))
 
 
-# Note: epic_delete deliberately not exposed as an MCP tool. Permanently
-# deleting an epic is irreversible. If you genuinely need to delete an epic,
-# do it via `zh epic delete <N>` directly from the CLI — that requires
-# human deliberation.
+# ---- Initiative (level 1) ---------------------------------------------------
+#
+# Full surface (8 tools) parallel to epic_*. Each delegates to the same
+# generic _planning_* helper, so adding behavior in one place updates every
+# noun.
+
+@mcp.tool()
+def initiative_create(title: str, description: str = "", labels: str = "",
+                      pipeline: str = "", assignee: str = "",
+                      estimate: str = "", parent: int = 0,
+                      repo_path: str = "") -> dict:
+    """Create an Initiative (issue-type Initiative, level 1).
+
+    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
+    raw, stderr.
+    """
+    return _planning_create("initiative", title, description, labels,
+                            pipeline, assignee, estimate, parent, repo_path)
+
+
+@mcp.tool()
+def initiative_list(repo_path: str = "") -> dict:
+    """List issues of type Initiative. Returns ok, items, raw, stderr."""
+    return _planning_list("initiative", repo_path)
+
+
+@mcp.tool()
+def initiative_show(number: int, repo_path: str = "") -> dict:
+    """Show an Initiative issue + its child issues. Returns ok, number, raw."""
+    return _planning_show("initiative", number, repo_path)
+
+
+@mcp.tool()
+def initiative_update(number: int, title: str = "", description: str = "",
+                      repo_path: str = "") -> dict:
+    """Update an Initiative's title and/or description.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_update("initiative", number, title, description,
+                            repo_path)
+
+
+@mcp.tool()
+def initiative_add_children(number: int, issue_numbers: list[int],
+                            repo_path: str = "") -> dict:
+    """Attach issues (typically Projects/Epics) under an Initiative.
+
+    Returns: dict with ok, parent, added, raw, stderr.
+    """
+    return _planning_add_children("initiative", number, issue_numbers,
+                                  repo_path)
+
+
+@mcp.tool()
+def initiative_remove_children(number: int, issue_numbers: list[int],
+                               repo_path: str = "") -> dict:
+    """Detach sub-issues from an Initiative.
+
+    Returns: dict with ok, parent, removed, raw, stderr.
+    """
+    return _planning_remove_children("initiative", number, issue_numbers,
+                                     repo_path)
+
+
+@mcp.tool()
+def initiative_close(number: int, comment: str = "",
+                     repo_path: str = "") -> dict:
+    """Close an Initiative issue. DESTRUCTIVE.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_close("initiative", number, comment, repo_path)
+
+
+@mcp.tool()
+def initiative_reopen(number: int, repo_path: str = "") -> dict:
+    """Reopen a closed Initiative issue.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_reopen("initiative", number, repo_path)
+
+
+# ---- Project (level 2) ------------------------------------------------------
+
+@mcp.tool()
+def project_create(title: str, description: str = "", labels: str = "",
+                   pipeline: str = "", assignee: str = "",
+                   estimate: str = "", parent: int = 0,
+                   repo_path: str = "") -> dict:
+    """Create a Project (issue-type Project, level 2).
+
+    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
+    raw, stderr.
+    """
+    return _planning_create("project", title, description, labels, pipeline,
+                            assignee, estimate, parent, repo_path)
+
+
+@mcp.tool()
+def project_list(repo_path: str = "") -> dict:
+    """List issues of type Project. Returns ok, items, raw, stderr."""
+    return _planning_list("project", repo_path)
+
+
+@mcp.tool()
+def project_show(number: int, repo_path: str = "") -> dict:
+    """Show a Project issue + its child issues. Returns ok, number, raw."""
+    return _planning_show("project", number, repo_path)
+
+
+@mcp.tool()
+def project_update(number: int, title: str = "", description: str = "",
+                   repo_path: str = "") -> dict:
+    """Update a Project's title and/or description.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_update("project", number, title, description, repo_path)
+
+
+@mcp.tool()
+def project_add_children(number: int, issue_numbers: list[int],
+                         repo_path: str = "") -> dict:
+    """Attach issues (typically Epics) under a Project.
+
+    Returns: dict with ok, parent, added, raw, stderr.
+    """
+    return _planning_add_children("project", number, issue_numbers, repo_path)
+
+
+@mcp.tool()
+def project_remove_children(number: int, issue_numbers: list[int],
+                            repo_path: str = "") -> dict:
+    """Detach sub-issues from a Project.
+
+    Returns: dict with ok, parent, removed, raw, stderr.
+    """
+    return _planning_remove_children("project", number, issue_numbers,
+                                     repo_path)
+
+
+@mcp.tool()
+def project_close(number: int, comment: str = "",
+                  repo_path: str = "") -> dict:
+    """Close a Project issue. DESTRUCTIVE.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_close("project", number, comment, repo_path)
+
+
+@mcp.tool()
+def project_reopen(number: int, repo_path: str = "") -> dict:
+    """Reopen a closed Project issue.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_reopen("project", number, repo_path)
+
+
+# ---- Sub-task (level 5) -----------------------------------------------------
+
+@mcp.tool()
+def subtask_create(title: str, description: str = "", labels: str = "",
+                   pipeline: str = "", assignee: str = "",
+                   estimate: str = "", parent: int = 0,
+                   repo_path: str = "") -> dict:
+    """Create a Sub-task (issue-type Sub-task, level 5).
+
+    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
+    raw, stderr.
+    """
+    return _planning_create("subtask", title, description, labels, pipeline,
+                            assignee, estimate, parent, repo_path)
+
+
+@mcp.tool()
+def subtask_list(repo_path: str = "") -> dict:
+    """List issues of type Sub-task. Returns ok, items, raw, stderr."""
+    return _planning_list("subtask", repo_path)
+
+
+@mcp.tool()
+def subtask_show(number: int, repo_path: str = "") -> dict:
+    """Show a Sub-task issue + its child issues (if any).
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_show("subtask", number, repo_path)
+
+
+@mcp.tool()
+def subtask_update(number: int, title: str = "", description: str = "",
+                   repo_path: str = "") -> dict:
+    """Update a Sub-task's title and/or description.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_update("subtask", number, title, description, repo_path)
+
+
+@mcp.tool()
+def subtask_add_children(number: int, issue_numbers: list[int],
+                         repo_path: str = "") -> dict:
+    """Attach further sub-issues under a Sub-task.
+
+    Returns: dict with ok, parent, added, raw, stderr.
+    """
+    return _planning_add_children("subtask", number, issue_numbers, repo_path)
+
+
+@mcp.tool()
+def subtask_remove_children(number: int, issue_numbers: list[int],
+                            repo_path: str = "") -> dict:
+    """Detach sub-issues from a Sub-task.
+
+    Returns: dict with ok, parent, removed, raw, stderr.
+    """
+    return _planning_remove_children("subtask", number, issue_numbers,
+                                     repo_path)
+
+
+@mcp.tool()
+def subtask_close(number: int, comment: str = "",
+                  repo_path: str = "") -> dict:
+    """Close a Sub-task issue. DESTRUCTIVE.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_close("subtask", number, comment, repo_path)
+
+
+@mcp.tool()
+def subtask_reopen(number: int, repo_path: str = "") -> dict:
+    """Reopen a closed Sub-task issue.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_reopen("subtask", number, repo_path)
+
+
+# Note: *_delete is deliberately not exposed as an MCP tool for any planning
+# level. Permanently deleting an issue is irreversible; do it via
+# `zh delete <N>` directly from the CLI, which requires human deliberation.
 
 
 # =============================================================================
@@ -2041,12 +2506,16 @@ def _resolve_ctx(repo_path: str = ""):
 def subissue_list(parent_number: int, repo_path: str = "") -> dict:
     """List sub-issues of a parent issue.
 
-    Calls ZenHub's GraphQL `zenhubChildIssues` connection directly from
-    Python — no bash text contract. Walks pagination with the
-    stuck-cursor + iteration-cap defenses carried over from the bash
-    implementation. Each child dict carries its `repository.owner` and
-    `.name` so callers can spot cross-repo children that can't be
-    operated on from a single git checkout.
+    Calls ZenHub's GraphQL `githubChildIssues` connection directly from
+    Python (no bash text contract). v1.9.0 migrated all sub-issue reads
+    to githubChildIssues because that is the connection both
+    addSubIssues and CreateIssueInput.parentIssueId populate in
+    GitHub-backed workspaces (verified live, 2026-05-29);
+    zenhubChildIssues stays empty for those writes. Walks pagination
+    with the stuck-cursor + iteration-cap defenses carried over from
+    the bash implementation. Each child dict carries its
+    `repository.owner` and `.name` so callers can spot cross-repo
+    children that can't be operated on from a single git checkout.
 
     Args:
         parent_number: Issue number of the parent (positive int).
@@ -2059,7 +2528,7 @@ def subissue_list(parent_number: int, repo_path: str = "") -> dict:
             parent_number: int
             parent_title: str
             parent_state: str | None — "OPEN" / "CLOSED"
-            total_count: int — API's zenhubChildIssues.totalCount
+            total_count: int (the API's githubChildIssues.totalCount)
             fetched_count: int — how many CHILD nodes we walked
             children: list[dict] each with
                 number: int
@@ -2359,9 +2828,9 @@ def subissue_reorder(child_number: int, position: str,
     """Reorder a sub-issue among its siblings.
 
     Calls ZenHub's `reprioritizeSubIssue` mutation directly. Sibling
-    anchoring (top/bottom/after/before) is computed in Python from
-    `zenhubChildIssues` listing — same logic the bash implementation had,
-    just on the MCP side now.
+    anchoring (top/bottom/after/before) is computed in Python from the
+    `githubChildIssues` listing (the canonical sub-issue connection in
+    GitHub-backed workspaces; see subissue_list for the rationale).
 
     Positions:
       - "top" / "first"   — first sibling

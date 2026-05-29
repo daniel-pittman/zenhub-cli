@@ -67,7 +67,7 @@ def test_list_sub_issues_handles_pipe_in_title_and_check_in_state():
                 "number": 42,
                 "title": "Parent task",
                 "state": "OPEN",
-                "zenhubChildIssues": {
+                "githubChildIssues": {
                     "totalCount": 1,
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                     "nodes": [
@@ -110,7 +110,7 @@ def test_list_sub_issues_em_dash_pipeline_kept_literal():
                 "number": 42,
                 "title": "Parent",
                 "state": "OPEN",
-                "zenhubChildIssues": {
+                "githubChildIssues": {
                     "totalCount": 2,
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                     "nodes": [
@@ -157,7 +157,7 @@ def test_list_sub_issues_walks_pagination():
                     "number": 42,
                     "title": "P",
                     "state": "OPEN",
-                    "zenhubChildIssues": {
+                    "githubChildIssues": {
                         "totalCount": 3,
                         "pageInfo": {
                             "hasNextPage": has_next,
@@ -202,7 +202,7 @@ def test_list_sub_issues_stuck_cursor_breaks_walk():
                 "number": 42,
                 "title": "P",
                 "state": "OPEN",
-                "zenhubChildIssues": {
+                "githubChildIssues": {
                     "totalCount": 100,
                     "pageInfo": {
                         "hasNextPage": True,
@@ -239,7 +239,7 @@ def test_list_sub_issues_iteration_cap_belt_and_suspenders():
                     "number": 42,
                     "title": "P",
                     "state": "OPEN",
-                    "zenhubChildIssues": {
+                    "githubChildIssues": {
                         "totalCount": 1_000_000,
                         "pageInfo": {
                             "hasNextPage": True,
@@ -289,7 +289,7 @@ def test_list_sub_issues_returns_repository_per_child():
                 "number": 42,
                 "title": "P",
                 "state": "OPEN",
-                "zenhubChildIssues": {
+                "githubChildIssues": {
                     "totalCount": 2,
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                     "nodes": [
@@ -582,7 +582,7 @@ def test_reorder_sub_issue_only_child_is_noop():
                     "number": 42,
                     "title": "Parent",
                     "state": "OPEN",
-                    "zenhubChildIssues": {
+                    "githubChildIssues": {
                         "totalCount": 1,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                         "nodes": [
@@ -662,7 +662,7 @@ def test_reorder_sub_issue_top_crosses_repos_via_id_anchor():
                     "number": 42,
                     "title": "Parent",
                     "state": "OPEN",
-                    "zenhubChildIssues": {
+                    "githubChildIssues": {
                         "totalCount": 2,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                         "nodes": [
@@ -732,7 +732,7 @@ def test_reorder_sub_issue_refuses_when_both_anchors_null():
                     "number": 42,
                     "title": "Parent",
                     "state": "OPEN",
-                    "zenhubChildIssues": {
+                    "githubChildIssues": {
                         "totalCount": 2,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
                         "nodes": [
@@ -1641,7 +1641,7 @@ def test_list_sub_issues_returns_id_for_each_child():
                 "number": 42,
                 "title": "Parent",
                 "state": "OPEN",
-                "zenhubChildIssues": {
+                "githubChildIssues": {
                     "totalCount": 1,
                     "pageInfo": {"hasNextPage": False, "endCursor": None},
                     "nodes": [
@@ -1664,3 +1664,137 @@ def test_list_sub_issues_returns_id_for_each_child():
     with _patch_ctx_query(ctx, [response]):
         out = zh_graphql_ops.list_sub_issues(ctx, 42)
     assert out["children"][0]["id"] == "issue-gid-99"
+
+
+# ===========================================================================
+# Divergence regression pin (v1.9.0 PR #23 root cause).
+#
+# Verified live against a GitHub-backed workspace (2026-05-29): both
+# addSubIssues and CreateIssueInput.parentIssueId populate the
+# githubChildIssues connection; zenhubChildIssues stays empty for those
+# writes. v1.9.0 migrated every reader (cmd_subissue_list, cmd_hierarchy_show,
+# cmd_issue, the bash walkers, and list_sub_issues here) to read
+# githubChildIssues so that an issue wired via either of those writes shows
+# up on subsequent reads.
+#
+# The test below stubs the SAME response shape the live workspace returns
+# after `addSubIssues parent=42 children=[100]`: githubChildIssues has the
+# child, zenhubChildIssues would be {totalCount: 0, nodes: []}. If a future
+# refactor relapses to reading zenhubChildIssues, the parent/child round
+# trip silently shows zero children and this test will catch it.
+# ===========================================================================
+
+
+def test_list_sub_issues_reads_github_child_issues_not_zenhub():
+    """Regression pin: list_sub_issues must read githubChildIssues, which is
+    the connection both addSubIssues and parentIssueId populate in
+    GitHub-backed workspaces. A test that fed `zenhubChildIssues` instead
+    would pass (because the API field name is just the dict key), so we
+    feed BOTH connections in the stub: zenhubChildIssues holds a decoy
+    record, githubChildIssues holds the real one. A correct reader picks
+    the real one; a regressed reader would return the decoy.
+    """
+    ctx = _ctx("acme/widgets")
+    response = {
+        "data": {
+            "issueByInfo": {
+                "number": 42,
+                "title": "Parent epic",
+                "state": "OPEN",
+                # Decoy: a relapse to zenhubChildIssues would surface
+                # this child instead of the real one.
+                "zenhubChildIssues": {
+                    "totalCount": 1,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {
+                            "id": "issue-gid-decoy",
+                            "number": 9999,
+                            "title": "DECOY: should not be returned",
+                            "state": "OPEN",
+                            "assignees": {"nodes": []},
+                            "pipelineIssue": None,
+                            "repository": {
+                                "ownerName": "acme", "name": "widgets",
+                            },
+                        }
+                    ],
+                },
+                # The real child wired via addSubIssues.
+                "githubChildIssues": {
+                    "totalCount": 1,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {
+                            "id": "issue-gid-100",
+                            "number": 100,
+                            "title": "Real sub-issue",
+                            "state": "OPEN",
+                            "assignees": {"nodes": [{"login": "alice"}]},
+                            "pipelineIssue": {
+                                "pipeline": {"name": "Product Backlog"},
+                            },
+                            "repository": {
+                                "ownerName": "acme", "name": "widgets",
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    with _patch_ctx_query(ctx, [response]):
+        out = zh_graphql_ops.list_sub_issues(ctx, 42)
+    assert out["ok"] is True
+    assert out["total_count"] == 1
+    assert out["fetched_count"] == 1
+    assert len(out["children"]) == 1
+    child = out["children"][0]
+    assert child["number"] == 100, (
+        "list_sub_issues should read githubChildIssues (the connection "
+        "populated by addSubIssues + parentIssueId in GitHub-backed "
+        f"workspaces), not zenhubChildIssues. Got #{child['number']}; "
+        "a #9999 here would indicate a relapse to zenhubChildIssues."
+    )
+    assert child["title"] == "Real sub-issue"
+    assert child["pipeline"] == "Product Backlog"
+
+
+def test_list_sub_issues_zero_children_when_github_connection_empty():
+    """Symmetric pin: if githubChildIssues is empty, list_sub_issues
+    reports zero children even when zenhubChildIssues has a decoy. This
+    catches the inverse relapse where a future change adds a fallback to
+    zenhubChildIssues "just in case".
+    """
+    ctx = _ctx("acme/widgets")
+    response = {
+        "data": {
+            "issueByInfo": {
+                "number": 42,
+                "title": "Parent epic",
+                "state": "OPEN",
+                "zenhubChildIssues": {
+                    "totalCount": 5,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {"id": "x", "number": n, "title": f"decoy-{n}",
+                         "state": "OPEN", "assignees": {"nodes": []},
+                         "pipelineIssue": None,
+                         "repository": {"ownerName": "acme", "name": "widgets"}}
+                        for n in (1, 2, 3, 4, 5)
+                    ],
+                },
+                "githubChildIssues": {
+                    "totalCount": 0,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [],
+                },
+            }
+        }
+    }
+    with _patch_ctx_query(ctx, [response]):
+        out = zh_graphql_ops.list_sub_issues(ctx, 42)
+    assert out["ok"] is True
+    assert out["total_count"] == 0
+    assert out["fetched_count"] == 0
+    assert out["children"] == []

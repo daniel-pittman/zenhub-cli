@@ -423,43 +423,46 @@ def test_parse_pipeline_listing_title_with_hash_pipe_pattern():
 
 
 # -----------------------------------------------------------------------------
-# _parse_new_issue_number / _parse_new_epic_number — round-4 #3.
-# Anchor on the ✓ success marker so an adversarial title containing
-# `Created issue #NN` (or the preceding `Info: Creating issue: ...`
-# line) doesn't trick the parser into returning the wrong number.
+# _parse_create_json (v1.9.0 G2). `zh create --json` emits a single JSON
+# object on stdout (human chatter goes to stderr). The MCP create_issue /
+# planning *_create tools parse the new number from this object rather than
+# scraping a colorized success line. The v1.5-era `_parse_new_issue_number` /
+# `_parse_new_epic_number` helpers were retired with the migration and the
+# tests pinning them deleted alongside.
 # -----------------------------------------------------------------------------
 
 
-def test_parse_new_issue_number_returns_the_success_line_number():
+def test_parse_create_json_pure_object():
     stdout = (
-        "Info: Creating issue: Bug: Created issue #99 has wrong fix...\n"
-        "✓ Created issue #42: Bug: Created issue #99 has wrong fix\n"
+        '{"number": 42, "url": "https://github.com/o/r/issues/42", '
+        '"title": "Auth service", "type": "Epic", "pipeline": null, '
+        '"estimate": null, "parent": null}\n'
     )
-    assert mcp_server._parse_new_issue_number(stdout) == 42
+    obj = mcp_server._parse_create_json(stdout)
+    assert obj is not None
+    assert obj["number"] == 42
+    assert obj["type"] == "Epic"
+    assert obj["url"].endswith("/42")
 
 
-def test_parse_new_issue_number_returns_none_without_success_line():
-    # No ✓ line means the create command never reported success — must
-    # return None, not whatever number the Info line echoed from the
-    # user's title.
-    stdout = (
-        "Info: Creating issue: Bug: Created issue #99 has wrong fix...\n"
-        "Error: GraphQL mutation failed\n"
-    )
-    assert mcp_server._parse_new_issue_number(stdout) is None
+def test_parse_create_json_with_leading_noise():
+    # Defensive: a wrapper prepends a stray line. We still find the object.
+    stdout = 'stray prefix line\n{"number": 7, "type": "Feature"}\n'
+    obj = mcp_server._parse_create_json(stdout)
+    assert obj is not None
+    assert obj["number"] == 7
+    assert obj["type"] == "Feature"
 
 
-def test_parse_new_epic_number_returns_the_success_line_number():
-    stdout = (
-        "Info: Creating epic: Bug: see Created epic #99 for context...\n"
-        "✓ Created epic #42: Bug: see Created epic #99 for context\n"
-    )
-    assert mcp_server._parse_new_epic_number(stdout) == 42
+def test_parse_create_json_returns_none_on_no_json():
+    assert mcp_server._parse_create_json("Error: type not found\n") is None
+    assert mcp_server._parse_create_json("") is None
 
 
-def test_parse_new_epic_number_returns_none_without_success_line():
-    stdout = "Error: epic creation failed; see Created epic #99 in audit\n"
-    assert mcp_server._parse_new_epic_number(stdout) is None
+def test_parse_create_json_ignores_non_object_json():
+    # A bare JSON array / scalar is not a create object.
+    assert mcp_server._parse_create_json("[1, 2, 3]") is None
+    assert mcp_server._parse_create_json("42") is None
 
 
 # -----------------------------------------------------------------------------
@@ -929,3 +932,168 @@ def test_similarity_exc_to_stderr_passthrough_for_other_errors():
     msg = mcp_server._similarity_exc_to_stderr(ValueError("bad query"))
     assert msg == "bad query"
     assert "rm -rf" not in msg
+
+
+# ---------------------------------------------------------------------------
+# v1.9.0 round-3 MCP fixes (PR #23 findings #1, #3, #4, #11).
+# ---------------------------------------------------------------------------
+
+
+def test_with_epic_number_alias_promotes_number():
+    """epic_* responses returning `number` carry an `epic_number` alias for
+    v1.8.x back-compat (review finding #1).
+    """
+    d = mcp_server._with_epic_number_alias(
+        {"ok": True, "number": 42, "url": "u"}
+    )
+    assert d["epic_number"] == 42
+    assert d["number"] == 42
+    assert d["url"] == "u"
+
+
+def test_with_epic_number_alias_promotes_parent():
+    """epic_add_children / epic_remove_children return `parent`, so the
+    alias falls back to that (the epic IS the parent in those responses).
+    """
+    d = mcp_server._with_epic_number_alias(
+        {"ok": True, "parent": 100, "added": [1]}
+    )
+    assert d["epic_number"] == 100
+    assert d["parent"] == 100
+
+
+def test_with_epic_number_alias_respects_explicit_value():
+    """An explicit `epic_number` already present is not overwritten."""
+    d = mcp_server._with_epic_number_alias(
+        {"number": 1, "epic_number": 999}
+    )
+    assert d["epic_number"] == 999
+
+
+def test_with_epic_number_alias_handles_missing_identifier():
+    """Error returns (no `number` / `parent`) gain no alias."""
+    d = mcp_server._with_epic_number_alias({"ok": False, "stderr": "oops"})
+    assert "epic_number" not in d
+
+
+def test_planning_create_forwards_new_kwargs(monkeypatch):
+    """_planning_create must pass assignee / estimate / parent as `-a`,
+    `-e`, `--parent` to the bash side. Review finding #3.
+    """
+    captured = {}
+
+    def fake_run_zh(args, cwd=None):
+        captured["args"] = list(args)
+        return {
+            "ok": True,
+            "stdout_plain": (
+                '{"number": 42, "url": "https://example/42",'
+                ' "title": "T", "type": "Epic",'
+                ' "pipeline": "Backlog", "estimate": 5, "parent": 100}'
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server._planning_create(
+        "epic", "T", "body", "label1,label2", "Backlog",
+        "alice", "5", 100, "",
+    )
+    assert out["ok"] is True
+    args = captured["args"]
+    assert args[:4] == ["epic", "create", "T", "--json"]
+    assert "-d" in args and "body" in args
+    assert "-l" in args and "label1,label2" in args
+    assert "-p" in args and "Backlog" in args
+    assert "-a" in args and "alice" in args
+    assert "-e" in args and "5" in args
+    assert "--parent" in args and "100" in args
+
+
+def test_planning_create_omits_unset_kwargs(monkeypatch):
+    """Empty / zero kwargs should not appear in the argv so a caller
+    passing assignee="" does not end up with a stray `-a ""`.
+    """
+    captured = {}
+
+    def fake_run_zh(args, cwd=None):
+        captured["args"] = list(args)
+        return {
+            "ok": True,
+            "stdout_plain": '{"number": 1}',
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    mcp_server._planning_create(
+        "epic", "T", "", "", "", "", "", 0, "",
+    )
+    args = captured["args"]
+    assert "-a" not in args and "-e" not in args
+    assert "--parent" not in args
+    assert "-d" not in args and "-l" not in args and "-p" not in args
+
+
+def test_planning_create_forwards_pipeline_and_parent_in_response(monkeypatch):
+    """_planning_create's return shape includes `pipeline` and `parent`
+    parsed from the JSON instead of dropping them. Review finding #4.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": (
+                '{"number": 42, "url": "u", "title": "T", "type": "Epic",'
+                ' "pipeline": "Backlog", "estimate": 5, "parent": 100}'
+            ),
+            "stderr": "",
+        },
+    )
+    out = mcp_server._planning_create(
+        "epic", "T", "", "", "Backlog", "", "", 100, "",
+    )
+    assert out["number"] == 42
+    assert out["pipeline"] == "Backlog"
+    assert out["parent"] == 100
+    assert out["estimate"] == 5
+    assert out["type"] == "Epic"
+
+
+def test_epic_list_returns_both_items_and_epics(monkeypatch):
+    """epic_list exposes the new noun-neutral `items` key AND a
+    back-compat `epics` alias. Review finding #11.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": (
+                "  #42  OPEN    Auth redesign\n"
+                "  #99  CLOSED  Old auth\n"
+            ),
+            "stderr": "",
+        },
+    )
+    out = mcp_server.epic_list("")
+    assert "items" in out and "epics" in out
+    assert out["items"] == out["epics"]
+    nums = {x["number"] for x in out["items"]}
+    assert nums == {42, 99}
+
+
+def test_planning_list_returns_items_only(monkeypatch):
+    """Non-epic _planning_list (initiative/project/subtask) returns
+    `items` WITHOUT the `epics` alias. Confirms the alias is
+    epic_list-specific.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": "  #1  OPEN  An initiative\n",
+            "stderr": "",
+        },
+    )
+    out = mcp_server._planning_list("initiative", "")
+    assert "items" in out
+    assert "epics" not in out
