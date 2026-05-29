@@ -1109,7 +1109,15 @@ Example: zh issue 42"
         echo -e "  ${CYAN}Parent:${NC}    #${parent_num} ${parent_title}"
     fi
     if [[ "$child_count" -gt 0 ]]; then
-        echo -e "  ${CYAN}Children:${NC}  ${child_count} (see 'zh epic show ${issue_num}')"
+        # Noun-neutral pointer plus a noun-specific one when we can: the
+        # issue's actual type drives the second hint, so 'zh project show'
+        # gets pointed at 'zh project show' rather than the hardcoded 'zh
+        # epic show' the v1.9.0 first cut used (review finding round-3 #9).
+        if [[ -n "$type_name" ]]; then
+            echo -e "  ${CYAN}Children:${NC}  ${child_count} (see 'zh subissue list ${issue_num}' or 'zh $(to_lower "$type_name") show ${issue_num}')"
+        else
+            echo -e "  ${CYAN}Children:${NC}  ${child_count} (see 'zh subissue list ${issue_num}')"
+        fi
     fi
     echo -e "  ${CYAN}ZenHub:${NC}    ${zh_url}"
     echo -e "  ${CYAN}GitHub:${NC}    ${gh_url}"
@@ -2232,7 +2240,8 @@ just an issue, so this deletes sub-issues as well.
 
 DANGER: This is permanent, cannot be undone, and requires admin or triage
 permission on the repository. For the normal case use 'zh close <issue#>'
-instead. To delete an epic, use 'zh epic delete <epic#>'.
+instead. Epics are normal issues in v1.9.0, so this command deletes them
+too: 'zh delete <epic-issue#>'.
 
 When run from an interactive terminal you'll be asked to retype the issue
 number to confirm; pass -y/--yes to skip the prompt (also implied for
@@ -3321,6 +3330,15 @@ cmd_hierarchy_create() {
                 passthrough+=("-b" "$2")
                 shift 2
                 ;;
+            -t|--type)
+                # The noun IS the type. Accepting a user-supplied -t and
+                # appending our own at the tail would silently drop the
+                # user's value (cmd_create's parser is last-wins), so
+                # `zh epic create "X" -t Bug` would create an Epic with
+                # the user's intent lost. Reject up-front. Review finding
+                # round-3 #2.
+                error "-t conflicts with the noun type ${type_name}. Do not pass -t to 'zh $(to_lower "$type_name") create'; use 'zh create -t <type>' for an explicit type or 'zh type <issue#> <name>' to retype after create."
+                ;;
             *)
                 passthrough+=("$1")
                 shift
@@ -3469,7 +3487,10 @@ cmd_hierarchy_show() {
     if [[ -n "$body" ]] && [[ "$body" != "null" ]]; then
         echo -e "${BOLD}Body:${NC}"
         echo ""
-        echo "$body" | sed 's/^/  /'
+        # printf, not echo, so a body whose first line starts with -e /
+        # -n / -E is not interpreted as a flag by the bash builtin and
+        # rendered blank. Review finding round-3 #6.
+        printf '%s\n' "$body" | sed 's/^/  /'
         echo ""
     fi
 
@@ -3497,6 +3518,16 @@ cmd_hierarchy_show() {
                 "$num" "${pipeline:0:18}" "${assignees:0:15}" "$marker" "$ititle"
         done
     echo ""
+
+    # Coverage warning (review finding round-3 #7). The query caps at
+    # first: 100; if the total exceeds the rendered set, say so
+    # explicitly so a planner counting open children does not close an
+    # epic prematurely. Symmetric with cmd_hierarchy_list's warn.
+    local fetched
+    fetched=$(echo "$response" | jq -r '.data.issueByInfo.githubChildIssues.nodes | length')
+    if [[ "$child_count" -gt "$fetched" ]]; then
+        warn "Showing first ${fetched} of ${child_count} children (the query caps at 100; remaining are not displayed). Use 'zh subissue list ${issue_num}' for the full set."
+    fi
 }
 
 # Dispatch a planning-noun subcommand. Create/list/show are noun-specific;
@@ -3527,6 +3558,13 @@ cmd_hierarchy_dispatch() {
             cmd_hierarchy_create "$type_name" "$@"
             ;;
         list|ls)
+            # Reject stray positionals so a user reaching for
+            # 'zh epic list 42' (expecting a sub-issue listing for #42)
+            # gets a clear redirect instead of having the 42 silently
+            # discarded. Review finding round-3 #10.
+            if [[ $# -gt 0 ]]; then
+                error "zh ${lower} list takes no arguments (got ${#} extra: $*). Did you mean 'zh subissue list <parent#>' to see the children of an issue, or 'zh ${lower} show <issue#>' to view a single ${type_name} issue?"
+            fi
             cmd_hierarchy_list "$type_name"
             ;;
         show|view)

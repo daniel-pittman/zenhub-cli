@@ -686,3 +686,188 @@ def test_list_truncation_silent_when_empty() -> None:
     r = _list_truncation("0", "0")
     assert r.returncode == 0
     assert r.stdout.strip() == "OK"
+
+
+# ===========================================================================
+# v1.9.0 round-3 review fixes (PR #23 findings #2, #6, #7, #10).
+# Each snippet mirrors the single guard added in `zh` so a future change
+# that loosens or drops the guard fails a test instead of silently shipping.
+# ===========================================================================
+
+
+# Mirrors cmd_hierarchy_create's -t / --type rejection arm. Round-3 #2.
+_NOUN_DASH_T_REJECTION_SNIPPET = r"""
+set -euo pipefail
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--description)
+            if [[ $# -lt 2 ]]; then echo "ARITY_ERROR"; exit 1; fi
+            passthrough+=("-b" "$2"); shift 2 ;;
+        -t|--type)
+            echo "T_REJECTED"
+            exit 1 ;;
+        *)
+            passthrough+=("$1"); shift ;;
+    esac
+done
+echo "OK:${passthrough[*]:-}"
+"""
+
+
+def _noun_dash_t(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _NOUN_DASH_T_REJECTION_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_noun_create_rejects_user_supplied_dash_t() -> None:
+    """`zh epic create "X" -t Bug` is rejected up-front, because the noun
+    IS the type. Last-wins behavior in cmd_create's parser would otherwise
+    silently discard the user's -t Bug and create an Epic; any agent or
+    human typing -t in this context would get the wrong type.
+    """
+    r = _noun_dash_t("Title", "-t", "Bug")
+    assert r.returncode == 1
+    assert r.stdout.strip() == "T_REJECTED"
+
+
+def test_noun_create_rejects_long_form_dash_dash_type() -> None:
+    """Same for the long form --type."""
+    r = _noun_dash_t("Title", "--type", "Feature")
+    assert r.returncode == 1
+    assert r.stdout.strip() == "T_REJECTED"
+
+
+def test_noun_create_accepts_dash_d_unchanged() -> None:
+    """The -t rejection doesn't break the existing -d translation."""
+    r = _noun_dash_t("Title", "-d", "the body")
+    assert r.returncode == 0
+    out = r.stdout.strip()
+    assert out.startswith("OK:")
+    assert "-b" in out and "the body" in out
+
+
+# Mirrors cmd_hierarchy_show's body printf. Round-3 #6. `echo "$body"`
+# would treat a body starting with -e/-n/-E as flags and either silently
+# drop the line or interpret \n as a literal newline. `printf '%s\n'`
+# is flag-immune.
+_BODY_PRINTF_SNIPPET = r"""
+set -euo pipefail
+body="$1"
+printf '%s\n' "$body" | sed 's/^/  /'
+"""
+
+
+def _body_printf(body: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _BODY_PRINTF_SNIPPET, "_", body],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_show_body_prints_flag_starting_body_literally() -> None:
+    """A body starting with `-e` round-trips as text, not as an echo
+    flag. The old `echo "$body"` rendered this empty.
+    """
+    r = _body_printf("-e first line\nsecond line")
+    assert r.returncode == 0
+    assert r.stdout == "  -e first line\n  second line\n"
+
+
+def test_show_body_prints_dash_n_starting_body() -> None:
+    """`-n` is the bash echo "suppress newline" flag. printf is immune."""
+    r = _body_printf("-n raw text")
+    assert r.returncode == 0
+    assert r.stdout == "  -n raw text\n"
+
+
+def test_show_body_prints_dash_capital_e_starting_body() -> None:
+    """`-E` (disable escape interpretation) is also an echo flag."""
+    r = _body_printf("-E literal $ backslash content")
+    assert r.returncode == 0
+    assert r.stdout == "  -E literal $ backslash content\n"
+
+
+# Mirrors cmd_hierarchy_show's child-truncation warn. Round-3 #7.
+# Symmetric with cmd_hierarchy_list's gate, against the per-child query
+# instead of the per-noun query.
+_SHOW_TRUNCATION_SNIPPET = r"""
+set -euo pipefail
+child_count="$1"; fetched="$2"
+if [[ "$child_count" -gt "$fetched" ]]; then
+    echo "WARN:${fetched}/${child_count}"
+else
+    echo "OK"
+fi
+"""
+
+
+def _show_truncation(child_count: str, fetched: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _SHOW_TRUNCATION_SNIPPET, "_", child_count, fetched],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_show_truncation_warns_when_children_exceed_fetched() -> None:
+    """Epic with 120 sub-issues, query capped at 100, surfaces a warning
+    so a planner counting open children does not close the epic
+    prematurely.
+    """
+    r = _show_truncation("120", "100")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "WARN:100/120"
+
+
+def test_show_truncation_silent_when_under_cap() -> None:
+    """A normal-sized epic (fewer than 100 children) shows no warning."""
+    r = _show_truncation("5", "5")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+# Mirrors cmd_hierarchy_dispatch's `list` arm reject-stray-arg gate.
+# Round-3 #10.
+_NOUN_LIST_REJECT_STRAY_SNIPPET = r"""
+set -euo pipefail
+type_name="$1"
+shift
+if [[ $# -gt 0 ]]; then
+    echo "REJECT:${#}:${*}"
+    exit 1
+fi
+echo "OK"
+"""
+
+
+def _noun_list_reject_stray(type_name, *args):
+    return subprocess.run(
+        ["bash", "-c", _NOUN_LIST_REJECT_STRAY_SNIPPET, "_", type_name, *args],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_noun_list_rejects_stray_positional() -> None:
+    """`zh epic list 42` errors clearly instead of silently listing the
+    full Epic workspace and discarding the 42 (which a user trained on
+    `zh subissue list <parent#>` reasonably expects to filter).
+    """
+    r = _noun_list_reject_stray("Epic", "42")
+    assert r.returncode == 1
+    assert r.stdout.startswith("REJECT:1:42")
+
+
+def test_noun_list_no_args_passes() -> None:
+    """The well-formed `zh epic list` continues to work."""
+    r = _noun_list_reject_stray("Epic")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+def test_noun_list_rejects_multiple_stray() -> None:
+    """Multiple stray args are also rejected, with the count surfaced."""
+    r = _noun_list_reject_stray("Project", "42", "43", "44")
+    assert r.returncode == 1
+    assert r.stdout.startswith("REJECT:3:42 43 44")

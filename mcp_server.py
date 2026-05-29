@@ -1278,29 +1278,23 @@ def epic_list(repo_path: str = "") -> dict:
     every such issue. The `number` is an ordinary GitHub issue number with
     a normal issue URL (the old ZenhubEpic id concept is gone).
 
+    v1.9.0 delegates to the generic `_planning_list` so initiative_list /
+    project_list / subtask_list all behave identically. The response
+    exposes BOTH the new noun-neutral `items` key AND a back-compat
+    `epics` alias (deprecated) for callers pinned to the v1.8.x shape.
+
     Args:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, epics (list of {number, state, title}), raw, stderr.
+        dict with: ok, items (list of {number, state, title}),
+        epics (back-compat alias for items, deprecated), raw, stderr.
     """
-    r = _run_zh(["epic", "list"], cwd=_resolve_cwd(repo_path))
-    epics = []
-    if r["ok"]:
-        for line in r["stdout_plain"].splitlines():
-            m = re.match(r"^\s*#(\d+)\s+(OPEN|CLOSED)\s+(.+?)\s*$", line)
-            if m:
-                epics.append({
-                    "number": int(m.group(1)),
-                    "state": m.group(2),
-                    "title": m.group(3).strip(),
-                })
-    return {
-        "ok": r["ok"],
-        "epics": epics,
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    result = _planning_list("epic", repo_path)
+    # Back-compat alias: every other planning noun returns `items`; v1.8.x
+    # callers of epic_list read `epics`. Carry both.
+    result["epics"] = result.get("items", [])
+    return result
 
 
 @mcp.tool()
@@ -1969,10 +1963,20 @@ def block_issue(blocked: int, blocking: int, repo_path: str = "") -> dict:
 
 
 def _planning_create(noun: str, title: str, description: str, labels: str,
-                     pipeline: str, repo_path: str) -> dict:
-    """Shared `zh <noun> create --json` wrapper for the planning nouns."""
+                     pipeline: str, assignee: str, estimate: str,
+                     parent: int, repo_path: str) -> dict:
+    """Shared `zh <noun> create --json` wrapper for the planning nouns.
+
+    Forwards every meaningful create-time flag the bash side exposes:
+    description, labels, pipeline, assignee, estimate, parent. The
+    duplicate-check pre-flight that `create_issue` runs is deliberately
+    NOT applied here (deferred to v1.9.1): planning nouns get created
+    rarely and per-noun similarity tuning is its own work item.
+    """
     if not title.strip():
-        return {"ok": False, "stderr": "title must be non-empty", "number": None}
+        return {"ok": False, "stderr": "title must be non-empty",
+                "number": None, "url": None, "type": None,
+                "pipeline": None, "parent": None, "estimate": None}
     args = [noun, "create", title, "--json"]
     if description:
         args.extend(["-d", description])
@@ -1980,6 +1984,12 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         args.extend(["-l", labels])
     if pipeline:
         args.extend(["-p", pipeline])
+    if assignee:
+        args.extend(["-a", assignee])
+    if estimate:
+        args.extend(["-e", estimate])
+    if parent and parent > 0:
+        args.extend(["--parent", str(parent)])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     return {
@@ -1987,6 +1997,9 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         "number": created.get("number") if created else None,
         "url": created.get("url") if created else None,
         "type": created.get("type") if created else None,
+        "pipeline": created.get("pipeline") if created else None,
+        "parent": created.get("parent") if created else None,
+        "estimate": created.get("estimate") if created else None,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -2075,28 +2088,83 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
     }
 
 
+def _planning_close(noun: str, number: int, comment: str,
+                    repo_path: str) -> dict:
+    args = [noun, "close", str(number)]
+    if comment:
+        args.append(comment)
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "number": number,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+def _planning_reopen(noun: str, number: int, repo_path: str) -> dict:
+    r = _run_zh([noun, "reopen", str(number)], cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "number": number,
+        "raw": r["stdout_plain"],
+        "stderr": r["stderr"],
+    }
+
+
+def _with_epic_number_alias(d: dict) -> dict:
+    """Add an `epic_number` alias to an epic_* tool response (review #1).
+
+    Pre-v1.9.0 the `epic_*` MCP tools returned `epic_number` in their dict;
+    the rewrite to the generic `_planning_*` helpers uses `number` / `parent`
+    instead. To avoid silently breaking agents pinned to the v1.8.x contract,
+    every epic_* response carries an `epic_number` alias mirroring whichever
+    of `number` or `parent` is the epic's identifier in that shape. Tool
+    docstrings note the alias is for back-compat and may be removed in a
+    future major release.
+    """
+    if "number" in d and "epic_number" not in d:
+        d["epic_number"] = d.get("number")
+    elif "parent" in d and "epic_number" not in d:
+        d["epic_number"] = d.get("parent")
+    return d
+
+
 # ---- Epic (the headline noun; backward-compatible tool names) ---------------
+#
+# Every epic_* tool returns the new generic shape plus an `epic_number` alias
+# for back-compat with v1.8.x callers (see _with_epic_number_alias).
 
 @mcp.tool()
 def epic_create(title: str, description: str = "", labels: str = "",
-                pipeline: str = "", repo_path: str = "") -> dict:
+                pipeline: str = "", assignee: str = "", estimate: str = "",
+                parent: int = 0, repo_path: str = "") -> dict:
     """Create an Epic (an issue with issue-type Epic).
 
     v1.9.0: an epic is a normal issue typed Epic, with a normal issue
-    number and URL (the ZenhubEpic id concept is gone).
+    number and URL (the ZenhubEpic id concept is gone). Every `zh create`
+    flag is forwarded; the duplicate-check pre-flight that `create_issue`
+    runs is deferred to v1.9.1 (track via list_priorities-style follow-up).
 
     Args:
         title: Epic title (required, non-empty).
         description: Optional epic body / description.
         labels: Optional comma-separated label names.
         pipeline: Optional target pipeline.
+        assignee: Optional GitHub username to assign at create time.
+        estimate: Optional story-point estimate (numeric string).
+        parent: Optional parent issue number; the new epic is wired as a
+            sub-issue of that parent via addSubIssues.
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, url, type, raw, stderr.
+        dict with: ok, number, epic_number (back-compat alias for number),
+        url, type, pipeline, parent, estimate, raw, stderr.
     """
-    return _planning_create("epic", title, description, labels, pipeline,
-                            repo_path)
+    return _with_epic_number_alias(_planning_create(
+        "epic", title, description, labels, pipeline,
+        assignee, estimate, parent, repo_path,
+    ))
 
 
 @mcp.tool()
@@ -2106,16 +2174,11 @@ def epic_update(epic_number: int, title: str = "", description: str = "",
 
     At least one of `title` or `description` must be provided.
 
-    Args:
-        epic_number: Issue number of the Epic-typed issue.
-        title: New title (optional).
-        description: New body / description (optional).
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, number, raw, stderr.
+    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
     """
-    return _planning_update("epic", epic_number, title, description, repo_path)
+    return _with_epic_number_alias(_planning_update(
+        "epic", epic_number, title, description, repo_path,
+    ))
 
 
 @mcp.tool()
@@ -2123,15 +2186,12 @@ def epic_add_children(epic_number: int, issue_numbers: list[int],
                       repo_path: str = "") -> dict:
     """Attach one or more issues as sub-issues of an epic (addSubIssues).
 
-    Args:
-        epic_number: Issue number of the Epic-typed issue.
-        issue_numbers: Child issue numbers to attach (single API call).
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, parent, added (list of issue numbers), raw, stderr.
+    Returns: dict with ok, parent, epic_number (back-compat alias for
+    parent), added (list of issue numbers), raw, stderr.
     """
-    return _planning_add_children("epic", epic_number, issue_numbers, repo_path)
+    return _with_epic_number_alias(_planning_add_children(
+        "epic", epic_number, issue_numbers, repo_path,
+    ))
 
 
 @mcp.tool()
@@ -2139,16 +2199,12 @@ def epic_remove_children(epic_number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Detach one or more sub-issues from an epic (removeSubIssues).
 
-    Args:
-        epic_number: Issue number of the Epic-typed issue.
-        issue_numbers: Child issue numbers to detach.
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, parent, removed (list of issue numbers), raw, stderr.
+    Returns: dict with ok, parent, epic_number (back-compat alias for
+    parent), removed (list of issue numbers), raw, stderr.
     """
-    return _planning_remove_children("epic", epic_number, issue_numbers,
-                                     repo_path)
+    return _with_epic_number_alias(_planning_remove_children(
+        "epic", epic_number, issue_numbers, repo_path,
+    ))
 
 
 @mcp.tool()
@@ -2157,58 +2213,42 @@ def epic_close(epic_number: int, comment: str = "", repo_path: str = "") -> dict
 
     DESTRUCTIVE: affects board visibility and notifies watchers. Pre-confirm.
 
-    Args:
-        epic_number: Issue number of the Epic-typed issue.
-        comment: Optional closing comment.
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, number, raw, stderr.
+    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
     """
-    args = ["epic", "close", str(epic_number)]
-    if comment:
-        args.append(comment)
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
-    return {
-        "ok": r["ok"],
-        "number": epic_number,
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    return _with_epic_number_alias(_planning_close(
+        "epic", epic_number, comment, repo_path,
+    ))
 
 
 @mcp.tool()
 def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
     """Reopen a closed epic issue.
 
-    Args:
-        epic_number: Issue number of the Epic-typed issue.
-        repo_path: Optional absolute path of a git checkout to run zh from.
-
-    Returns:
-        dict with: ok, number, raw, stderr.
+    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
     """
-    r = _run_zh(["epic", "reopen", str(epic_number)],
-                cwd=_resolve_cwd(repo_path))
-    return {
-        "ok": r["ok"],
-        "number": epic_number,
-        "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
-    }
+    return _with_epic_number_alias(_planning_reopen(
+        "epic", epic_number, repo_path,
+    ))
 
 
 # ---- Initiative (level 1) ---------------------------------------------------
+#
+# Full surface (8 tools) parallel to epic_*. Each delegates to the same
+# generic _planning_* helper, so adding behavior in one place updates every
+# noun.
 
 @mcp.tool()
 def initiative_create(title: str, description: str = "", labels: str = "",
-                      pipeline: str = "", repo_path: str = "") -> dict:
-    """Create an Initiative (an issue with issue-type Initiative, level 1).
+                      pipeline: str = "", assignee: str = "",
+                      estimate: str = "", parent: int = 0,
+                      repo_path: str = "") -> dict:
+    """Create an Initiative (issue-type Initiative, level 1).
 
-    Returns: dict with ok, number, url, type, raw, stderr.
+    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
+    raw, stderr.
     """
     return _planning_create("initiative", title, description, labels,
-                            pipeline, repo_path)
+                            pipeline, assignee, estimate, parent, repo_path)
 
 
 @mcp.tool()
@@ -2224,6 +2264,17 @@ def initiative_show(number: int, repo_path: str = "") -> dict:
 
 
 @mcp.tool()
+def initiative_update(number: int, title: str = "", description: str = "",
+                      repo_path: str = "") -> dict:
+    """Update an Initiative's title and/or description.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_update("initiative", number, title, description,
+                            repo_path)
+
+
+@mcp.tool()
 def initiative_add_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Attach issues (typically Projects/Epics) under an Initiative.
@@ -2234,17 +2285,50 @@ def initiative_add_children(number: int, issue_numbers: list[int],
                                   repo_path)
 
 
+@mcp.tool()
+def initiative_remove_children(number: int, issue_numbers: list[int],
+                               repo_path: str = "") -> dict:
+    """Detach sub-issues from an Initiative.
+
+    Returns: dict with ok, parent, removed, raw, stderr.
+    """
+    return _planning_remove_children("initiative", number, issue_numbers,
+                                     repo_path)
+
+
+@mcp.tool()
+def initiative_close(number: int, comment: str = "",
+                     repo_path: str = "") -> dict:
+    """Close an Initiative issue. DESTRUCTIVE.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_close("initiative", number, comment, repo_path)
+
+
+@mcp.tool()
+def initiative_reopen(number: int, repo_path: str = "") -> dict:
+    """Reopen a closed Initiative issue.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_reopen("initiative", number, repo_path)
+
+
 # ---- Project (level 2) ------------------------------------------------------
 
 @mcp.tool()
 def project_create(title: str, description: str = "", labels: str = "",
-                   pipeline: str = "", repo_path: str = "") -> dict:
-    """Create a Project (an issue with issue-type Project, level 2).
+                   pipeline: str = "", assignee: str = "",
+                   estimate: str = "", parent: int = 0,
+                   repo_path: str = "") -> dict:
+    """Create a Project (issue-type Project, level 2).
 
-    Returns: dict with ok, number, url, type, raw, stderr.
+    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
+    raw, stderr.
     """
     return _planning_create("project", title, description, labels, pipeline,
-                            repo_path)
+                            assignee, estimate, parent, repo_path)
 
 
 @mcp.tool()
@@ -2260,6 +2344,16 @@ def project_show(number: int, repo_path: str = "") -> dict:
 
 
 @mcp.tool()
+def project_update(number: int, title: str = "", description: str = "",
+                   repo_path: str = "") -> dict:
+    """Update a Project's title and/or description.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_update("project", number, title, description, repo_path)
+
+
+@mcp.tool()
 def project_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach issues (typically Epics) under a Project.
@@ -2269,23 +2363,115 @@ def project_add_children(number: int, issue_numbers: list[int],
     return _planning_add_children("project", number, issue_numbers, repo_path)
 
 
+@mcp.tool()
+def project_remove_children(number: int, issue_numbers: list[int],
+                            repo_path: str = "") -> dict:
+    """Detach sub-issues from a Project.
+
+    Returns: dict with ok, parent, removed, raw, stderr.
+    """
+    return _planning_remove_children("project", number, issue_numbers,
+                                     repo_path)
+
+
+@mcp.tool()
+def project_close(number: int, comment: str = "",
+                  repo_path: str = "") -> dict:
+    """Close a Project issue. DESTRUCTIVE.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_close("project", number, comment, repo_path)
+
+
+@mcp.tool()
+def project_reopen(number: int, repo_path: str = "") -> dict:
+    """Reopen a closed Project issue.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_reopen("project", number, repo_path)
+
+
 # ---- Sub-task (level 5) -----------------------------------------------------
 
 @mcp.tool()
 def subtask_create(title: str, description: str = "", labels: str = "",
-                   pipeline: str = "", repo_path: str = "") -> dict:
-    """Create a Sub-task (an issue with issue-type Sub-task, level 5).
+                   pipeline: str = "", assignee: str = "",
+                   estimate: str = "", parent: int = 0,
+                   repo_path: str = "") -> dict:
+    """Create a Sub-task (issue-type Sub-task, level 5).
 
-    Returns: dict with ok, number, url, type, raw, stderr.
+    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
+    raw, stderr.
     """
     return _planning_create("subtask", title, description, labels, pipeline,
-                            repo_path)
+                            assignee, estimate, parent, repo_path)
 
 
 @mcp.tool()
 def subtask_list(repo_path: str = "") -> dict:
     """List issues of type Sub-task. Returns ok, items, raw, stderr."""
     return _planning_list("subtask", repo_path)
+
+
+@mcp.tool()
+def subtask_show(number: int, repo_path: str = "") -> dict:
+    """Show a Sub-task issue + its child issues (if any).
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_show("subtask", number, repo_path)
+
+
+@mcp.tool()
+def subtask_update(number: int, title: str = "", description: str = "",
+                   repo_path: str = "") -> dict:
+    """Update a Sub-task's title and/or description.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_update("subtask", number, title, description, repo_path)
+
+
+@mcp.tool()
+def subtask_add_children(number: int, issue_numbers: list[int],
+                         repo_path: str = "") -> dict:
+    """Attach further sub-issues under a Sub-task.
+
+    Returns: dict with ok, parent, added, raw, stderr.
+    """
+    return _planning_add_children("subtask", number, issue_numbers, repo_path)
+
+
+@mcp.tool()
+def subtask_remove_children(number: int, issue_numbers: list[int],
+                            repo_path: str = "") -> dict:
+    """Detach sub-issues from a Sub-task.
+
+    Returns: dict with ok, parent, removed, raw, stderr.
+    """
+    return _planning_remove_children("subtask", number, issue_numbers,
+                                     repo_path)
+
+
+@mcp.tool()
+def subtask_close(number: int, comment: str = "",
+                  repo_path: str = "") -> dict:
+    """Close a Sub-task issue. DESTRUCTIVE.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_close("subtask", number, comment, repo_path)
+
+
+@mcp.tool()
+def subtask_reopen(number: int, repo_path: str = "") -> dict:
+    """Reopen a closed Sub-task issue.
+
+    Returns: dict with ok, number, raw, stderr.
+    """
+    return _planning_reopen("subtask", number, repo_path)
 
 
 # Note: *_delete is deliberately not exposed as an MCP tool for any planning
