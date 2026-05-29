@@ -1097,13 +1097,15 @@ def test_types_filter_treats_missing_isenabled_as_enabled() -> None:
     assert types and types[0]["name"] == "Task"
 
 
-# v1.9.1 item #7 (G4): cmd_issue must surface the priority alongside
-# state/pipeline/estimate. The jq read pulls priority.name from the same
-# pipelineIssue node as pipeline.
+# v1.9.1 item #7 (G4) + round-3 finding #5: cmd_issue must surface the
+# priority alongside state/pipeline/estimate, AND read the field via the
+# workspace-scoped pipelineIssue (not the ambiguous pipelineIssues
+# nodes[0] form, which could return the wrong workspace for issues in
+# multiple workspaces).
 _ISSUE_PRIORITY_READ_SNIPPET = r"""
 set -euo pipefail
 issue="$1"
-priority=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].priority.name // "None"')
+priority=$(echo "$issue" | jq -r '.pipelineIssue.priority.name // "None"')
 echo "$priority"
 """
 
@@ -1117,9 +1119,11 @@ def _issue_priority(issue_json: str) -> str:
 
 
 def test_issue_priority_reads_configured_name() -> None:
-    """An issue with a configured priority surfaces the priority name."""
-    issue = ('{"pipelineIssues":{"nodes":[{"pipeline":{"name":"In Progress"},'
-             '"priority":{"name":"High priority"}}]}}')
+    """An issue with a configured priority surfaces the priority name.
+    Workspace-scoped pipelineIssue field (round-3 #5).
+    """
+    issue = ('{"pipelineIssue":{"pipeline":{"name":"In Progress"},'
+             '"priority":{"name":"High priority"}}}')
     assert _issue_priority(issue) == "High priority"
 
 
@@ -1127,16 +1131,17 @@ def test_issue_priority_renders_none_when_unset() -> None:
     """A pipelineIssue with priority=null renders as `None`, mirroring
     the Pipeline / Estimate fields' "always-present" line.
     """
-    issue = ('{"pipelineIssues":{"nodes":[{"pipeline":{"name":"In Progress"},'
-             '"priority":null}]}}')
+    issue = ('{"pipelineIssue":{"pipeline":{"name":"In Progress"},'
+             '"priority":null}}')
     assert _issue_priority(issue) == "None"
 
 
 def test_issue_priority_renders_none_when_no_pipeline_issue() -> None:
-    """An issue with no pipelineIssues nodes (e.g. just-created, not yet
-    placed) still renders cleanly as None instead of `null` or empty.
+    """An issue with no pipelineIssue (e.g. just-created, not yet
+    placed in any pipeline) still renders cleanly as None instead of
+    `null` or empty.
     """
-    issue = '{"pipelineIssues":{"nodes":[]}}'
+    issue = '{"pipelineIssue":null}'
     assert _issue_priority(issue) == "None"
 
 
@@ -1659,3 +1664,275 @@ def test_set_type_zero_count_still_says_failed() -> None:
     r = _set_type_msg(resp, "42")
     assert r.returncode == 1
     assert "Failed to set type" in r.stdout
+
+
+# ===========================================================================
+# v1.9.1 round-3 fixes (PR #25 round-2 review findings 1, 2, 4, 6).
+# ===========================================================================
+
+
+# Round-3 finding #1: extend the fail-soft envelope to the OUTER
+# get_repo_info / get_repo_id round-trips, not just the inner
+# zh_graphql call inside zh_hierarchy_warn_type_mismatch.
+_OUTER_FAILSOFT_SNIPPET = r"""
+set -euo pipefail
+fail_at="$1"  # "get_repo_info", "get_repo_id", or "none"
+get_repo_info() {
+    if [[ "$fail_at" == "get_repo_info" ]]; then
+        echo "ZenHub API error" >&2
+        return 1
+    fi
+    echo "owner/repo"
+}
+get_repo_id() {
+    if [[ "$fail_at" == "get_repo_id" ]]; then
+        echo "ZenHub API error" >&2
+        return 1
+    fi
+    echo "repo-id-abc"
+}
+warn_helper() {
+    local owner_repo="" repo_id=""
+    owner_repo=$(get_repo_info 2>/dev/null) || return 0
+    if [[ -z "$owner_repo" ]]; then return 0; fi
+    repo_id=$(get_repo_id "$owner_repo" 2>/dev/null) || return 0
+    if [[ -z "$repo_id" ]]; then return 0; fi
+    echo "WOULD_HAVE_WARNED"
+}
+warn_helper
+echo "REACHED_CALLER"
+"""
+
+
+def _outer_failsoft(fail_at: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _OUTER_FAILSOFT_SNIPPET, "_", fail_at],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_outer_failsoft_get_repo_info_does_not_kill_caller() -> None:
+    """A transient .errors on get_repo_info must NOT terminate the script
+    under set -euo pipefail. The caller's next line runs.
+    """
+    r = _outer_failsoft("get_repo_info")
+    assert r.returncode == 0
+    assert "REACHED_CALLER" in r.stdout
+    assert "WOULD_HAVE_WARNED" not in r.stdout
+
+
+def test_outer_failsoft_get_repo_id_does_not_kill_caller() -> None:
+    """A transient .errors on get_repo_id must NOT terminate the script
+    either. Symmetric pin for the second outer round-trip.
+    """
+    r = _outer_failsoft("get_repo_id")
+    assert r.returncode == 0
+    assert "REACHED_CALLER" in r.stdout
+    assert "WOULD_HAVE_WARNED" not in r.stdout
+
+
+def test_outer_failsoft_clean_path_warns() -> None:
+    """When both outer lookups succeed, the warn helper runs (this
+    pins that the envelope did not silently disable the warn on the
+    happy path).
+    """
+    r = _outer_failsoft("none")
+    assert r.returncode == 0
+    assert "WOULD_HAVE_WARNED" in r.stdout
+    assert "REACHED_CALLER" in r.stdout
+
+
+# Round-3 finding #2: type-mismatch redirect must NOT suggest a non-
+# existent verb. Bug / Feature / Task have no dispatcher arm.
+_TYPE_MISMATCH_GATED_REDIRECT_SNIPPET = r"""
+set -euo pipefail
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+display_noun_for() {
+    local lower
+    lower=$(to_lower "$1")
+    case "$lower" in
+        sub-task) echo "subtask" ;;
+        *) echo "$lower" ;;
+    esac
+}
+actual_type="$1"
+issue_num="$2"
+verb="$3"
+
+actual_lower_norm=$(to_lower "$actual_type")
+case "$actual_lower_norm" in
+    initiative|project|epic|sub-task|subtask)
+        actual_display=$(display_noun_for "$actual_type")
+        redirect="zh ${actual_display} ${verb} ${issue_num}"
+        ;;
+    *)
+        redirect="zh issue ${issue_num}"
+        ;;
+esac
+echo "$redirect"
+"""
+
+
+def _gated_redirect(actual_type, issue_num, verb="show"):
+    r = subprocess.run(
+        ["bash", "-c", _TYPE_MISMATCH_GATED_REDIRECT_SNIPPET, "_",
+         actual_type, issue_num, verb],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_redirect_gates_bug_to_zh_issue() -> None:
+    """A Bug-typed issue redirects to `zh issue 42`, NOT
+    `zh bug close 42` (which would error "Unknown command: bug").
+    """
+    assert _gated_redirect("Bug", "42", "close") == "zh issue 42"
+
+
+def test_redirect_gates_feature_to_zh_issue() -> None:
+    assert _gated_redirect("Feature", "42", "update") == "zh issue 42"
+
+
+def test_redirect_gates_task_to_zh_issue() -> None:
+    assert _gated_redirect("Task", "42", "show") == "zh issue 42"
+
+
+def test_redirect_emits_typed_form_for_planning_nouns() -> None:
+    """Planning nouns keep the typed redirect because their dispatcher
+    arms exist.
+    """
+    assert _gated_redirect("Epic", "42", "close") == "zh epic close 42"
+    assert _gated_redirect("Initiative", "42", "show") == "zh initiative show 42"
+    assert _gated_redirect("Project", "42", "update") == "zh project update 42"
+    assert _gated_redirect("Sub-task", "42", "close") == "zh subtask close 42"
+
+
+# Round-3 finding #4: `--flag=value` GNU-style. cmd_create normalizes
+# `--flag=value` to `--flag value` at the top of the arg-parsing loop
+# so every long flag accepts both forms uniformly.
+_GNU_FLAG_NORMALIZE_SNIPPET = r"""
+set -euo pipefail
+title=""
+priority_name=""
+issue_type=""
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        set -- "${1%%=*}" "${1#*=}" "${@:2}"
+    fi
+    case "$1" in
+        -t|--type) issue_type="$2"; shift 2 ;;
+        --priority) priority_name="$2"; shift 2 ;;
+        *)
+            if [[ -z "$title" ]]; then title="$1"; fi
+            shift
+            ;;
+    esac
+done
+echo "TITLE:${title}"
+echo "TYPE:${issue_type}"
+echo "PRIORITY:${priority_name}"
+"""
+
+
+def _gnu_flag(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _GNU_FLAG_NORMALIZE_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_gnu_flag_equals_form_captured_for_priority() -> None:
+    """`--priority=High` is normalized to `--priority High` and lands
+    in priority_name. Pre-fix it fell through to `*)` and was treated
+    as the title.
+    """
+    r = _gnu_flag("Title", "--priority=High")
+    assert r.returncode == 0
+    assert "TITLE:Title" in r.stdout
+    assert "PRIORITY:High" in r.stdout
+
+
+def test_gnu_flag_equals_form_captured_for_type() -> None:
+    """Same normalization works for every long flag, not just --priority."""
+    r = _gnu_flag("Title", "--type=Epic")
+    assert r.returncode == 0
+    assert "TYPE:Epic" in r.stdout
+
+
+def test_gnu_flag_space_form_still_works() -> None:
+    """The classic space-separated form continues to work after the
+    normalization pass.
+    """
+    r = _gnu_flag("Title", "--priority", "High")
+    assert r.returncode == 0
+    assert "PRIORITY:High" in r.stdout
+
+
+def test_gnu_flag_equals_before_positional_works() -> None:
+    """`--priority=High Foo` (flag-first, positional last) is handled
+    correctly: the flag is consumed, the positional becomes title.
+    """
+    r = _gnu_flag("--priority=High", "Foo")
+    assert r.returncode == 0
+    assert "TITLE:Foo" in r.stdout
+    assert "PRIORITY:High" in r.stdout
+
+
+# Round-3 finding #6: zh_hierarchy_warn_for_noun must track flag arity
+# so a numeric flag VALUE does not get picked as the issue number.
+_FLAG_ARITY_SCAN_SNIPPET = r"""
+set -euo pipefail
+shift  # drop expected_type
+shift  # drop verb
+prev=""
+for arg in "$@"; do
+    case "$prev" in
+        -t|--title|-d|--description|-b|--body|-e|--estimate|-l|--label|--labels|-a|--assign|--assignee|-p|--pipeline|--priority|--parent)
+            prev="$arg"
+            continue
+            ;;
+    esac
+    prev="$arg"
+    stripped="${arg#\#}"
+    if [[ "$stripped" =~ ^[0-9]+$ ]]; then
+        echo "FOUND:${stripped}"
+        exit 0
+    fi
+done
+echo "NOT_FOUND"
+"""
+
+
+def _flag_arity_scan(*argv):
+    return subprocess.run(
+        ["bash", "-c", _FLAG_ARITY_SCAN_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_flag_arity_skips_numeric_title_value() -> None:
+    """`zh epic update -t 42 100` should warn about issue #100, NOT #42
+    (which is the value bound to -t). Round-3 #6.
+    """
+    r = _flag_arity_scan("Epic", "update", "-t", "42", "100")
+    assert r.stdout.strip() == "FOUND:100"
+
+
+def test_flag_arity_skips_numeric_description_value() -> None:
+    """`-d 42 100` -> 42 is a description value, 100 is the issue."""
+    r = _flag_arity_scan("Epic", "update", "-d", "42", "100")
+    assert r.stdout.strip() == "FOUND:100"
+
+
+def test_flag_arity_finds_only_numeric_after_other_flags() -> None:
+    """Symmetric: when there's only one numeric positional after a
+    string-valued flag, it's the issue number.
+    """
+    r = _flag_arity_scan("Epic", "close", "100", "-t", "Foo")
+    assert r.stdout.strip() == "FOUND:100"
+
+
+def test_flag_arity_returns_not_found_when_only_flag_values_are_numeric() -> None:
+    """If every numeric token is a flag value, no issue-number found."""
+    r = _flag_arity_scan("Epic", "update", "-t", "42", "-d", "100")
+    assert r.stdout.strip() == "NOT_FOUND"

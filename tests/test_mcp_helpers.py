@@ -971,9 +971,17 @@ def test_with_epic_number_alias_respects_explicit_value():
 
 
 def test_with_epic_number_alias_handles_missing_identifier():
-    """Error returns (no `number` / `parent`) gain no alias."""
+    """Error returns (no `number` / `parent`) get `epic_number: None`.
+
+    v1.9.1 round-3 #3: the round-2 #6 minimization of the
+    _planning_create blocked-response dropped both number and parent
+    placeholders, so without this fallback a v1.8.x agent reading
+    `out["epic_number"]` on a blocked create would get KeyError. Always
+    ensure the key is present.
+    """
     d = mcp_server._with_epic_number_alias({"ok": False, "stderr": "oops"})
-    assert "epic_number" not in d
+    assert "epic_number" in d
+    assert d["epic_number"] is None
 
 
 def test_planning_create_forwards_new_kwargs(monkeypatch):

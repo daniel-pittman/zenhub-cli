@@ -1991,12 +1991,25 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
                 "number": None, "url": None, "type": None,
                 "pipeline": None, "parent": None, "estimate": None}
 
-    # v1.9.1 item #5: pre-flight similarity check, identical to
-    # create_issue. Same shape: a "block" recommendation short-circuits
-    # the create with the candidate matches; "warn" only annotates the
-    # response. Embedding failures or missing index fall through to
-    # create rather than blocking, so a transient infra problem cannot
-    # become a planning-noun outage.
+    # v1.9.1 item #5: pre-flight similarity check, identical machinery
+    # to create_issue. Same shape: a "block" recommendation
+    # short-circuits the create with the candidate matches; "warn" only
+    # annotates the response. Embedding failures or missing index fall
+    # through to create rather than blocking, so a transient infra
+    # problem cannot become a planning-noun outage.
+    #
+    # Round-3 finding #8: the two entry points differ on input
+    # validation. create_issue requires a non-empty body, so its
+    # embedding always sees both title and body. _planning_create
+    # accepts an empty description (planning items are often title-
+    # only). At the SOFT/HARD threshold boundary the same title can
+    # therefore land on different sides of the gate from the two
+    # surfaces. Equalizing this would mean either tightening
+    # _planning_create (hurts UX for legitimate title-only initiatives
+    # / epics) or relaxing create_issue (lowers a useful hint). The
+    # tradeoff is documented here so a future maintainer sees the
+    # asymmetry rather than treating it as a bug; agents that need
+    # identical scoring across surfaces should always pass description.
     dup_info = None
     if not skip_duplicate_check:
         repo, err = _similarity_repo(repo_path)
@@ -2186,11 +2199,23 @@ def _with_epic_number_alias(d: dict) -> dict:
     of `number` or `parent` is the epic's identifier in that shape. Tool
     docstrings note the alias is for back-compat and may be removed in a
     future major release.
+
+    v1.9.1 round-3 finding #3: the round-2 #6 fix minimized the
+    `_planning_create` blocked-response to 4 keys (ok / blocked / stderr
+    / duplicate_check), dropping the `number` and `parent` placeholders
+    the alias used to set. Without a fallback, a v1.8.x agent reading
+    `out["epic_number"]` on a blocked create gets `KeyError`. Always
+    ensure the alias key is present (None when no identifier is
+    available, e.g. on blocked / error paths).
     """
     if "number" in d and "epic_number" not in d:
         d["epic_number"] = d.get("number")
     elif "parent" in d and "epic_number" not in d:
         d["epic_number"] = d.get("parent")
+    # Fallback for paths that carry neither (blocked / pre-flight
+    # errors). v1.8.x clients use `out["epic_number"]` directly; this
+    # guarantees the key exists.
+    d.setdefault("epic_number", None)
     return d
 
 

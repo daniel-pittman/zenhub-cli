@@ -298,7 +298,13 @@ EOF
 # human chatter goes to stderr)
 zh create "Auth service" -t Epic --json
 # {"number":42,"url":"https://github.com/o/r/issues/42","title":"Auth service",
-#  "type":"Epic","pipeline":null,"estimate":null,"parent":null}
+#  "type":"Epic","pipeline":null,"estimate":null,"parent":null,
+#  "priority":null,"priority_requested":null}
+#
+# v1.9.1: `priority_requested` mirrors the user's --priority value
+# regardless of whether the post-create mutation confirmed it. Compare to
+# detect partial apply: `priority_requested="High", priority=null` means
+# the request did not land and `zh priority #N "High"` is the safe retry.
 
 # Or just the new number
 NEW=$(zh create "Quick task" -q)
