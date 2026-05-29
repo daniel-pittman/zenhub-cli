@@ -1144,7 +1144,12 @@ def test_planning_create_blocks_on_duplicate(monkeypatch):
     )
     assert out["ok"] is False
     assert out.get("blocked") is True
-    assert out["number"] is None
+    # Round-2 finding #6: the block response now mirrors create_issue's
+    # minimal 4-key shape (ok, blocked, stderr, duplicate_check) so MCP
+    # clients can handle both entry points uniformly. No None-valued
+    # placeholders for number / url / type / etc.
+    assert "number" not in out
+    assert "raw" not in out
     assert out["duplicate_check"] == blocked_info
     assert "confirm_create=True" in out["stderr"]
     assert called["ran"] is False, "bash create must NOT run when blocked"

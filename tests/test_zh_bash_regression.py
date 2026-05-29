@@ -1251,6 +1251,7 @@ display_noun_for() {
 expected_type="$1"
 response="$2"
 issue_num="$3"
+verb="${4:-show}"
 
 actual_type=$(echo "$response" | jq -r '.data.issueByInfo.issueType.name // empty')
 if [[ -z "$actual_type" ]]; then
@@ -1264,16 +1265,16 @@ if [[ "$expected_lower" == "$actual_lower" ]]; then
     exit 0
 fi
 actual_display=$(display_noun_for "$actual_type")
-echo "WARN:${actual_type}:zh ${actual_display} show ${issue_num}"
+echo "WARN:${actual_type}:zh ${actual_display} ${verb} ${issue_num}"
 """
 
 
 def _type_mismatch(
-    expected_type: str, response: str, issue_num: str
+    expected_type: str, response: str, issue_num: str, verb: str = "show",
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", "-c", _TYPE_MISMATCH_WARN_SNIPPET, "_",
-         expected_type, response, issue_num],
+         expected_type, response, issue_num, verb],
         capture_output=True, text=True, check=False,
     )
 
@@ -1331,3 +1332,330 @@ def test_type_mismatch_silent_on_untyped_issue() -> None:
     r = _type_mismatch("Epic", resp, "42")
     assert r.returncode == 0
     assert r.stdout.strip() == "SILENT_NO_TYPE"
+
+
+def test_type_mismatch_redirect_threads_invoking_verb_close() -> None:
+    """Round-2 finding #4: `zh epic close 42` against a Bug must
+    redirect to `zh bug close 42`, not `zh bug show 42`. The verb is
+    passed into the helper and interpolated into the warn line.
+    """
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Bug"}}}}'
+    r = _type_mismatch("Epic", resp, "42", verb="close")
+    assert r.returncode == 0
+    assert "zh bug close 42" in r.stdout
+    assert "zh bug show 42" not in r.stdout
+
+
+def test_type_mismatch_redirect_threads_invoking_verb_update() -> None:
+    """Symmetric pin for the update verb."""
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Task"}}}}'
+    r = _type_mismatch("Epic", resp, "42", verb="update")
+    assert r.returncode == 0
+    assert "zh task update 42" in r.stdout
+
+
+def test_type_mismatch_redirect_defaults_to_show_when_verb_omitted() -> None:
+    """Back-compat: the default verb is `show` so the v1.9.1 round-1
+    behavior (called from cmd_hierarchy_show without an explicit verb)
+    still works.
+    """
+    resp = '{"data":{"issueByInfo":{"issueType":{"name":"Bug"}}}}'
+    r = _type_mismatch("Epic", resp, "42")  # no verb arg
+    assert r.returncode == 0
+    assert "zh bug show 42" in r.stdout
+
+
+# ===========================================================================
+# v1.9.1 round-2 fixes (PR #25 claude-review findings 1, 2, 3, 4, 5, 7).
+# Each snippet mirrors the single guard added in the round-2 sweep so a
+# future change that loosens or drops the guard fails a test instead of
+# silently shipping.
+# ===========================================================================
+
+
+# Round-2 finding #1: zh_hierarchy_warn_type_mismatch must fail SOFT on any
+# zh_graphql failure, because the helper runs ahead of cmd_close /
+# cmd_reopen / cmd_update_issue and those verbs do not require a healthy
+# ZenHub API.
+_WARN_FAIL_SOFT_SNIPPET = r"""
+set -euo pipefail
+# Stub zh_graphql to simulate a .errors response, which the real
+# zh_graphql turns into `error "ZenHub API error: ..."; exit 1`.
+zh_graphql() {
+    echo "ZenHub API error: rate limited" >&2
+    return 1
+}
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+display_noun_for() { echo "$(to_lower "$1")"; }
+warn() { echo "WARN: $1" >&2; }
+
+zh_hierarchy_warn_type_mismatch() {
+    local expected_type="$1"
+    local issue_num="$2"
+    local repo_id="$3"
+    local verb="${4:-show}"
+    local response=""
+    response=$(zh_graphql "query" "vars" 2>/dev/null) || return 0
+    local actual_type
+    actual_type=$(echo "$response" | jq -r '.data.issueByInfo.issueType.name // empty')
+    if [[ -z "$actual_type" ]]; then return 0; fi
+    warn "would have warned"
+}
+
+zh_hierarchy_warn_type_mismatch "Epic" "42" "repo-id" "close"
+echo "REACHED_CALLER"
+"""
+
+
+def test_warn_helper_returns_zero_on_zh_graphql_failure() -> None:
+    """The round-2 fail-soft envelope: a transient ZenHub API failure
+    must NOT terminate the script under `set -euo pipefail`. Caller
+    code (cmd_close / cmd_reopen / cmd_update_issue) must reach the
+    line after the helper.
+    """
+    r = subprocess.run(
+        ["bash", "-c", _WARN_FAIL_SOFT_SNIPPET],
+        capture_output=True, text=True, check=False,
+    )
+    assert r.returncode == 0
+    assert "REACHED_CALLER" in r.stdout
+    assert "WARN: would have warned" not in r.stderr
+
+
+# Round-2 finding #2: zh_hierarchy_warn_for_noun must find the issue
+# number regardless of where it sits in the argv (before OR after a flag).
+_WARN_FOR_NOUN_SCAN_SNIPPET = r"""
+set -euo pipefail
+expected_type="$1"; verb="$2"
+shift 2
+arg=""
+for arg in "$@"; do
+    stripped="${arg#\#}"
+    if [[ "$stripped" =~ ^[0-9]+$ ]]; then
+        echo "FOUND:${stripped}"
+        exit 0
+    fi
+done
+echo "NOT_FOUND"
+"""
+
+
+def _warn_for_noun_scan(expected_type, verb, *argv):
+    return subprocess.run(
+        ["bash", "-c", _WARN_FOR_NOUN_SCAN_SNIPPET, "_",
+         expected_type, verb, *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_warn_scanner_finds_issue_number_before_flags() -> None:
+    """`zh epic update 42 -t Foo` -> issue number at position 0."""
+    r = _warn_for_noun_scan("Epic", "update", "42", "-t", "Foo")
+    assert r.stdout.strip() == "FOUND:42"
+
+
+def test_warn_scanner_finds_issue_number_after_flags() -> None:
+    """Round-2 finding #2: `zh epic update -t Foo 42` -> issue number
+    at the END, after a flag. The pre-fix scanner broke on the first
+    `-*` and missed this case, leaving the warn silent for flag-first
+    invocations.
+    """
+    r = _warn_for_noun_scan("Epic", "update", "-t", "Foo", "42")
+    assert r.stdout.strip() == "FOUND:42"
+
+
+def test_warn_scanner_strips_hash_prefix() -> None:
+    """`#42` is the same input as `42` (cmd_close accepts both)."""
+    r = _warn_for_noun_scan("Epic", "close", "#42")
+    assert r.stdout.strip() == "FOUND:42"
+
+
+def test_warn_scanner_returns_not_found_with_no_number() -> None:
+    """No numeric token -> NOT_FOUND. The verb's own usage error still
+    fires; the warn just stays silent.
+    """
+    r = _warn_for_noun_scan("Epic", "update", "-t", "Foo")
+    assert r.stdout.strip() == "NOT_FOUND"
+
+
+# Round-2 finding #3: cmd_create must not silently apply --priority to the
+# wrong (default) pipeline when --pipeline did not resolve. The fix skips
+# the priority mutation and warns.
+_PRIORITY_SKIP_ON_UNRESOLVED_PIPELINE_SNIPPET = r"""
+set -euo pipefail
+pipeline_resolved="$1"  # "yes" or "no"
+priority_requested="$2" # priority name or ""
+priority_id_after_skip=""
+
+if [[ "$pipeline_resolved" == "no" ]]; then
+    echo "WARN: Pipeline not found" >&2
+    if [[ -n "$priority_requested" ]]; then
+        echo "WARN: Skipping --priority because --pipeline did not resolve" >&2
+        priority_id_after_skip=""
+    fi
+fi
+
+if [[ -n "$priority_id_after_skip" ]]; then
+    echo "PRIORITY_APPLIED"
+else
+    echo "PRIORITY_SKIPPED"
+fi
+"""
+
+
+def _priority_skip(pipeline_resolved, priority_requested):
+    return subprocess.run(
+        ["bash", "-c", _PRIORITY_SKIP_ON_UNRESOLVED_PIPELINE_SNIPPET, "_",
+         pipeline_resolved, priority_requested],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_priority_skipped_when_pipeline_unresolved() -> None:
+    """`zh create "X" -p "Bad name" --priority "High" --json`: pipeline
+    does not resolve, so priority must NOT bind to the default pipeline
+    where the issue lands. Skipping with a warn is the documented
+    behavior post-round-2.
+    """
+    r = _priority_skip("no", "High")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "PRIORITY_SKIPPED"
+    assert "Skipping --priority" in r.stderr
+
+
+def test_priority_skip_silent_when_priority_not_requested() -> None:
+    """A pipeline-only request that fails to resolve still warns about
+    the pipeline but never mentions priority.
+    """
+    r = _priority_skip("no", "")
+    assert "Skipping --priority" not in r.stderr
+
+
+# Round-2 finding #7: --json output must distinguish "user did not pass
+# --priority" from "user passed --priority but the post-create mutation
+# did not confirm it". The `priority_requested` sibling field carries
+# the user's input regardless of mutation outcome.
+_CREATE_JSON_PRIORITY_SNIPPET = r"""
+new_issue_num="$1"; new_issue_url="$2"; title="$3"
+new_type_name="$4"; pipeline_set="$5"; estimate="$6"; parent_wired="$7"
+priority_set="$8"; priority_name="$9"
+jq -n \
+    --argjson number "$new_issue_num" \
+    --arg url "$new_issue_url" \
+    --arg title "$title" \
+    --arg type "${new_type_name}" \
+    --arg pipeline "${pipeline_set}" \
+    --arg estimate "${estimate}" \
+    --arg parent "${parent_wired}" \
+    --arg priority "${priority_set}" \
+    --arg priority_requested "${priority_name}" \
+    '{number: $number, url: $url, title: $title,
+      type: (if $type == "" then null else $type end),
+      pipeline: (if $pipeline == "" then null else $pipeline end),
+      estimate: (if $estimate == "" then null else ($estimate | tonumber) end),
+      parent: (if $parent == "" then null else ($parent | tonumber) end),
+      priority: (if $priority == "" then null else $priority end),
+      priority_requested: (if $priority_requested == "" then null else $priority_requested end)}'
+"""
+
+
+def _create_json_with_priority(num, url, title, type_, pipeline, estimate,
+                               parent, priority_set, priority_requested):
+    r = subprocess.run(
+        ["bash", "-c", _CREATE_JSON_PRIORITY_SNIPPET, "_", str(num), url,
+         title, type_, pipeline, estimate, parent, priority_set,
+         priority_requested],
+        capture_output=True, text=True, check=False,
+    )
+    import json as _json
+    return _json.loads(r.stdout)
+
+
+def test_create_json_priority_not_requested_is_both_null() -> None:
+    """No --priority -> both fields null. Caller branches:
+    null -> null = not requested.
+    """
+    obj = _create_json_with_priority(
+        42, "u", "T", "Task", "Backlog", "5", "", "", "",
+    )
+    assert obj["priority"] is None
+    assert obj["priority_requested"] is None
+
+
+def test_create_json_priority_applied_both_carry_name() -> None:
+    """`--priority "High" applied -> both fields the same name. Caller
+    branches: "X" -> "X" = applied.
+    """
+    obj = _create_json_with_priority(
+        42, "u", "T", "Task", "Backlog", "5", "", "High", "High",
+    )
+    assert obj["priority"] == "High"
+    assert obj["priority_requested"] == "High"
+
+
+def test_create_json_priority_requested_but_not_confirmed() -> None:
+    """The motivating case: user asked for "High", post-create mutation
+    failed to confirm (read-after-write lag, transient API failure).
+    Caller branches: "X" -> null = requested but not confirmed, retry.
+    """
+    obj = _create_json_with_priority(
+        42, "u", "T", "Task", "Backlog", "5", "", "", "High",
+    )
+    assert obj["priority"] is None
+    assert obj["priority_requested"] == "High"
+
+
+# Round-2 finding #5: cmd_set_type partial-applied wording. The branch
+# fires only when success_count >= 1, so the type DID land on ZenHub.
+# Word the message as "Partially applied" / "Verify", not "Failed".
+_SET_TYPE_PARTIAL_MSG_SNIPPET = r"""
+set -euo pipefail
+response="$1"; issue_num="$2"
+success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+failed_count=$(echo "$response" | jq -r '(.data.changeIssueTypeOfIssues.failedIssues // []) | length')
+gh_errors=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.githubErrors // {}')
+gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
+
+if [[ "$success_count" -lt 1 ]]; then
+    echo "Failed to set type of #${issue_num}"
+    exit 1
+fi
+if [[ "$failed_count" -gt 0 ]] || [[ "$gh_errors_len" -gt 0 ]]; then
+    echo "Partially applied: type change on #${issue_num} landed on ZenHub (successCount=${success_count}), but the mutation reported follow-on errors. Verify with 'zh issue ${issue_num}' before retrying."
+    exit 1
+fi
+echo "Set type of #${issue_num}"
+"""
+
+
+def _set_type_msg(response, issue_num):
+    return subprocess.run(
+        ["bash", "-c", _SET_TYPE_PARTIAL_MSG_SNIPPET, "_", response, issue_num],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_set_type_partial_message_uses_partially_applied_wording() -> None:
+    """`successCount=1 + githubErrors populated` is partial-applied, not
+    a total failure. The message must say so, so the operator does not
+    retry a change that already landed.
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
+            '"failedIssues":[],"githubErrors":[{"code":"X"}]}}}')
+    r = _set_type_msg(resp, "42")
+    assert r.returncode == 1
+    assert "Partially applied" in r.stdout
+    assert "Verify with" in r.stdout
+    assert "Failed to set type" not in r.stdout
+
+
+def test_set_type_zero_count_still_says_failed() -> None:
+    """successCount=0 IS a real failure; the "Failed" wording is correct
+    there. Symmetric regression guard so a future sweep does not
+    over-soften both branches.
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":0,'
+            '"failedIssues":[{"number":42}],"githubErrors":[]}}}')
+    r = _set_type_msg(resp, "42")
+    assert r.returncode == 1
+    assert "Failed to set type" in r.stdout

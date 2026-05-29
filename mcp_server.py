@@ -2019,6 +2019,12 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
 
         if (dup_info and dup_info.get("recommendation") == "block"
                 and not confirm_create):
+            # Round-2 finding #6: mirror create_issue's minimal block
+            # response shape (ok / blocked / stderr / duplicate_check).
+            # The 10-key version with `None` placeholders that this
+            # branch previously returned diverged from create_issue,
+            # which broke MCP clients that handled both entry points
+            # uniformly via `out["raw"]`.
             return {
                 "ok": False,
                 "blocked": True,
@@ -2030,12 +2036,6 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
                     "genuinely distinct, retry with confirm_create=True."
                 ),
                 "duplicate_check": dup_info,
-                "number": None,
-                "url": None,
-                "type": None,
-                "pipeline": None,
-                "parent": None,
-                "estimate": None,
             }
 
     args = [noun, "create", title, "--json"]
