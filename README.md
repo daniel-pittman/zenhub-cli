@@ -161,17 +161,22 @@ ZH_REST_TOKEN=your_rest_token_here
 | `close <issue> [comment]` | | Close an issue |
 | `reopen <issue>` | | Reopen a closed issue |
 | `delete <issue> [-y]` | | **Permanently delete** a GitHub issue (via `gh`; needs admin/triage). Prompts to confirm when interactive; `-y`/`--yes` skips. Prefer `close`. |
-| `create <title> [options]` | `new` | Create a new issue |
+| `create <title> [options]` | `new` | Create a new issue (`--json` / `-q` for machine output, `--parent` to nest) |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
-| `priority <issue> [level]` | `prio` | Set or view issue priority |
-| `epic <subcommand>` | `epics` | Manage ZenHub native epics (see [Epics](#epics)) |
-| `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues — 3rd hierarchy tier (see [Sub-issues](#sub-issues)) |
+| `priority <issue> [name]` | `prio` | Set or view issue priority by name (workspace-defined; see [Priorities](#priorities)) |
+| `priorities` | `prios` | List the workspace's configured priorities |
+| `type <issue> <name>` | `set-type`, `retype` | Change an existing issue's type |
+| `epic <subcommand>` | `epics` | Manage Epic issues (issue-type + sub-issues; see [Planning hierarchy](#planning-hierarchy)) |
+| `initiative <subcommand>` | `initiatives` | Manage Initiative issues (level 1) |
+| `project <subcommand>` | `projects` | Manage Project issues (level 2) |
+| `subtask <subcommand>` | `subtasks` | Manage Sub-task issues (level 5) |
+| `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues, the parent/child wiring (see [Sub-issues](#sub-issues)) |
 | `sprints [--all]` | `sp` | List sprints in workspace (see [Sprints](#sprints)) |
 | `sprint <name>` | | View sprint details and issues |
 | `sprint add <name> <issue#> [...]` | `sa` (top-level) | Add one or more issues to a sprint |
 | `sprint remove <name> <issue#> [...]` | `sr` (top-level), `rm` | Remove one or more issues from a sprint |
-| `types` | | List available issue types |
+| `types` | | List assignable issue types (name, level, disposition, source) |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
 | `workspaces` | `ws` | List available workspaces |
@@ -288,17 +293,29 @@ This feature adds...
 - [ ] Criterion 1
 - [ ] Criterion 2
 EOF
+
+# Machine-readable output for batch / agent callers (clean JSON on stdout,
+# human chatter goes to stderr)
+zh create "Auth service" -t Epic --json
+# {"number":42,"url":"https://github.com/o/r/issues/42","title":"Auth service",
+#  "type":"Epic","pipeline":null,"estimate":null,"parent":null}
+
+# Or just the new number
+NEW=$(zh create "Quick task" -q)
 ```
 
 **Create options:**
-- `-t, --type <type>` - Issue type (Bug, Feature, Task, Spike, etc.)
+- `-t, --type <type>` - Issue type (discover with `zh types`; any assignable type works, including Epic/Initiative/Project/Sub-task)
 - `-l, --labels <labels>` - Comma-separated labels
 - `-a, --assignee <user>` - GitHub username to assign
 - `-p, --pipeline <name>` - Pipeline to place issue in
 - `-e, --estimate <pts>` - Story points
+- `--parent <issue#>` - Wire the new issue as a sub-issue of `<issue#>`
 - `-b, --body <text>` - Short description inline
 - `-f, --file <path>` - Read description from file
 - `--stdin` - Read description from stdin
+- `--json` - Emit a JSON object on stdout (suppresses human lines)
+- `-q, --quiet` - Emit only the new issue number on stdout
 
 ### Close & Reopen Issues
 
@@ -323,7 +340,7 @@ zh delete 42
 zh delete 42 -y   # skip the confirmation prompt
 ```
 
-### Dependencies & Priority
+### Dependencies
 
 ```bash
 # Set issue #123 as blocked by #456
@@ -332,64 +349,96 @@ zh block 123 456
 
 # Remove blocking dependency
 zh unblock 123 456
+```
 
-# View current priority
+### Priorities
+
+Priorities are **workspace-defined**, not a fixed high/medium/low set. `zh priority` resolves the name you pass case-insensitively against the workspace's configured priorities. Discover the configured names with `zh priorities`.
+
+```bash
+# List the workspace's configured priorities
+zh priorities
+
+# View an issue's current priority
 zh priority 42
 
-# Set high priority
-zh priority 42 high
+# Set a priority by name (matched case-insensitively)
+zh priority 42 "High priority"
 
 # Remove priority
 zh priority 42 clear
 ```
 
-### Epics
+If you pass a name that isn't configured, `zh` errors and lists the available names rather than silently doing the wrong thing. Add new priorities in your ZenHub workspace settings.
 
-ZenHub *native* epics (the kind created via the workspace's Epics view, not legacy "epic" labels) are workspace-scoped objects that group related issues. `zh epic` exposes them via subcommands.
+### Planning hierarchy
 
-The epic numbers shown by `zh epic list` are stable, ZenHub-assigned numeric IDs (the trailing portion of the internal global ID). Re-use them with all other epic subcommands.
+ZenHub removed Legacy Epics and ZenhubEpics in June 2025: "Epics and Projects have been replaced with Issue Types and Sub-Issues." The current model is a 5-level issue-type hierarchy wired with Sub-Issues:
+
+| Level | Type | Disposition |
+|-------|------|-------------|
+| 1 | Initiative | Planning panel |
+| 2 | Project | Planning panel |
+| 3 | Epic | Planning panel |
+| 4 | Bug / Feature / Task | Board |
+| 5 | Sub-task | Board |
+
+An **epic is just an issue** whose issue-type is Epic. It has an ordinary GitHub issue number and issue URL; children are attached via Sub-Issues. `zh` exposes a planning noun for each ZenHub-managed level (`initiative`, `project`, `epic`, `subtask`), each a thin wrapper over the same issue-type + sub-issue machinery. Board-level Bug/Feature/Task are created with `zh create -t <type>`.
 
 ```bash
-# List all epics in the workspace
+# List the workspace's assignable types with level + disposition + source
+zh types
+
+# List Epic issues
 zh epic list
 
-# Show an epic and its child issues
-zh epic show 12345
-
-# Create a new epic (optionally with description + comma-separated labels)
+# Create an Epic (any of -d body, -l labels, -p pipeline, --json / -q)
 zh epic create "Auth Service" -d "Build authentication API endpoints" -l backend,auth
 
-# Edit an existing epic's title and/or body (at least one of -t / -d required)
-zh epic update 12345 -t "Auth Service (v2)"
-zh epic update 12345 -d "Updated body text"
-zh epic update 12345 -t "Renamed" -d "New body"
+# Show an epic issue and its child issues
+zh epic show 42
 
-# Add or remove issues from an epic (one OR MORE issue numbers per call)
-zh epic add 12345 369 370 412
-zh epic remove 12345 369
+# Edit an epic issue's title and/or body
+zh epic update 42 -t "Auth Service (v2)" -d "Updated body text"
 
-# Toggle epic state
-zh epic close 12345
-zh epic reopen 12345
+# Attach / detach sub-issues (one OR MORE per call)
+zh epic add 42 369 370 412
+zh epic remove 42 369
 
-# DANGER: permanently delete an epic (no undo). Prefer `close` unless cleanup
-# is intended.
-zh epic delete 12345
+# Close / reopen the epic issue
+zh epic close 42 "Shipped in release X"
+zh epic reopen 42
+
+# The other planning levels share the same surface
+zh initiative create "Platform modernization"
+zh project list
+zh subtask create "Wire up the migration script" --parent 42
 ```
 
-**Epic subcommands:**
+You can also change an existing issue's type at any time, and create a child in one call:
+
+```bash
+# Promote an existing issue to an Epic (or any configured type)
+zh type 42 Epic
+
+# Create a Feature already nested under epic #42
+zh create "Token refresh endpoint" -t Feature --parent 42 --json
+```
+
+**Planning-noun subcommands (same for initiative / project / epic / subtask):**
 
 | Subcommand | Description |
 |------------|-------------|
-| `list` | List all epics in the workspace (number, state, title) |
-| `show <epic#>` | Show epic metadata, body, and child-issue list |
-| `create "Title" [opts]` | Create a new epic. Options: `-d` description, `-l` comma-separated labels |
-| `update <epic#> [opts]` | Edit an epic's title and/or body. Options: `-t` new title, `-d` new description. At least one required. Aliases: `edit`, `modify` |
-| `add <epic#> <issue#>...` | Add one or more issues to an epic in a single API call |
-| `remove <epic#> <issue#>...` | Remove one or more issues from an epic |
-| `close <epic#>` | Mark an epic CLOSED |
-| `reopen <epic#>` | Mark an epic OPEN |
-| `delete <epic#>` | Permanently delete an epic (no undo) |
+| `list` | List issues of that type (number, state, title) |
+| `show <issue#>` | Show the issue + its child issues |
+| `create "Title" [opts]` | Create an issue of that type. Options: `-d` body, `-l` labels, `-p` pipeline, `--json` / `-q` |
+| `update <issue#> [opts]` | Edit title and/or body. Options: `-t`, `-d`. Aliases: `edit`, `modify` |
+| `add <parent#> <issue#>...` | Attach sub-issues (single API call) |
+| `remove <parent#> <issue#>...` | Detach sub-issues |
+| `close <issue#> [comment]` | Close the issue |
+| `reopen <issue#>` | Reopen the issue |
+
+To delete an epic, delete the issue: `zh delete <issue#>` (DANGER, prefer `close`).
 
 ### Sub-issues
 

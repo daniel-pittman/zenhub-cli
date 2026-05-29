@@ -261,3 +261,278 @@ def test_delete_notfound_reaches_guard_under_set_e() -> None:
     assert result.returncode == 1
     assert "Issue #999999 not found" in result.stderr
     assert "REACHED_DELETE" not in result.stdout
+
+
+# ===========================================================================
+# v1.9.0: issue-type model migration (G7 / G8 / G3) + create --json (G2) +
+# priority-by-name (G1).
+#
+# These mirror the pure-jq resolution helpers in `zh` (zh_issue_type_id_from,
+# zh_priority_id_from), the create --json output shaping, and the planning-
+# noun create sugar (translating -d -> -b and appending -t <TYPE>). They run
+# without network: the assignableIssueTypes / prioritiesConnection payloads
+# are fed in directly, exactly as the live API returns them.
+# ===========================================================================
+
+# A realistic assignableIssueTypes payload (the union of GithubIssueType and
+# ZenhubIssueType), shaped like zh_fetch_issue_types echoes it.
+_TYPES_JSON = (
+    '[{"typename":"ZenhubIssueType","id":"zid-init","name":"Initiative","level":1,"disposition":"PLANNING_PANEL","isEnabled":true},'
+    '{"typename":"ZenhubIssueType","id":"zid-proj","name":"Project","level":2,"disposition":"PLANNING_PANEL","isEnabled":true},'
+    '{"typename":"ZenhubIssueType","id":"zid-epic","name":"Epic","level":3,"disposition":"PLANNING_PANEL","isEnabled":true},'
+    '{"typename":"GithubIssueType","id":"gid-bug","name":"Bug","level":4,"disposition":"BOARD","isEnabled":true},'
+    '{"typename":"GithubIssueType","id":"gid-feat","name":"Feature","level":4,"disposition":"BOARD","isEnabled":true},'
+    '{"typename":"GithubIssueType","id":"gid-task","name":"Task","level":4,"disposition":"BOARD","isEnabled":true},'
+    '{"typename":"ZenhubIssueType","id":"zid-sub","name":"Sub-task","level":5,"disposition":"BOARD","isEnabled":true}]'
+)
+
+# Mirrors zh_issue_type_id_from (case-insensitive name -> id, "" if absent).
+_TYPE_ID_SNIPPET = r"""
+types_json="$1"; name="$2"
+echo "$types_json" | jq -r --arg name "$name" \
+    'map(select((.name | ascii_downcase) == ($name | ascii_downcase))) | .[0].id // empty'
+"""
+
+
+def _resolve_type_id(name: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _TYPE_ID_SNIPPET, "_", _TYPES_JSON, name],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_issue_type_resolves_github_type_id() -> None:
+    """A GithubIssueType (Feature, level 4) resolves to its id. Confirms
+    the create path can still type board issues.
+    """
+    assert _resolve_type_id("Feature") == "gid-feat"
+
+
+def test_issue_type_resolves_zenhub_type_id() -> None:
+    """A ZenhubIssueType (Epic, level 3) resolves to its id via the SAME
+    unified mechanism. This is the heart of G8: Epic/Initiative/Project/
+    Sub-task are ZenhubIssueTypes, and the unified id is what both
+    CreateIssueInput.issueTypeId and ChangeIssueTypeOfIssuesInput.issueTypeId
+    accept, so no separate Github-vs-Zenhub branch is needed.
+    """
+    assert _resolve_type_id("Epic") == "zid-epic"
+    assert _resolve_type_id("Sub-task") == "zid-sub"
+
+
+def test_issue_type_resolution_is_case_insensitive() -> None:
+    assert _resolve_type_id("epic") == "zid-epic"
+    assert _resolve_type_id("INITIATIVE") == "zid-init"
+
+
+def test_issue_type_unknown_resolves_to_empty() -> None:
+    """An unknown type name resolves to empty so the caller can hard-error
+    with the available list rather than firing a create with no type.
+    """
+    assert _resolve_type_id("Story") == ""
+
+
+# Mirrors zh_priority_id_from + the not-found "Available:" message build.
+_PRIORITY_SNIPPET = r"""
+set -euo pipefail
+priorities_json="$1"; name="$2"
+priority_id=$(echo "$priorities_json" | jq -r --arg name "$name" \
+    'map(select((.name | ascii_downcase) == ($name | ascii_downcase))) | .[0].id // empty')
+if [[ "$name" == "clear" || "$name" == "none" || "$name" == "remove" ]]; then
+    echo "CLEAR"
+    exit 0
+fi
+if [[ -z "$priority_id" ]]; then
+    available=$(echo "$priorities_json" | jq -r 'if length == 0 then "(none configured)" else ([.[].name] | join(", ")) end')
+    echo "NOMATCH:${available}"
+    exit 0
+fi
+echo "ID:${priority_id}"
+"""
+
+_PRIORITIES_JSON = (
+    '[{"id":"pid-high","name":"High priority","color":"red"},'
+    '{"id":"pid-low","name":"Low priority","color":"blue"}]'
+)
+
+
+def _resolve_priority(priorities_json: str, name: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _PRIORITY_SNIPPET, "_", priorities_json, name],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_priority_by_name_matches_case_insensitively() -> None:
+    """G1: the given name resolves against the workspace's configured
+    priorities (case-insensitive), NOT a hardcoded high/medium/low set and
+    NOT nodes[0]. "high priority" -> the High priority id.
+    """
+    assert _resolve_priority(_PRIORITIES_JSON, "high priority") == "ID:pid-high"
+    assert _resolve_priority(_PRIORITIES_JSON, "Low priority") == "ID:pid-low"
+
+
+def test_priority_no_match_lists_available() -> None:
+    """G1: an unconfigured name errors clearly with the available list,
+    instead of silently firing a mutation with an empty id (the old bug
+    behind the opaque "Resource not found").
+    """
+    out = _resolve_priority(_PRIORITIES_JSON, "medium")
+    assert out.startswith("NOMATCH:")
+    assert "High priority" in out and "Low priority" in out
+
+
+def test_priority_no_match_with_no_priorities_configured() -> None:
+    out = _resolve_priority("[]", "high")
+    assert out == "NOMATCH:(none configured)"
+
+
+def test_priority_clear_is_distinct_from_name_resolution() -> None:
+    """`clear` (and its aliases) must take the clear branch, never attempt
+    a name match.
+    """
+    assert _resolve_priority(_PRIORITIES_JSON, "clear") == "CLEAR"
+
+
+# Mirrors cmd_create's --json output shaping (the final jq emit), with a
+# representative set of post-create values.
+_CREATE_JSON_SNIPPET = r"""
+new_issue_num="$1"; new_issue_url="$2"; title="$3"
+new_type_name="$4"; pipeline_set="$5"; estimate="$6"; parent_wired="$7"
+jq -n \
+    --argjson number "$new_issue_num" \
+    --arg url "$new_issue_url" \
+    --arg title "$title" \
+    --arg type "${new_type_name}" \
+    --arg pipeline "${pipeline_set}" \
+    --arg estimate "${estimate}" \
+    --arg parent "${parent_wired}" \
+    '{number: $number, url: $url, title: $title,
+      type: (if $type == "" then null else $type end),
+      pipeline: (if $pipeline == "" then null else $pipeline end),
+      estimate: (if $estimate == "" then null else ($estimate | tonumber) end),
+      parent: (if $parent == "" then null else ($parent | tonumber) end)}'
+"""
+
+
+def _create_json(num, url, title, type_, pipeline, estimate, parent):
+    r = subprocess.run(
+        ["bash", "-c", _CREATE_JSON_SNIPPET, "_", str(num), url, title,
+         type_, pipeline, estimate, parent],
+        capture_output=True, text=True, check=False,
+    )
+    import json as _json
+    return _json.loads(r.stdout)
+
+
+def test_create_json_full_object_shape() -> None:
+    """G2: create --json emits a clean object with all batch-relevant
+    fields; number is a JSON int and absent optionals are null.
+    """
+    obj = _create_json(
+        42, "https://github.com/o/r/issues/42", "Auth service",
+        "Epic", "Product Backlog", "5", "12",
+    )
+    assert obj == {
+        "number": 42,
+        "url": "https://github.com/o/r/issues/42",
+        "title": "Auth service",
+        "type": "Epic",
+        "pipeline": "Product Backlog",
+        "estimate": 5,
+        "parent": 12,
+    }
+
+
+def test_create_json_nulls_for_unset_optionals() -> None:
+    obj = _create_json(
+        7, "https://github.com/o/r/issues/7", "Plain task",
+        "Task", "", "", "",
+    )
+    assert obj["number"] == 7
+    assert obj["type"] == "Task"
+    assert obj["pipeline"] is None
+    assert obj["estimate"] is None
+    assert obj["parent"] is None
+
+
+# Mirrors cmd_hierarchy_create's argument translation: it rewrites a planning
+# noun's -d/--description to cmd_create's -b and appends -t <TYPE>. The result
+# is the exact argv handed to cmd_create.
+_NOUN_CREATE_ARGS_SNIPPET = r"""
+type_name="$1"; shift
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--description) passthrough+=("-b" "$2"); shift 2 ;;
+        *) passthrough+=("$1"); shift ;;
+    esac
+done
+printf '%s\n' "${passthrough[@]}" -t "$type_name"
+"""
+
+
+def test_epic_noun_create_translates_to_typed_create() -> None:
+    """G3: `zh epic create "Title" -d "body"` becomes a plain
+    `cmd_create "Title" -b "body" -t Epic`. The epic noun is sugar over the
+    issue-type model: no ZenhubEpic mutation involved.
+    """
+    r = subprocess.run(
+        ["bash", "-c", _NOUN_CREATE_ARGS_SNIPPET, "_", "Epic",
+         "Title", "-d", "body text", "-l", "backend"],
+        capture_output=True, text=True, check=False,
+    )
+    argv = r.stdout.splitlines()
+    assert argv == ["Title", "-b", "body text", "-l", "backend", "-t", "Epic"]
+
+
+def test_subtask_noun_create_passes_json_flag_through() -> None:
+    """Flags like --json/-q pass straight through to cmd_create so machine
+    output works on every planning noun, not just `zh create`.
+    """
+    r = subprocess.run(
+        ["bash", "-c", _NOUN_CREATE_ARGS_SNIPPET, "_", "Sub-task",
+         "Small thing", "--json"],
+        capture_output=True, text=True, check=False,
+    )
+    argv = r.stdout.splitlines()
+    assert argv == ["Small thing", "--json", "-t", "Sub-task"]
+
+
+# Mirrors cmd_set_type's success gate: changeIssueTypeOfIssues returns
+# successCount; < 1 is an error, >= 1 is success. (G8 retype-after-create.)
+_SET_TYPE_GATE_SNIPPET = r"""
+response="$1"
+success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+if [[ "$success_count" -lt 1 ]]; then
+    echo "FAILED"
+    exit 1
+fi
+echo "OK"
+"""
+
+
+def _set_type_gate(response: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _SET_TYPE_GATE_SNIPPET, "_", response],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_set_type_success_when_count_positive() -> None:
+    """A retype to a ZenhubIssueType (e.g. Epic) reports successCount 1."""
+    resp = '{"data":{"changeIssueTypeOfIssues":{"successCount":1,"failedIssues":[],"githubErrors":[]}}}'
+    r = _set_type_gate(resp)
+    assert r.returncode == 0
+    assert r.stdout.strip() == "OK"
+
+
+def test_set_type_failure_when_count_zero() -> None:
+    """successCount 0 (or a failedIssues entry) is a hard failure, not a
+    silent no-op.
+    """
+    resp = '{"data":{"changeIssueTypeOfIssues":{"successCount":0,"failedIssues":[{"number":42}],"githubErrors":[]}}}'
+    r = _set_type_gate(resp)
+    assert r.returncode == 1
+    assert r.stdout.strip() == "FAILED"

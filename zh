@@ -59,6 +59,12 @@ success() {
     echo -e "${GREEN}✓${NC} $1"
 }
 
+# Lowercase a string portably. bash 3.2 (macOS default, and a CI matrix
+# target) has no ${var,,} parameter expansion, so use tr.
+to_lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 # Load configuration
 load_config() {
     # Round-6 #14: precedence must be env > config (to match Python
@@ -408,6 +414,107 @@ build_zenhub_url() {
 }
 
 # =============================================================================
+# Issue-type resolution (v1.9.0: the modern model)
+# =============================================================================
+#
+# ZenHub removed Legacy Epics and ZenhubEpics in June 2025 ("Epics and Projects
+# have been replaced with Issue Types and Sub-Issues"). The current model is a
+# 5-level Issue Type hierarchy wired with Sub-Issues. assignableIssueTypes
+# returns a union of GithubIssueType and ZenhubIssueType, each carrying a single
+# `id` that both CreateIssueInput.issueTypeId and
+# ChangeIssueTypeOfIssuesInput.issueTypeId accept. That unified id is the reason
+# one mechanism covers every level (Initiative/Project/Epic are ZenhubIssueType;
+# Bug/Feature/Task are GithubIssueType; Sub-task is ZenhubIssueType): the caller
+# never has to branch on the subtype.
+
+# Fetch the workspace's assignable issue types as a JSON array of
+# {typename, id, name, level, disposition, isEnabled} on stdout.
+# Echoes "[]" if none are returned. Data-driven: no per-noun hardcoding.
+zh_fetch_issue_types() {
+    local owner_repo="$1"
+    local workspace_id="$2"
+
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null || true)
+    if [[ -z "$gh_id" ]]; then
+        echo "[]"
+        return
+    fi
+
+    local query='
+    query($ghIds: [Int!]!, $workspaceId: ID!) {
+        repositoriesByGhId(ghIds: $ghIds) {
+            assignableIssueTypes(workspaceId: $workspaceId, first: 100) {
+                nodes {
+                    __typename
+                    ... on GithubIssueType { id name level disposition isEnabled }
+                    ... on ZenhubIssueType { id name level disposition isEnabled }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --argjson gh_id "$gh_id" --arg workspace_id "$workspace_id" \
+        '{ghIds: [$gh_id], workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    echo "$response" | jq -c '
+        [ (.data.repositoriesByGhId[0].assignableIssueTypes.nodes // [])[]
+          | {typename: .__typename, id: .id, name: .name, level: .level,
+             disposition: .disposition, isEnabled: .isEnabled} ]'
+}
+
+# Resolve an issue-type name (case-insensitive) to its id, using a pre-fetched
+# types JSON array. Echoes the id, or empty if no match. Pure jq, no network.
+zh_issue_type_id_from() {
+    local types_json="$1"
+    local name="$2"
+    echo "$types_json" | jq -r --arg name "$name" \
+        'map(select((.name | ascii_downcase) == ($name | ascii_downcase))) | .[0].id // empty'
+}
+
+# Build a human-friendly "Available types: ..." list from a types JSON array.
+zh_issue_type_names_from() {
+    local types_json="$1"
+    echo "$types_json" | jq -r '[.[].name] | join(", ")'
+}
+
+# Fetch the workspace's configured priorities as a JSON array of {id, name,
+# color} on stdout. Echoes "[]" if none are configured.
+zh_fetch_priorities() {
+    local workspace_id="$1"
+
+    local query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            prioritiesConnection {
+                nodes { id name color }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    echo "$response" | jq -c '.data.workspace.prioritiesConnection.nodes // []'
+}
+
+# Resolve a priority name (case-insensitive) to its id, using a pre-fetched
+# priorities JSON array. Echoes the id, or empty if no match.
+zh_priority_id_from() {
+    local priorities_json="$1"
+    local name="$2"
+    echo "$priorities_json" | jq -r --arg name "$name" \
+        'map(select((.name | ascii_downcase) == ($name | ascii_downcase))) | .[0].id // empty'
+}
+
+# =============================================================================
 # Commands
 # =============================================================================
 
@@ -494,11 +601,12 @@ COMMANDS:
     reopen <issue>          Reopen a closed issue
                            Example: zh reopen 42
 
-    delete <issue> [-y]     PERMANENTLY delete a GitHub issue via gh (DANGER —
+    delete <issue> [-y]     PERMANENTLY delete a GitHub issue via gh (DANGER:
                            prefer 'close'; needs admin/triage). Removes it
                            from the ZenHub board too; also covers sub-issues.
                            Prompts for confirmation when interactive; -y/--yes
-                           skips it. For epics use 'zh epic delete'.
+                           skips it. Epics are issues now, so delete one the
+                           same way: zh delete <issue#>.
                            Example: zh delete 42
 
     block <issue> <blocker> Set issue as blocked by another
@@ -509,12 +617,19 @@ COMMANDS:
                            Example: zh unblock 123 456
                            (123 is no longer blocked by 456)
 
-    priority <issue> [lvl]  Set or view issue priority
-                           Example: zh priority 42 high
+    priority <issue> [name] Set or view issue priority (name-resolved)
+                           Priorities are workspace-defined; discover with
+                           'zh priorities'. The name is matched case-insensitively.
+                           Example: zh priority 42 "High priority"
                            Example: zh priority 42 clear
                            Example: zh priority 42  (view only)
 
-    types                   List available issue types
+    priorities              List the workspace's configured priorities
+
+    types                   List assignable issue types (name/level/disposition)
+
+    type <issue> <name>     Change an existing issue's type
+                           Example: zh type 42 Epic
 
     labels                  List available labels
 
@@ -523,19 +638,23 @@ COMMANDS:
 
     workspaces              List available workspaces for current repo
 
-    epic <subcommand>       Manage ZenHub epics (native epics in the workspace)
+    PLANNING NOUNS (issue-type + sub-issue model):
+    epic <subcommand>       Manage Epic issues (issue-type Epic, level 3)
                            Subcommands:
-                             list                              List all epics in workspace
-                             show <epic#>                      Show epic + child issues
-                             create "Title" [-d body] [-l ...] Create new epic
-                             update <epic#> [-t ...] [-d ...]  Edit epic title and/or body
-                             add <epic#> <issue#> [...]        Add issues to epic
-                             remove <epic#> <issue#> [...]     Remove issues from epic
-                             close <epic#>                     Close epic
-                             reopen <epic#>                    Reopen epic
+                             list                              List Epic issues
+                             show <issue#>                     Show issue + sub-issues
+                             create "Title" [-d body] [-l ...] [-p pipeline] [--json|-q]
+                             update <issue#> [-t ...] [-d ...] Edit title and/or body
+                             add <parent#> <issue#> [...]      Attach sub-issues
+                             remove <parent#> <issue#> [...]   Detach sub-issues
+                             close <issue#> [comment]          Close the issue
+                             reopen <issue#>                   Reopen the issue
                            Example: zh epic create "Auth Service" -l backend,auth
-                           Example: zh epic update 12345 -t "Renamed" -d "New body"
-                           Example: zh epic add 12345 369 370
+                           Example: zh epic add 42 369 370
+    initiative <subcommand> Same surface, issue-type Initiative (level 1)
+    project <subcommand>    Same surface, issue-type Project (level 2)
+    subtask <subcommand>    Same surface, issue-type Sub-task (level 5)
+                           (level-4 Bug/Feature/Task use 'zh create -t <type>')
 
     subissue <subcommand>   Manage sub-issues (Issue → Sub-issue hierarchy tier)
                            Subcommands:
@@ -619,11 +738,14 @@ EXAMPLES:
     zh types                        # List issue types
     zh labels                       # List available labels
     zh block 123 456                # 123 blocked by 456
-    zh priority 42 high            # Set high priority
+    zh priorities                   # List configured priorities
+    zh priority 42 "High priority" # Set priority by name
     cat desc.md | zh create "Title" --stdin  # Body from stdin
-    zh epic list                    # List all epics
-    zh epic show 12345              # Show epic + child issues
-    zh epic add 12345 369 370       # Add issues to epic
+    zh epic create "Auth" --json    # Create epic, JSON output for batch use
+    zh epic list                    # List Epic issues
+    zh epic show 42                 # Show issue + sub-issues
+    zh epic add 42 369 370          # Attach sub-issues to epic #42
+    zh type 42 Epic                 # Retype issue #42 to Epic
     zh sprints                      # List open sprints
     zh sprint current               # View active sprint + issues
     zh sprint "Sprint 5"            # View specific sprint
@@ -887,6 +1009,11 @@ Example: zh issue 42"
             estimate {
                 value
             }
+            issueType {
+                __typename
+                ... on GithubIssueType { name level disposition }
+                ... on ZenhubIssueType { name level disposition }
+            }
             assignees {
                 nodes {
                     login
@@ -922,7 +1049,7 @@ Example: zh issue 42"
                 number
                 title
             }
-            zenhubChildIssues(first: 1) {
+            githubChildIssues(first: 1) {
                 totalCount
             }
             createdAt
@@ -944,11 +1071,13 @@ Example: zh issue 42"
         error "Issue #${issue_num} not found"
     fi
 
-    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues parent_num parent_title child_count
+    local title state pipeline estimate assignees labels gh_url zh_url blocking_issues blocked_issues parent_num parent_title child_count type_name type_level
     title=$(echo "$issue" | jq -r '.title')
     state=$(echo "$issue" | jq -r '.state')
     pipeline=$(echo "$issue" | jq -r '.pipelineIssues.nodes[0].pipeline.name // "None"')
     estimate=$(echo "$issue" | jq -r '.estimate.value // "—"')
+    type_name=$(echo "$issue" | jq -r '.issueType.name // empty')
+    type_level=$(echo "$issue" | jq -r '.issueType.level // empty')
     assignees=$(echo "$issue" | jq -r '[.assignees.nodes[].login] | join(", ") | if . == "" then "Unassigned" else . end')
     labels=$(echo "$issue" | jq -r '[.labels.nodes[].name] | join(", ") | if . == "" then "None" else . end')
     gh_url=$(echo "$issue" | jq -r '.htmlUrl')
@@ -957,12 +1086,15 @@ Example: zh issue 42"
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
     parent_num=$(echo "$issue" | jq -r '.parentIssue.number // empty')
     parent_title=$(echo "$issue" | jq -r '.parentIssue.title // ""')
-    child_count=$(echo "$issue" | jq -r '.zenhubChildIssues.totalCount // 0')
+    child_count=$(echo "$issue" | jq -r '.githubChildIssues.totalCount // 0')
 
     echo ""
     echo -e "${BOLD}#${issue_num}${NC} ${title}"
     echo ""
     echo -e "  ${CYAN}State:${NC}     ${state}"
+    if [[ -n "$type_name" ]]; then
+        echo -e "  ${CYAN}Type:${NC}      ${type_name} (level ${type_level})"
+    fi
     echo -e "  ${CYAN}Pipeline:${NC}  ${pipeline}"
     echo -e "  ${CYAN}Estimate:${NC}  ${estimate}"
     echo -e "  ${CYAN}Assignees:${NC} ${assignees}"
@@ -977,7 +1109,7 @@ Example: zh issue 42"
         echo -e "  ${CYAN}Parent:${NC}    #${parent_num} ${parent_title}"
     fi
     if [[ "$child_count" -gt 0 ]]; then
-        echo -e "  ${CYAN}Sub-issues:${NC} ${child_count} (see 'zh subissue list ${issue_num}')"
+        echo -e "  ${CYAN}Children:${NC}  ${child_count} (see 'zh epic show ${issue_num}')"
     fi
     echo -e "  ${CYAN}ZenHub:${NC}    ${zh_url}"
     echo -e "  ${CYAN}GitHub:${NC}    ${gh_url}"
@@ -2187,6 +2319,9 @@ cmd_create() {
     local assignee=""
     local pipeline=""
     local estimate=""
+    local parent=""
+    local json_out="false"
+    local quiet_out="false"
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -2194,6 +2329,18 @@ cmd_create() {
             -t|--type)
                 issue_type="$2"
                 shift 2
+                ;;
+            --parent)
+                parent="$2"
+                shift 2
+                ;;
+            --json)
+                json_out="true"
+                shift
+                ;;
+            -q|--quiet)
+                quiet_out="true"
+                shift
                 ;;
             -l|--label|--labels)
                 labels="$2"
@@ -2245,19 +2392,23 @@ cmd_create() {
         error "Usage: zh create <title> [options]
 
 Options:
-  -t, --type <type>       Issue type (Task, Bug, Feature, etc.)
+  -t, --type <type>       Issue type (discover with 'zh types')
   -l, --labels <labels>   Comma-separated labels
   -a, --assignee <user>   GitHub username to assign
   -p, --pipeline <name>   Pipeline to place issue in
   -e, --estimate <pts>    Story points estimate
+  --parent <issue#>       Wire the new issue as a sub-issue of <issue#>
   -b, --body <text>       Issue body/description (short)
   -f, --file <path>       Read body from file (for longer descriptions)
   --stdin                 Read body from stdin
+  --json                  Emit a JSON object on stdout (for batch callers)
+  -q, --quiet             Emit only the new issue number on stdout
 
 Examples:
   zh create \"Fix login bug\" -t Bug -l \"priority:high\"
   zh create \"Add dark mode\" -t Feature -a acme-user -e 5
-  zh create \"Research OAuth options\" -t Spike -p \"TO DO\""
+  zh create \"Research OAuth options\" -t Task -p \"Product Backlog\"
+  zh create \"Auth service\" -t Epic --json"
     fi
 
     local owner_repo
@@ -2266,7 +2417,16 @@ Examples:
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
-    info "Creating issue: ${title}..."
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # In --json / --quiet mode, human chatter goes to stderr so stdout stays
+    # pure JSON (or a bare number) for batch callers piping into jq.
+    if [[ "$json_out" == "true" ]] || [[ "$quiet_out" == "true" ]]; then
+        info "Creating issue: ${title}..." >&2
+    else
+        info "Creating issue: ${title}..."
+    fi
 
     # Build the create mutation variables
     local create_vars
@@ -2291,39 +2451,40 @@ Examples:
         create_vars=$(echo "$create_vars" | jq --arg assignee "$assignee" '.input.assignees = [$assignee]')
     fi
 
-    # Add issue type if provided
+    # Add issue type if provided. v1.9.0: resolve via assignableIssueTypes
+    # (covers both GithubIssueType and ZenhubIssueType) instead of the old
+    # githubIssueTypes-only query that could not see Epic/Initiative/Project/
+    # Sub-task. A name that resolves to no type is now a hard error (with the
+    # available types listed) rather than a silently-typeless create, since
+    # the planning nouns depend on the type actually being set.
     if [[ -n "$issue_type" ]]; then
-        # Get GitHub repo ID for issue types query
-        local gh_id
-        gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
-
-        # Look up issue type ID
-        local types_query='
-        query($ghIds: [Int!]!) {
-            repositoriesByGhId(ghIds: $ghIds) {
-                githubIssueTypes {
-                    nodes {
-                        id
-                        name
-                    }
-                }
-            }
-        }'
-
-        local types_vars
-        types_vars=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
-
-        local types_response
-        types_response=$(zh_graphql "$types_query" "$types_vars")
+        local types_json
+        types_json=$(zh_fetch_issue_types "$owner_repo" "$workspace_id")
 
         local type_id
-        type_id=$(echo "$types_response" | jq -r --arg name "$issue_type" \
-            '.data.repositoriesByGhId[0].githubIssueTypes.nodes[] | select(.name | ascii_downcase == ($name | ascii_downcase)) | .id')
+        type_id=$(zh_issue_type_id_from "$types_json" "$issue_type")
 
         if [[ -n "$type_id" ]]; then
             create_vars=$(echo "$create_vars" | jq --arg type_id "$type_id" '.input.issueTypeId = $type_id')
         else
-            warn "Issue type '${issue_type}' not found, creating without type"
+            local available
+            available=$(zh_issue_type_names_from "$types_json")
+            error "Issue type '${issue_type}' not found in this workspace. Available: ${available:-(none)}. Discover with 'zh types'."
+        fi
+    fi
+
+    # Validate --parent format up-front (before create). The actual wiring
+    # happens AFTER create, via addSubIssues, so it lands in the same
+    # ZenHub-native sub-issue hierarchy that 'zh subissue' and the planning
+    # nouns read (zenhubChildIssues). CreateIssueInput.parentIssueId, by
+    # contrast, sets the GitHub-native parent (githubChildIssues), which
+    # 'zh epic show' / 'zh subissue list' do not read, so using it here would
+    # create children invisible to those reads.
+    local parent_stripped=""
+    if [[ -n "$parent" ]]; then
+        parent_stripped="${parent#\#}"
+        if ! [[ "$parent_stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid parent issue number: ${parent}"
         fi
     fi
 
@@ -2335,6 +2496,11 @@ Examples:
                 number
                 title
                 htmlUrl
+                issueType {
+                    __typename
+                    ... on GithubIssueType { name level }
+                    ... on ZenhubIssueType { name level }
+                }
             }
         }
     }'
@@ -2342,14 +2508,64 @@ Examples:
     local response
     response=$(zh_graphql "$mutation" "$create_vars")
 
-    local new_issue_id new_issue_num new_issue_url
-    new_issue_id=$(echo "$response" | jq -r '.data.createIssue.issue.id')
-    new_issue_num=$(echo "$response" | jq -r '.data.createIssue.issue.number')
-    new_issue_url=$(echo "$response" | jq -r '.data.createIssue.issue.htmlUrl')
+    local new_issue_id new_issue_num new_issue_url new_type_name new_type_level
+    new_issue_id=$(echo "$response" | jq -r '.data.createIssue.issue.id // empty')
+    new_issue_num=$(echo "$response" | jq -r '.data.createIssue.issue.number // empty')
+    new_issue_url=$(echo "$response" | jq -r '.data.createIssue.issue.htmlUrl // empty')
+    new_type_name=$(echo "$response" | jq -r '.data.createIssue.issue.issueType.name // empty')
+    new_type_level=$(echo "$response" | jq -r '.data.createIssue.issue.issueType.level // empty')
 
-    echo ""
-    success "Created issue #${new_issue_num}: ${title}"
-    echo -e "  URL: ${CYAN}${new_issue_url}${NC}"
+    if [[ -z "$new_issue_num" ]]; then
+        error "Failed to create issue: $(echo "$response" | jq -r '.errors[0].message // "unknown error"')"
+    fi
+
+    # `human` is true only when neither --json nor --quiet was requested.
+    local human="true"
+    if [[ "$json_out" == "true" ]] || [[ "$quiet_out" == "true" ]]; then
+        human="false"
+    fi
+
+    if [[ "$human" == "true" ]]; then
+        echo ""
+        success "Created issue #${new_issue_num}: ${title}"
+        echo -e "  URL: ${CYAN}${new_issue_url}${NC}"
+        if [[ -n "$new_type_name" ]]; then
+            echo -e "  Type: ${GREEN}${new_type_name}${NC} (level ${new_type_level})"
+        fi
+    fi
+
+    # Wire the new issue under its parent via the ZenHub-native sub-issue
+    # relationship (addSubIssues), so it shows up in 'zh subissue list' and
+    # 'zh <noun> show'. Done post-create because the parent id and the new
+    # child id both have to exist.
+    local parent_wired=""
+    if [[ -n "$parent_stripped" ]]; then
+        local parent_id
+        parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_stripped")
+
+        local sub_mutation='
+        mutation($input: AddSubIssuesInput!) {
+            addSubIssues(input: $input) {
+                successCount
+                failedIssues { number }
+            }
+        }'
+        local sub_vars
+        sub_vars=$(jq -n --arg pid "$parent_id" --arg cid "$new_issue_id" \
+            '{input: {parentId: $pid, childIssueIds: [$cid]}}')
+
+        local sub_response sub_ok
+        sub_response=$(zh_graphql "$sub_mutation" "$sub_vars")
+        sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
+        if [[ "$sub_ok" -ge 1 ]]; then
+            parent_wired="$parent_stripped"
+            if [[ "$human" == "true" ]]; then
+                echo -e "  Parent: ${GREEN}#${parent_stripped}${NC}"
+            fi
+        else
+            warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped}"
+        fi
+    fi
 
     # Set estimate if provided
     if [[ -n "$estimate" ]]; then
@@ -2365,14 +2581,14 @@ Examples:
             '{input: {issueId: $issue_id, value: $value}}')
 
         zh_graphql "$est_mutation" "$est_vars" > /dev/null
-        echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
+        if [[ "$human" == "true" ]]; then
+            echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
+        fi
     fi
 
     # Move to pipeline if provided
+    local pipeline_set=""
     if [[ -n "$pipeline" ]]; then
-        local workspace_id
-        workspace_id=$(get_workspace_id "$owner_repo")
-
         # Get pipeline ID
         local pipelines_query='
         query($workspaceId: ID!) {
@@ -2409,10 +2625,32 @@ Examples:
                 '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: 0}}')
 
             zh_graphql "$move_mutation" "$move_vars" > /dev/null
-            echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
+            pipeline_set="$pipeline"
+            if [[ "$human" == "true" ]]; then
+                echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
+            fi
         else
             warn "Pipeline '${pipeline}' not found"
         fi
+    fi
+
+    # Machine-readable output (G2). --json wins over --quiet if both are set.
+    if [[ "$json_out" == "true" ]]; then
+        jq -n \
+            --argjson number "$new_issue_num" \
+            --arg url "$new_issue_url" \
+            --arg title "$title" \
+            --arg type "${new_type_name:-}" \
+            --arg pipeline "${pipeline_set:-}" \
+            --arg estimate "${estimate:-}" \
+            --arg parent "${parent_wired:-}" \
+            '{number: $number, url: $url, title: $title,
+              type: (if $type == "" then null else $type end),
+              pipeline: (if $pipeline == "" then null else $pipeline end),
+              estimate: (if $estimate == "" then null else ($estimate | tonumber) end),
+              parent: (if $parent == "" then null else ($parent | tonumber) end)}'
+    elif [[ "$quiet_out" == "true" ]]; then
+        echo "$new_issue_num"
     fi
 }
 
@@ -2424,33 +2662,36 @@ cmd_types() {
 
     info "Getting issue types for ${owner_repo}..."
 
-    local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
 
-    local query='
-    query($ghIds: [Int!]!) {
-        repositoriesByGhId(ghIds: $ghIds) {
-            githubIssueTypes {
-                nodes {
-                    id
-                    name
-                }
-            }
-        }
-    }'
-
-    local variables
-    variables=$(jq -n --argjson gh_id "$gh_id" '{ghIds: [$gh_id]}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    # v1.9.0: assignableIssueTypes returns the full workspace hierarchy
+    # (Initiative/Project/Epic + Bug/Feature/Task + Sub-task), each with its
+    # level (1-5) and disposition (PLANNING_PANEL vs BOARD) and source
+    # (ZenhubIssueType vs GithubIssueType). The old githubIssueTypes query
+    # only saw the board-level GitHub types.
+    local types_json
+    types_json=$(zh_fetch_issue_types "$owner_repo" "$workspace_id")
 
     echo ""
-    echo -e "${BOLD}Issue Types:${NC}"
+    echo -e "${BOLD}Issue Types${NC} (assignable in this workspace):"
     echo ""
 
-    echo "$response" | jq -r '.data.repositoriesByGhId[0].githubIssueTypes.nodes[] | "  \(.name)"'
+    if [[ "$types_json" == "[]" ]] || [[ -z "$types_json" ]]; then
+        echo "  (none: connect the repo to a ZenHub workspace, or enable types in settings)"
+        echo ""
+        return
+    fi
+
+    printf "  ${BOLD}%-14s %-6s %-15s %s${NC}\n" "NAME" "LEVEL" "DISPOSITION" "SOURCE"
+    echo "$types_json" | jq -r 'sort_by(.level)[] |
+        "\(.name)\t\(.level)\t\(.disposition)\t\(.typename)"' | \
+        while IFS=$'\t' read -r name level disposition source; do
+            printf "  %-14s %-6s %-15s %s\n" "$name" "$level" "$disposition" "$source"
+        done
     echo ""
+    echo -e "${CYAN}Tip:${NC} PLANNING_PANEL types (Initiative/Project/Epic) appear in Goals & Planning;"
+    echo -e "     BOARD types (Bug/Feature/Task/Sub-task) appear on the board."
 }
 
 cmd_users() {
@@ -2723,12 +2964,16 @@ cmd_priority() {
     local priority_action="${2:-}"
 
     if [[ -z "$issue_num" ]]; then
-        error "Usage: zh priority <issue_number> [high|clear]
+        error "Usage: zh priority <issue_number> [<name>|clear]
+
+Priorities are workspace-defined (not a fixed high/medium/low set). The name is
+matched case-insensitively against the workspace's configured priorities.
+Discover them with 'zh priorities'.
 
 Examples:
-  zh priority 42 high   # Set high priority
-  zh priority 42 clear  # Remove priority
-  zh priority 42        # Show current priority"
+  zh priority 42 \"High priority\"   # Set a configured priority by name
+  zh priority 42 clear              # Remove priority
+  zh priority 42                    # Show current priority"
     fi
 
     # Strip # prefix if present
@@ -2788,32 +3033,24 @@ Examples:
         return
     fi
 
-    # Get priority ID (if setting to high)
+    # Resolve the priority name to an id (G1). Priorities are workspace-defined,
+    # so we match the given name case-insensitively against the configured set
+    # rather than special-casing "high" and grabbing nodes[0] (the old bug that
+    # made "medium"/"low" fire a mutation with an empty id and fail opaquely).
     local priority_id=""
-    if [[ "$priority_action" == "high" ]]; then
-        # Get the high priority ID from workspace
-        local priorities_query='
-        query($workspaceId: ID!) {
-            workspace(id: $workspaceId) {
-                prioritiesConnection {
-                    nodes {
-                        id
-                        name
-                    }
-                }
-            }
-        }'
+    local is_clear="false"
+    if [[ "$priority_action" == "clear" ]] || [[ "$priority_action" == "none" ]] || [[ "$priority_action" == "remove" ]]; then
+        is_clear="true"
+    else
+        local priorities_json
+        priorities_json=$(zh_fetch_priorities "$workspace_id")
 
-        local priorities_vars
-        priorities_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
-
-        local priorities_response
-        priorities_response=$(zh_graphql "$priorities_query" "$priorities_vars")
-
-        priority_id=$(echo "$priorities_response" | jq -r '.data.workspace.prioritiesConnection.nodes[0].id // empty')
+        priority_id=$(zh_priority_id_from "$priorities_json" "$priority_action")
 
         if [[ -z "$priority_id" ]]; then
-            error "No priority levels configured in this workspace"
+            local available
+            available=$(echo "$priorities_json" | jq -r 'if length == 0 then "(none configured)" else ([.[].name] | join(", ")) end')
+            error "No priority named '${priority_action}' in this workspace. Available: ${available}. Add it in ZenHub workspace settings if you want to use it (discover with 'zh priorities')."
         fi
     fi
 
@@ -2833,7 +3070,7 @@ Examples:
     }'
 
     local mutation_vars
-    if [[ "$priority_action" == "clear" ]] || [[ "$priority_action" == "none" ]] || [[ "$priority_action" == "remove" ]]; then
+    if [[ "$is_clear" == "true" ]]; then
         mutation_vars=$(jq -n --arg pipeline_issue_id "$pipeline_issue_id" \
             '{input: {pipelineIssueIds: [$pipeline_issue_id], priorityId: null}}')
     else
@@ -2849,18 +3086,515 @@ Examples:
 
     echo ""
     success "Updated priority for #${issue_num}: ${issue_title}"
-    echo -e "  ${CYAN}${current_priority}${NC} → ${GREEN}${new_priority}${NC}"
+    echo -e "  ${CYAN}${current_priority}${NC} -> ${GREEN}${new_priority}${NC}"
+}
+
+# G1 companion: list the workspace's configured priorities (name + color).
+# The not-found branch of cmd_priority and this verb share zh_fetch_priorities.
+cmd_priorities() {
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    info "Getting configured priorities..."
+
+    local priorities_json
+    priorities_json=$(zh_fetch_priorities "$workspace_id")
+
+    echo ""
+    echo -e "${BOLD}Priorities${NC} (workspace-defined):"
+    echo ""
+
+    if [[ "$priorities_json" == "[]" ]] || [[ -z "$priorities_json" ]]; then
+        echo "  (none configured: add priorities in ZenHub workspace settings)"
+        echo ""
+        return
+    fi
+
+    echo "$priorities_json" | jq -r '.[] | "  \(.name)\t\(.color // "")"' | \
+        while IFS=$'\t' read -r name color; do
+            printf "  ${BOLD}%-20s${NC} %s\n" "$name" "$color"
+        done
+    echo ""
+    echo -e "${CYAN}Tip:${NC} Set with 'zh priority <issue#> \"<name>\"' (name matched case-insensitively)."
 }
 
 # =============================================================================
-# Epic Commands
+# Issue-type set verb (G8) + planning-hierarchy nouns (G3)
 # =============================================================================
 #
-# ZenHub native epics (distinct from legacy "epic" issues). These live on the
-# workspace, not on a repository, and have an opaque GraphQL ID of the form
-# "gid://raptor/ZenhubEpic/<numeric>". We expose the trailing numeric portion
-# as the "epic#" the user types — it is stable and ZenHub-assigned. We re-encode
-# it into the full GID before sending API requests.
+# v1.9.0: the planning nouns (initiative/project/epic/subtask) are thin sugar
+# over the issue-type + sub-issue model. There is no separate ZenhubEpic object
+# anymore: an "epic" is just an Issue whose issue-type is Epic. The generic
+# mechanism (cmd_hierarchy_*) is driven entirely by a type NAME resolved through
+# assignableIssueTypes, so adding or removing a level later is a one-line alias
+# change with no new GraphQL.
+
+# zh type <issue#> <type-name>: change an existing issue's type (G8).
+# Wraps changeIssueTypeOfIssues, which accepts the unified issueTypeId for both
+# GithubIssueType and ZenhubIssueType.
+cmd_set_type() {
+    load_config
+
+    local issue_num="${1:-}"
+    local type_name="${2:-}"
+
+    if [[ -z "$issue_num" ]] || [[ -z "$type_name" ]]; then
+        error "Usage: zh type <issue#> <type-name>
+
+Change an existing issue's type. Discover type names with 'zh types'.
+
+Examples:
+  zh type 42 Epic       # Promote #42 to an Epic
+  zh type 42 Feature    # Set #42 back to a board-level Feature"
+    fi
+
+    issue_num="${issue_num#\#}"
+    if ! [[ "$issue_num" =~ ^[0-9]+$ ]]; then
+        error "Invalid issue number: ${issue_num}"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local types_json
+    types_json=$(zh_fetch_issue_types "$owner_repo" "$workspace_id")
+
+    local type_id
+    type_id=$(zh_issue_type_id_from "$types_json" "$type_name")
+    if [[ -z "$type_id" ]]; then
+        local available
+        available=$(zh_issue_type_names_from "$types_json")
+        error "Issue type '${type_name}' not found in this workspace. Available: ${available:-(none)}. Discover with 'zh types'."
+    fi
+
+    local issue_id
+    issue_id=$(zh_resolve_issue_id "$repo_id" "$issue_num")
+
+    info "Setting type of #${issue_num} to ${type_name}..."
+
+    local mutation='
+    mutation($input: ChangeIssueTypeOfIssuesInput!) {
+        changeIssueTypeOfIssues(input: $input) {
+            successCount
+            failedIssues { number }
+            githubErrors
+        }
+    }'
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg id "$issue_id" --arg tid "$type_id" \
+        '{input: {issueIds: [$id], issueTypeId: $tid}}')
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local success_count
+    success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+
+    if [[ "$success_count" -lt 1 ]]; then
+        error "Failed to set type of #${issue_num}: $(echo "$response" | jq -c '.data.changeIssueTypeOfIssues // .errors')"
+    fi
+
+    echo ""
+    success "Set type of #${issue_num} to ${type_name}"
+}
+
+# -----------------------------------------------------------------------------
+# Generic planning-hierarchy noun engine (G3 + 5-level model)
+# -----------------------------------------------------------------------------
+#
+# Every planning noun (initiative/project/epic/subtask) is the SAME machinery
+# parameterised by an issue-type NAME. The noun dispatchers below each call
+# cmd_hierarchy_dispatch with their type name; nothing about the level is
+# hardcoded, so the set of nouns can grow or shrink with the workspace's
+# configured types. The subcommand surface mirrors the old epic verbs:
+#
+#   <noun> create "Title" [-d body] [-l labels] [-p pipeline] [--json|-q]
+#   <noun> list
+#   <noun> show <issue#>
+#   <noun> add <parent#> <child#> [<child#> ...]      (addSubIssues)
+#   <noun> remove <parent#> <child#> [...]            (removeSubIssues)
+#   <noun> update <issue#> [-t title] [-d body]
+#   <noun> close <issue#> [comment]
+#   <noun> reopen <issue#>
+#
+# create is `zh create -t <TYPE>` sugar; add/remove are `zh subissue` sugar;
+# update/close/reopen are normal issue ops on a real issue. This is why the
+# headline finding (ZenhubEpic was a dead API) collapses to "epics are just
+# issues now": all the hierarchy mechanism already existed for sub-issues.
+
+# Resolve a noun's type name to a canonical, configured type name (preserving
+# the workspace's casing) and confirm it is assignable. Errors with the
+# available list if the type is not enabled in this workspace.
+zh_hierarchy_require_type() {
+    local owner_repo="$1"
+    local workspace_id="$2"
+    local type_name="$3"
+
+    local types_json
+    types_json=$(zh_fetch_issue_types "$owner_repo" "$workspace_id")
+
+    local canonical
+    canonical=$(echo "$types_json" | jq -r --arg name "$type_name" \
+        'map(select((.name | ascii_downcase) == ($name | ascii_downcase))) | .[0].name // empty')
+
+    if [[ -z "$canonical" ]]; then
+        local available
+        available=$(zh_issue_type_names_from "$types_json")
+        error "Issue type '${type_name}' is not assignable in this workspace. Available: ${available:-(none)}. Enable it in ZenHub workspace settings, then retry."
+    fi
+
+    echo "$canonical"
+}
+
+# <noun> create: create an issue with the noun's issue type. Delegates to
+# cmd_create so --json/-q, labels, pipeline, body-file, and assignee all work
+# identically to plain `zh create`.
+cmd_hierarchy_create() {
+    local type_name="$1"
+    shift || true
+
+    if [[ $# -eq 0 ]]; then
+        error "Usage: zh $(to_lower "$type_name") create \"<title>\" [-d <body>] [-l labels] [-p pipeline] [--json|-q]"
+    fi
+
+    # Pass everything through to cmd_create with the type prepended. cmd_create
+    # owns arg parsing (including --json/-q and the -d/-b body flags via -b).
+    # We translate the planning-noun's -d/--description to cmd_create's -b.
+    local -a passthrough=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--description)
+                passthrough+=("-b" "$2")
+                shift 2
+                ;;
+            *)
+                passthrough+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    cmd_create "${passthrough[@]}" -t "$type_name"
+}
+
+# <noun> list: list workspace issues of the noun's issue type.
+cmd_hierarchy_list() {
+    local type_name="$1"
+
+    load_config
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local canonical
+    canonical=$(zh_hierarchy_require_type "$owner_repo" "$workspace_id" "$type_name")
+
+    info "Getting ${canonical} issues..."
+
+    local query='
+    query($workspaceId: ID!, $typeName: String!) {
+        workspace(id: $workspaceId) {
+            name
+            issues(first: 100, filters: {issueIssueTypes: {in: [$typeName]}}) {
+                totalCount
+                nodes {
+                    number
+                    title
+                    state
+                    repository { ownerName name }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg workspace_id "$workspace_id" --arg typeName "$canonical" \
+        '{workspaceId: $workspace_id, typeName: $typeName}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local ws_name total
+    ws_name=$(echo "$response" | jq -r '.data.workspace.name // "Unknown"')
+    total=$(echo "$response" | jq -r '.data.workspace.issues.totalCount // 0')
+
+    echo ""
+    echo -e "${BOLD}${canonical} issues in ${ws_name}${NC} (${total} total)"
+    echo ""
+
+    if [[ "$total" -eq 0 ]]; then
+        echo "  No ${canonical} issues in this workspace"
+        echo ""
+        return
+    fi
+
+    echo "$response" | jq -r '.data.workspace.issues.nodes[] |
+        "\(.number)\t\(.state)\t\(.title)"' | \
+        while IFS=$'\t' read -r num state title; do
+            local state_color="$GREEN"
+            if [[ "$state" == "CLOSED" ]]; then
+                state_color="$YELLOW"
+            fi
+            printf "  ${BOLD}#%-5s${NC} ${state_color}%-6s${NC} %s\n" "$num" "$state" "$title"
+        done
+    echo ""
+    echo -e "${CYAN}Tip:${NC} 'zh $(to_lower "$type_name") show <issue#>' shows an issue and its sub-issues."
+}
+
+# <noun> show: show an issue (with its issue-type) plus its child issues. We
+# read the GitHub-native sub-issue connection (githubChildIssues / parentIssue),
+# which is the side ZenHub's addSubIssues mutation populates in the modern
+# model. (zenhubChildIssues, which 'zh subissue list' reads, is a separate
+# legacy connection that the modern sub-issue wiring leaves empty.)
+cmd_hierarchy_show() {
+    local type_name="$1"
+    local issue_num="${2:-}"
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh $(to_lower "$type_name") show <issue#>"
+    fi
+
+    issue_num="${issue_num#\#}"
+
+    # Header: reuse cmd_issue for the full single-issue detail (type, level,
+    # parent, etc.).
+    cmd_issue "$issue_num"
+
+    load_config
+    local owner_repo repo_id
+    owner_repo=$(get_repo_info)
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            number
+            githubChildIssues(first: 100) {
+                totalCount
+                nodes {
+                    number
+                    title
+                    state
+                    assignees { nodes { login } }
+                    repository { ownerName name }
+                }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $issue_num}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local child_count
+    child_count=$(echo "$response" | jq -r '.data.issueByInfo.githubChildIssues.totalCount // 0')
+
+    echo -e "${BOLD}Children (${child_count}):${NC}"
+    echo ""
+    if [[ "$child_count" -eq 0 ]]; then
+        echo "  No child issues"
+        echo ""
+        return
+    fi
+
+    echo "$response" | jq -r '.data.issueByInfo.githubChildIssues.nodes[] |
+        "\(.number)\t\(.state)\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
+        while IFS=$'\t' read -r num istate assignees ititle; do
+            local marker="  "
+            local color="$NC"
+            if [[ "$istate" == "CLOSED" ]]; then
+                marker="✓ "
+                color="$YELLOW"
+            fi
+            printf "  ${BOLD}#%-5s${NC} │ %-15s │ ${color}%s%s${NC}\n" \
+                "$num" "${assignees:0:15}" "$marker" "$ititle"
+        done
+    echo ""
+}
+
+# Dispatch a planning-noun subcommand. Create/list/show are noun-specific;
+# add/remove/update/close/reopen are thin pass-throughs to the existing issue
+# and sub-issue verbs (an epic add IS a sub-issue add).
+cmd_hierarchy_dispatch() {
+    local type_name="$1"
+    shift || true
+
+    local lower
+    lower=$(to_lower "$type_name")
+
+    local sub="${1:-}"
+    shift || true
+
+    case "$sub" in
+        create|new)
+            cmd_hierarchy_create "$type_name" "$@"
+            ;;
+        list|ls)
+            cmd_hierarchy_list "$type_name"
+            ;;
+        show|view)
+            cmd_hierarchy_show "$type_name" "$@"
+            ;;
+        add)
+            # <noun> add <parent#> <child#> ... == sub-issue add
+            cmd_subissue_add "$@"
+            ;;
+        remove|rm)
+            cmd_subissue_remove "$@"
+            ;;
+        update|edit|modify)
+            cmd_update_issue "$@"
+            ;;
+        close)
+            cmd_close "$@"
+            ;;
+        reopen|open)
+            cmd_reopen "$@"
+            ;;
+        ""|help|-h|--help)
+            cat <<EOF
+zh ${lower} - Manage ${type_name} issues (issue-type + sub-issue model)
+
+USAGE:
+    zh ${lower} <subcommand> [args]
+
+SUBCOMMANDS:
+    create "Title" [opts]          Create an issue with type ${type_name}
+                                     -d, --description <text>
+                                     -l, --labels <comma-separated>
+                                     -p, --pipeline <name>
+                                     --json | -q   (machine-readable output)
+    list                           List issues of type ${type_name}
+    show <issue#>                  Show an issue + its sub-issues
+    add <parent#> <child#> [...]   Attach sub-issues (addSubIssues)
+    remove <parent#> <child#> [...] Detach sub-issues
+    update <issue#> [opts]         Edit title/body
+                                     -t, --title <text>
+                                     -d, --description <text>
+    close <issue#> [comment]       Close the issue
+    reopen <issue#>                Reopen the issue
+
+NOTES:
+    A ${type_name} is a normal GitHub issue whose ZenHub issue-type is
+    ${type_name}. It has an ordinary #number and issue URL. Children are
+    wired with Sub-Issues (the same mechanism as 'zh subissue').
+EOF
+            ;;
+        *)
+            error "Unknown ${lower} subcommand: ${sub}
+
+Run 'zh ${lower} help' for usage information."
+            ;;
+    esac
+}
+
+# Edit an existing issue's title and/or body (used by <noun> update). Wraps
+# updateIssue. Kept generic so every planning noun shares one implementation.
+cmd_update_issue() {
+    load_config
+
+    local issue_num=""
+    local title=""
+    local body=""
+    local title_set="false"
+    local body_set="false"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--title)
+                if [[ $# -lt 2 ]]; then error "Option ${1} requires a value"; fi
+                title="$2"; title_set="true"; shift 2
+                ;;
+            -d|--description|-b|--body)
+                if [[ $# -lt 2 ]]; then error "Option ${1} requires a value"; fi
+                body="$2"; body_set="true"; shift 2
+                ;;
+            *)
+                if [[ -z "$issue_num" ]]; then issue_num="$1"; fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$issue_num" ]]; then
+        error "Usage: zh <noun> update <issue#> [-t \"New Title\"] [-d \"New body\"]
+At least one of -t (title) or -d (description) must be provided."
+    fi
+    if [[ "$title_set" != "true" && "$body_set" != "true" ]]; then
+        error "Nothing to update: provide -t (title) and/or -d (description)."
+    fi
+
+    issue_num="${issue_num#\#}"
+    if ! [[ "$issue_num" =~ ^[0-9]+$ ]]; then
+        error "Invalid issue number: ${issue_num}"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local issue_id
+    issue_id=$(zh_resolve_issue_id "$repo_id" "$issue_num")
+
+    info "Updating #${issue_num}..."
+
+    local input_json
+    input_json=$(jq -n --arg id "$issue_id" '{issueId: $id}')
+    if [[ "$title_set" == "true" ]]; then
+        input_json=$(echo "$input_json" | jq --arg t "$title" '. + {title: $t}')
+    fi
+    if [[ "$body_set" == "true" ]]; then
+        input_json=$(echo "$input_json" | jq --arg b "$body" '. + {body: $b}')
+    fi
+
+    local mutation_vars
+    mutation_vars=$(jq -n --argjson input "$input_json" '{input: $input}')
+
+    local mutation='
+    mutation($input: UpdateIssueInput!) {
+        updateIssue(input: $input) {
+            issue { number title }
+        }
+    }'
+
+    local response
+    response=$(zh_graphql "$mutation" "$mutation_vars")
+
+    local resulting_title
+    resulting_title=$(echo "$response" | jq -r '.data.updateIssue.issue.title // empty')
+    if [[ -z "$resulting_title" ]]; then
+        error "Failed to update #${issue_num}: $(echo "$response" | jq -r '.errors[0].message // "unknown error"')"
+    fi
+
+    echo ""
+    success "Updated #${issue_num}: ${resulting_title}"
+}
+
+# Thin noun aliases. Each names a planning level; the engine does the work.
+cmd_initiative() { cmd_hierarchy_dispatch "Initiative" "$@"; }
+cmd_project()    { cmd_hierarchy_dispatch "Project" "$@"; }
+cmd_epic()       { cmd_hierarchy_dispatch "Epic" "$@"; }
+cmd_subtask()    { cmd_hierarchy_dispatch "Sub-task" "$@"; }
 
 # =============================================================================
 # Sprint commands (v1.6.0)
@@ -3973,388 +4707,6 @@ Examples:
     fi
 }
 
-# Encode a numeric epic ID into its GraphQL global-ID form.
-zh_epic_encode_id() {
-    local epic_num="$1"
-    printf 'gid://raptor/ZenhubEpic/%s' "$epic_num" | base64 | tr -d '\n'
-}
-
-# Decode a ZenHub epic GID back to its numeric form (for display).
-zh_epic_decode_id() {
-    local gid="$1"
-    local decoded
-    decoded=$(printf '%s' "$gid" | base64 -d 2>/dev/null || true)
-    # decoded looks like: gid://raptor/ZenhubEpic/123459
-    echo "${decoded##*/}"
-}
-
-# Build a best-effort ZenHub URL for an epic.
-zh_epic_build_url() {
-    local workspace_id="$1"
-    local epic_num="$2"
-    echo "https://app.zenhub.com/workspaces/${workspace_id}/zenhub-epics/${epic_num}"
-}
-
-# Verify an epic exists and return its full GID; errors out if not found.
-# We bypass zh_graphql's strict error handling here because looking up a
-# non-existent epic legitimately returns a NOT_FOUND error from the API, and
-# we want to surface a friendly "Epic #N not found" message rather than the
-# raw GraphQL error text.
-zh_epic_resolve() {
-    local epic_num="$1"
-    epic_num="${epic_num#\#}"
-
-    if ! [[ "$epic_num" =~ ^[0-9]+$ ]]; then
-        error "Invalid epic number: ${epic_num} (must be numeric)"
-    fi
-
-    local gid
-    gid=$(zh_epic_encode_id "$epic_num")
-
-    local query='query($id: ID!) { node(id: $id) { ... on ZenhubEpic { id } } }'
-    local variables
-    variables=$(jq -n --arg id "$gid" '{id: $id}')
-
-    local body
-    body=$(jq -n --arg q "$query" --argjson v "$variables" '{query: $q, variables: $v}')
-
-    local response
-    response=$(curl -s -X POST "$ZENHUB_API" \
-        -H "Authorization: Bearer ${ZH_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "$body")
-
-    local resolved
-    resolved=$(echo "$response" | jq -r '.data.node.id // empty')
-
-    if [[ -z "$resolved" ]]; then
-        # Distinguish "not found" from other errors (auth, network, etc.)
-        local err_code
-        err_code=$(echo "$response" | jq -r '.errors[0].extensions.code // empty')
-        if [[ "$err_code" == "NOT_FOUND" ]]; then
-            error "Epic #${epic_num} not found in this workspace"
-        fi
-
-        local err_msg
-        err_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"')
-        error "ZenHub API error resolving epic #${epic_num}: ${err_msg}"
-    fi
-
-    echo "$resolved"
-}
-
-cmd_epic_list() {
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    info "Getting epics for ${owner_repo}..."
-
-    local workspace_id
-    workspace_id=$(get_workspace_id "$owner_repo")
-
-    local query='
-    query($workspaceId: ID!) {
-        workspace(id: $workspaceId) {
-            name
-            zenhubEpics(first: 100) {
-                totalCount
-                nodes {
-                    id
-                    title
-                    state
-                }
-            }
-        }
-    }'
-
-    local variables
-    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
-
-    local workspace_name total
-    workspace_name=$(echo "$response" | jq -r '.data.workspace.name // "Unknown"')
-    total=$(echo "$response" | jq -r '.data.workspace.zenhubEpics.totalCount // 0')
-
-    echo ""
-    echo -e "${BOLD}Epics in ${workspace_name}${NC} (${total} total)"
-    echo ""
-
-    if [[ "$total" -eq 0 ]]; then
-        echo "  No epics in this workspace"
-        echo ""
-        return
-    fi
-
-    # Decode each epic's GID to a numeric number; print "num | state | title"
-    echo "$response" | jq -r '.data.workspace.zenhubEpics.nodes[] |
-        "\(.id)\t\(.state)\t\(.title)"' | \
-        while IFS=$'\t' read -r gid state title; do
-            local epic_num
-            epic_num=$(zh_epic_decode_id "$gid")
-            local state_color="$GREEN"
-            if [[ "$state" == "CLOSED" ]]; then
-                state_color="$YELLOW"
-            fi
-            printf "  ${BOLD}#%s${NC}  ${state_color}%-6s${NC}  %s\n" "$epic_num" "$state" "$title"
-        done
-
-    echo ""
-    echo -e "${CYAN}Tip:${NC} Use 'zh epic show <epic#>' to see an epic and its child issues"
-}
-
-cmd_epic_show() {
-    local epic_num="${1:-}"
-
-    if [[ -z "$epic_num" ]]; then
-        error "Usage: zh epic show <epic#>
-Example: zh epic show 12345"
-    fi
-
-    epic_num="${epic_num#\#}"
-
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    local workspace_id
-    workspace_id=$(get_workspace_id "$owner_repo")
-
-    # Verify the epic exists and resolve to GID
-    local epic_gid
-    epic_gid=$(zh_epic_resolve "$epic_num")
-
-    local query='
-    query($id: ID!, $workspaceId: ID!) {
-        node(id: $id) {
-            ... on ZenhubEpic {
-                id
-                title
-                state
-                body
-                createdAt
-                updatedAt
-                childIssues(workspaceId: $workspaceId, first: 100) {
-                    totalCount
-                    nodes {
-                        number
-                        title
-                        state
-                        assignees {
-                            nodes { login }
-                        }
-                        pipelineIssue(workspaceId: $workspaceId) {
-                            pipeline { name }
-                        }
-                        repository {
-                            ownerName
-                            name
-                        }
-                    }
-                }
-            }
-        }
-    }'
-
-    local variables
-    variables=$(jq -n --arg id "$epic_gid" --arg workspace_id "$workspace_id" \
-        '{id: $id, workspaceId: $workspace_id}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
-
-    local epic
-    epic=$(echo "$response" | jq '.data.node')
-
-    if [[ "$epic" == "null" ]]; then
-        error "Epic #${epic_num} not found"
-    fi
-
-    local title state body child_count zh_url
-    title=$(echo "$epic" | jq -r '.title')
-    state=$(echo "$epic" | jq -r '.state')
-    body=$(echo "$epic" | jq -r '.body // ""')
-    child_count=$(echo "$epic" | jq -r '.childIssues.totalCount // 0')
-    zh_url=$(zh_epic_build_url "$workspace_id" "$epic_num")
-
-    local state_color="$GREEN"
-    if [[ "$state" == "CLOSED" ]]; then
-        state_color="$YELLOW"
-    fi
-
-    echo ""
-    echo -e "${BOLD}Epic #${epic_num}${NC} ${title}"
-    echo ""
-    echo -e "  ${CYAN}State:${NC}    ${state_color}${state}${NC}"
-    echo -e "  ${CYAN}Children:${NC} ${child_count}"
-    echo -e "  ${CYAN}ZenHub:${NC}   ${zh_url}"
-    echo ""
-
-    if [[ -n "$body" ]] && [[ "$body" != "null" ]]; then
-        echo -e "${BOLD}Body:${NC}"
-        echo ""
-        echo "$body" | sed 's/^/  /'
-        echo ""
-    fi
-
-    echo -e "${BOLD}Child issues (${child_count}):${NC}"
-    echo ""
-
-    if [[ "$child_count" -eq 0 ]]; then
-        echo "  No child issues"
-        echo ""
-        return
-    fi
-
-    echo "$epic" | jq -r '.childIssues.nodes[] |
-        "\(.number)\t\(.state)\t\(.pipelineIssue.pipeline.name // "—")\t\([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end)\t\(.title)"' | \
-        while IFS=$'\t' read -r num istate pipeline assignees ititle; do
-            local marker="  "
-            local color="$NC"
-            if [[ "$istate" == "CLOSED" ]]; then
-                marker="✓ "
-                color="$YELLOW"
-            fi
-            printf "  ${BOLD}#%-5s${NC} │ %-20s │ %-15s │ ${color}%s%s${NC}\n" \
-                "$num" "${pipeline:0:20}" "${assignees:0:15}" "$marker" "$ititle"
-        done
-
-    echo ""
-}
-
-cmd_epic_create() {
-    local title=""
-    local body=""
-    local labels=""
-
-    # Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -d|--description|-b|--body)
-                body="$2"
-                shift 2
-                ;;
-            -l|--label|--labels)
-                labels="$2"
-                shift 2
-                ;;
-            *)
-                if [[ -z "$title" ]]; then
-                    title="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$title" ]]; then
-        error "Usage: zh epic create \"<title>\" [-d <description>] [-l label1,label2]
-Example: zh epic create \"Auth Service\" -d \"Build authentication API\" -l backend,auth"
-    fi
-
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    info "Creating epic: ${title}..."
-
-    local workspace_id
-    workspace_id=$(get_workspace_id "$owner_repo")
-
-    # Get zenhubOrganization ID from the workspace. We deliberately do NOT pass
-    # zenhubRepositoryId — that field expects a ZenHub-internal repo ID (distinct
-    # from the GitHub-mirrored repo ID we have access to), and the field is
-    # optional. Without it, the epic is workspace-scoped, which matches what
-    # the ZenHub UI does for native epics.
-    local org_query='
-    query($workspaceId: ID!) {
-        workspace(id: $workspaceId) {
-            zenhubOrganization { id }
-        }
-    }'
-
-    local org_vars
-    org_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
-
-    local org_response
-    org_response=$(zh_graphql "$org_query" "$org_vars")
-
-    local org_id
-    org_id=$(echo "$org_response" | jq -r '.data.workspace.zenhubOrganization.id // empty')
-
-    if [[ -z "$org_id" ]]; then
-        error "Could not determine ZenHub organization for workspace"
-    fi
-
-    # Build the epic-input payload
-    local epic_input
-    if [[ -n "$body" ]]; then
-        epic_input=$(jq -n --arg title "$title" --arg body "$body" \
-            '{title: $title, body: $body}')
-    else
-        epic_input=$(jq -n --arg title "$title" '{title: $title}')
-    fi
-
-    local create_vars
-    create_vars=$(jq -n \
-        --arg org_id "$org_id" \
-        --argjson epic "$epic_input" \
-        '{input: {zenhubOrganizationId: $org_id, zenhubEpic: $epic}}')
-
-    local mutation='
-    mutation($input: CreateZenhubEpicInput!) {
-        createZenhubEpic(input: $input) {
-            zenhubEpic {
-                id
-                title
-                state
-            }
-        }
-    }'
-
-    local response
-    response=$(zh_graphql "$mutation" "$create_vars")
-
-    local new_gid
-    new_gid=$(echo "$response" | jq -r '.data.createZenhubEpic.zenhubEpic.id // empty')
-
-    if [[ -z "$new_gid" ]]; then
-        error "Failed to create epic"
-    fi
-
-    local new_num
-    new_num=$(zh_epic_decode_id "$new_gid")
-
-    local new_url
-    new_url=$(zh_epic_build_url "$workspace_id" "$new_num")
-
-    echo ""
-    success "Created epic #${new_num}: ${title}"
-    echo -e "  ${CYAN}URL:${NC} ${new_url}"
-
-    # Apply labels (best-effort) — uses LabelInfoInput {name, color}
-    if [[ -n "$labels" ]]; then
-        local labels_array
-        labels_array=$(echo "$labels" | jq -R \
-            'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map({name: ., color: "cccccc"})')
-
-        local label_vars
-        label_vars=$(jq -n --arg gid "$new_gid" --argjson infos "$labels_array" \
-            '{input: {zenhubEpicIds: [$gid], labelInfos: $infos}}')
-
-        local label_mutation='
-        mutation($input: AddZenhubLabelsToZenhubEpicsInput!) {
-            addZenhubLabelsToZenhubEpics(input: $input) {
-                zenhubEpics { id }
-            }
-        }'
-
-        if zh_graphql "$label_mutation" "$label_vars" > /dev/null 2>&1; then
-            echo -e "  ${CYAN}Labels:${NC} ${labels}"
-        else
-            warn "Failed to apply labels: ${labels}"
-        fi
-    fi
-}
 
 # Shared helper: resolve a list of issue numbers to ZenHub issue IDs.
 # Echoes a JSON array of IDs (one per resolved issue) on stdout; errors out
@@ -4398,309 +4750,6 @@ zh_resolve_issue_ids() {
     echo "$ids"
 }
 
-cmd_epic_add() {
-    local epic_num="${1:-}"
-    shift || true
-
-    if [[ -z "$epic_num" ]] || [[ $# -eq 0 ]]; then
-        error "Usage: zh epic add <epic#> <issue#> [<issue#> ...]
-Example: zh epic add 12345 369 370"
-    fi
-
-    local issue_nums=("$@")
-
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
-
-    # Resolve epic and issue IDs
-    local epic_gid
-    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
-
-    info "Adding ${#issue_nums[@]} issue(s) to epic #${epic_num#\#}..."
-
-    local issue_ids_json
-    issue_ids_json=$(zh_resolve_issue_ids "$repo_id" "${issue_nums[@]}")
-
-    local mutation_vars
-    mutation_vars=$(jq -n --arg gid "$epic_gid" --argjson ids "$issue_ids_json" \
-        '{input: {issueIds: $ids, zenhubEpicIds: [$gid]}}')
-
-    local mutation='
-    mutation($input: AddIssuesToZenhubEpicsInput!) {
-        addIssuesToZenhubEpics(input: $input) {
-            zenhubEpics { id }
-        }
-    }'
-
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
-
-    local ok
-    ok=$(echo "$response" | jq -r '.data.addIssuesToZenhubEpics.zenhubEpics[0].id // empty')
-
-    if [[ -z "$ok" ]]; then
-        error "Failed to add issues to epic"
-    fi
-
-    # Build a "#369, #370" style summary
-    local summary
-    summary=$(printf '#%s, ' "${issue_nums[@]/#\#/}")
-    summary="${summary%, }"
-
-    echo ""
-    success "Added ${summary} to epic #${epic_num#\#}"
-}
-
-cmd_epic_remove() {
-    local epic_num="${1:-}"
-    shift || true
-
-    if [[ -z "$epic_num" ]] || [[ $# -eq 0 ]]; then
-        error "Usage: zh epic remove <epic#> <issue#> [<issue#> ...]
-Example: zh epic remove 12345 369"
-    fi
-
-    local issue_nums=("$@")
-
-    local owner_repo
-    owner_repo=$(get_repo_info)
-
-    local repo_id
-    repo_id=$(get_repo_id "$owner_repo")
-
-    local epic_gid
-    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
-
-    info "Removing ${#issue_nums[@]} issue(s) from epic #${epic_num#\#}..."
-
-    local issue_ids_json
-    issue_ids_json=$(zh_resolve_issue_ids "$repo_id" "${issue_nums[@]}")
-
-    local mutation_vars
-    mutation_vars=$(jq -n --arg gid "$epic_gid" --argjson ids "$issue_ids_json" \
-        '{input: {issueIds: $ids, zenhubEpicIds: [$gid]}}')
-
-    local mutation='
-    mutation($input: RemoveIssuesFromZenhubEpicsInput!) {
-        removeIssuesFromZenhubEpics(input: $input) {
-            zenhubEpics { id }
-        }
-    }'
-
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
-
-    local ok
-    ok=$(echo "$response" | jq -r '.data.removeIssuesFromZenhubEpics.zenhubEpics[0].id // empty')
-
-    if [[ -z "$ok" ]]; then
-        error "Failed to remove issues from epic"
-    fi
-
-    local summary
-    summary=$(printf '#%s, ' "${issue_nums[@]/#\#/}")
-    summary="${summary%, }"
-
-    echo ""
-    success "Removed ${summary} from epic #${epic_num#\#}"
-}
-
-cmd_epic_set_state() {
-    local epic_num="$1"
-    local new_state="$2"     # OPEN or CLOSED
-    local verb="$3"          # "Closed" or "Reopened" (for output)
-
-    local epic_gid
-    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
-
-    info "Setting epic #${epic_num#\#} state to ${new_state}..."
-
-    local mutation_vars
-    mutation_vars=$(jq -n --arg gid "$epic_gid" --arg state "$new_state" \
-        '{input: {zenhubEpicId: $gid, state: $state}}')
-
-    # Note: ZenhubEpicState is an ENUM, but GraphQL accepts string-coerced enum
-    # values when sent as variables, so this works without special handling.
-    local mutation='
-    mutation($input: UpdateZenhubEpicStateInput!) {
-        updateZenhubEpicState(input: $input) {
-            zenhubEpic { id state title }
-        }
-    }'
-
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
-
-    local resulting_state title
-    resulting_state=$(echo "$response" | jq -r '.data.updateZenhubEpicState.zenhubEpic.state // empty')
-    title=$(echo "$response" | jq -r '.data.updateZenhubEpicState.zenhubEpic.title // ""')
-
-    if [[ -z "$resulting_state" ]]; then
-        error "Failed to update epic state"
-    fi
-
-    echo ""
-    success "${verb} epic #${epic_num#\#}: ${title}"
-    echo -e "  ${CYAN}State:${NC} ${resulting_state}"
-}
-
-cmd_epic_close() {
-    local epic_num="${1:-}"
-    if [[ -z "$epic_num" ]]; then
-        error "Usage: zh epic close <epic#>
-Example: zh epic close 12345"
-    fi
-    cmd_epic_set_state "$epic_num" "CLOSED" "Closed"
-}
-
-cmd_epic_reopen() {
-    local epic_num="${1:-}"
-    if [[ -z "$epic_num" ]]; then
-        error "Usage: zh epic reopen <epic#>
-Example: zh epic reopen 12345"
-    fi
-    cmd_epic_set_state "$epic_num" "OPEN" "Reopened"
-}
-
-cmd_epic_update() {
-    local epic_num=""
-    local title=""
-    local body=""
-    local title_set="false"
-    local body_set="false"
-
-    # Parse arguments. First positional is the epic number; -t/-d may follow
-    # in any order.
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -t|--title)
-                if [[ $# -lt 2 ]]; then
-                    error "Option ${1} requires a value"
-                fi
-                title="$2"
-                title_set="true"
-                shift 2
-                ;;
-            -d|--description|-b|--body)
-                if [[ $# -lt 2 ]]; then
-                    error "Option ${1} requires a value"
-                fi
-                body="$2"
-                body_set="true"
-                shift 2
-                ;;
-            *)
-                if [[ -z "$epic_num" ]]; then
-                    epic_num="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-
-    if [[ -z "$epic_num" ]]; then
-        error "Usage: zh epic update <epic#> [-t \"New Title\"] [-d \"New description\"]
-Example: zh epic update 12345 -t \"Renamed Epic\"
-Example: zh epic update 12345 -d \"Updated body text\"
-Example: zh epic update 12345 -t \"New Title\" -d \"New body\"
-
-At least one of -t (title) or -d (description) must be provided."
-    fi
-
-    if [[ "$title_set" != "true" && "$body_set" != "true" ]]; then
-        error "Nothing to update — provide -t (title) and/or -d (description).
-Usage: zh epic update <epic#> [-t \"New Title\"] [-d \"New description\"]"
-    fi
-
-    local epic_gid
-    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
-
-    info "Updating epic #${epic_num#\#}..."
-
-    # Build the input payload — only include fields that were actually set so
-    # we never accidentally clobber an unspecified field with an empty string.
-    local input_json
-    input_json=$(jq -n --arg gid "$epic_gid" '{zenhubEpicId: $gid}')
-
-    if [[ "$title_set" == "true" ]]; then
-        input_json=$(echo "$input_json" | jq --arg title "$title" '. + {title: $title}')
-    fi
-
-    if [[ "$body_set" == "true" ]]; then
-        input_json=$(echo "$input_json" | jq --arg body "$body" '. + {body: $body}')
-    fi
-
-    local mutation_vars
-    mutation_vars=$(jq -n --argjson input "$input_json" '{input: $input}')
-
-    local mutation='
-    mutation($input: UpdateZenhubEpicInput!) {
-        updateZenhubEpic(input: $input) {
-            zenhubEpic {
-                id
-                title
-                body
-                state
-            }
-        }
-    }'
-
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
-
-    local resulting_title resulting_state
-    resulting_title=$(echo "$response" | jq -r '.data.updateZenhubEpic.zenhubEpic.title // empty')
-    resulting_state=$(echo "$response" | jq -r '.data.updateZenhubEpic.zenhubEpic.state // empty')
-
-    if [[ -z "$resulting_title" ]]; then
-        error "Failed to update epic #${epic_num#\#}"
-    fi
-
-    echo ""
-    success "Updated epic #${epic_num#\#}: ${resulting_title}"
-    if [[ "$title_set" == "true" ]]; then
-        echo -e "  ${CYAN}Title:${NC} ${resulting_title}"
-    fi
-    if [[ "$body_set" == "true" ]]; then
-        echo -e "  ${CYAN}Body:${NC}  updated (${#body} chars)"
-    fi
-    echo -e "  ${CYAN}State:${NC} ${resulting_state}"
-}
-
-cmd_epic_delete() {
-    local epic_num="${1:-}"
-    if [[ -z "$epic_num" ]]; then
-        error "Usage: zh epic delete <epic#>
-Example: zh epic delete 12345
-
-DANGER: This permanently deletes the epic. Use 'zh epic close' instead if you
-just want to mark it done."
-    fi
-
-    local epic_gid
-    epic_gid=$(zh_epic_resolve "${epic_num#\#}")
-
-    info "Deleting epic #${epic_num#\#}..."
-
-    local mutation_vars
-    mutation_vars=$(jq -n --arg gid "$epic_gid" \
-        '{input: {zenhubEpicId: $gid}}')
-
-    local mutation='
-    mutation($input: DeleteZenhubEpicInput!) {
-        deleteZenhubEpic(input: $input) {
-            clientMutationId
-        }
-    }'
-
-    zh_graphql "$mutation" "$mutation_vars" > /dev/null
-
-    echo ""
-    success "Deleted epic #${epic_num#\#}"
-}
 
 # =============================================================================
 # Sub-issue Commands
@@ -5890,86 +5939,6 @@ Run 'zh subissue help' for usage information."
     esac
 }
 
-cmd_epic() {
-    load_config
-
-    local sub="${1:-}"
-    shift || true
-
-    case "$sub" in
-        list|ls)
-            cmd_epic_list "$@"
-            ;;
-        show|view)
-            cmd_epic_show "$@"
-            ;;
-        create|new)
-            cmd_epic_create "$@"
-            ;;
-        update|edit|modify)
-            cmd_epic_update "$@"
-            ;;
-        add)
-            cmd_epic_add "$@"
-            ;;
-        remove|rm)
-            cmd_epic_remove "$@"
-            ;;
-        close)
-            cmd_epic_close "$@"
-            ;;
-        reopen|open)
-            cmd_epic_reopen "$@"
-            ;;
-        delete)
-            cmd_epic_delete "$@"
-            ;;
-        ""|help|-h|--help)
-            cat << 'EOF'
-zh epic - Manage ZenHub native epics
-
-USAGE:
-    zh epic <subcommand> [args]
-
-SUBCOMMANDS:
-    list                              List all epics in the workspace
-    show <epic#>                      Show epic details + child issues
-    create "Title" [opts]             Create a new epic
-                                        -d, --description <text>
-                                        -l, --labels <comma-separated>
-    update <epic#> [opts]             Edit an existing epic's title and/or body
-                                        -t, --title <text>
-                                        -d, --description <text>
-                                      (aliases: edit, modify)
-    add <epic#> <issue#> [...]        Add one or more issues to an epic
-    remove <epic#> <issue#> [...]     Remove one or more issues from an epic
-    close <epic#>                     Mark an epic CLOSED
-    reopen <epic#>                    Mark an epic OPEN
-    delete <epic#>                    Permanently delete an epic (DANGER)
-
-EXAMPLES:
-    zh epic list
-    zh epic show 12345
-    zh epic create "Auth Service" -d "Build authentication API" -l backend,auth
-    zh epic update 12345 -t "Renamed" -d "New body"
-    zh epic add 12345 369 370
-    zh epic remove 12345 369
-    zh epic close 12345
-    zh epic reopen 12345
-
-NOTES:
-    Epic numbers are the trailing numeric portion of ZenHub's internal IDs
-    (stable, workspace-scoped). They are shown by 'zh epic list'.
-EOF
-            ;;
-        *)
-            error "Unknown epic subcommand: ${sub}
-
-Run 'zh epic help' for usage information."
-            ;;
-    esac
-}
-
 # =============================================================================
 # Main
 # =============================================================================
@@ -6122,6 +6091,9 @@ main() {
         types)
             cmd_types "$@"
             ;;
+        type|set-type|retype)
+            cmd_set_type "$@"
+            ;;
         labels)
             cmd_labels "$@"
             ;;
@@ -6137,8 +6109,20 @@ main() {
         priority|prio)
             cmd_priority "$@"
             ;;
+        priorities|prios)
+            cmd_priorities "$@"
+            ;;
         epic|epics)
             cmd_epic "$@"
+            ;;
+        initiative|initiatives)
+            cmd_initiative "$@"
+            ;;
+        project|projects)
+            cmd_project "$@"
+            ;;
+        subtask|subtasks)
+            cmd_subtask "$@"
             ;;
         subissue|subissues|sub|child|children)
             cmd_subissue "$@"

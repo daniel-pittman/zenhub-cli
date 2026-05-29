@@ -463,6 +463,47 @@ def test_parse_new_epic_number_returns_none_without_success_line():
 
 
 # -----------------------------------------------------------------------------
+# _parse_create_json (v1.9.0 G2). `zh create --json` emits a single JSON
+# object on stdout (human chatter goes to stderr). The MCP create_issue /
+# planning *_create tools parse the new number from this object rather than
+# scraping a colorized success line.
+# -----------------------------------------------------------------------------
+
+
+def test_parse_create_json_pure_object():
+    stdout = (
+        '{"number": 42, "url": "https://github.com/o/r/issues/42", '
+        '"title": "Auth service", "type": "Epic", "pipeline": null, '
+        '"estimate": null, "parent": null}\n'
+    )
+    obj = mcp_server._parse_create_json(stdout)
+    assert obj is not None
+    assert obj["number"] == 42
+    assert obj["type"] == "Epic"
+    assert obj["url"].endswith("/42")
+
+
+def test_parse_create_json_with_leading_noise():
+    # Defensive: a wrapper prepends a stray line. We still find the object.
+    stdout = 'stray prefix line\n{"number": 7, "type": "Feature"}\n'
+    obj = mcp_server._parse_create_json(stdout)
+    assert obj is not None
+    assert obj["number"] == 7
+    assert obj["type"] == "Feature"
+
+
+def test_parse_create_json_returns_none_on_no_json():
+    assert mcp_server._parse_create_json("Error: type not found\n") is None
+    assert mcp_server._parse_create_json("") is None
+
+
+def test_parse_create_json_ignores_non_object_json():
+    # A bare JSON array / scalar is not a create object.
+    assert mcp_server._parse_create_json("[1, 2, 3]") is None
+    assert mcp_server._parse_create_json("42") is None
+
+
+# -----------------------------------------------------------------------------
 # _default_venv_dir empty ZH_MCP_VENV — round-4 #10.
 # An empty / whitespace value must NOT silently fall through to XDG
 # without diagnostic. The fall-through is preserved (so CI configs

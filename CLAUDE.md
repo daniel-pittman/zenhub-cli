@@ -33,24 +33,36 @@ zh delete <issue> [-y]        # DANGER: permanently delete a GitHub issue (via g
 
 # Create issues
 zh create "Title" -t Bug -l "label1,label2" -e 3 -p "TO DO"
+zh create "Title" -t Epic --json              # Machine-readable JSON on stdout (batch callers)
+zh create "Title" -t Feature --parent 42 -q   # Nest under #42; emit only the new number
+zh type <issue> <name>                        # Change an existing issue's type
 
-# Dependencies & priority
+# Dependencies
 zh block <blocked> <blocker>  # Set dependency
 zh unblock <blocked> <blocker> # Remove dependency
-zh priority <issue> high      # Set priority
 
-# Epics (ZenHub native epics, workspace-scoped)
-zh epic list                       # List all epics in workspace
-zh epic show <epic#>               # Show epic + child issues
-zh epic create "Title" [-d body] [-l labels]
-zh epic update <epic#> [-t "New Title"] [-d "New body"]  # Edit existing epic
-zh epic add <epic#> <issue#> [...]    # Add one or more issues to an epic
-zh epic remove <epic#> <issue#> [...] # Remove one or more issues from an epic
-zh epic close <epic#>              # Close epic
-zh epic reopen <epic#>             # Reopen epic
-zh epic delete <epic#>             # DANGER: permanently delete an epic
+# Priorities (workspace-defined, resolved by name)
+zh priorities                 # List the workspace's configured priorities
+zh priority <issue> "High priority"  # Set by name (case-insensitive); errors if not configured
+zh priority <issue> clear     # Remove priority
 
-# Sub-issues (3rd hierarchy tier: Epic -> Issue -> Sub-issue)
+# Planning hierarchy (issue-type + sub-issue model)
+# ZenHub removed Legacy Epics and ZenhubEpics in June 2025. An epic is now a
+# normal issue whose issue-type is Epic; children are wired via sub-issues.
+# Levels: 1 Initiative, 2 Project, 3 Epic (planning panel); 4 Bug/Feature/Task,
+# 5 Sub-task (board). Each ZenHub-managed level has a noun with the same surface.
+zh epic list                       # List Epic issues
+zh epic show <issue#>              # Show the issue + its sub-issues
+zh epic create "Title" [-d body] [-l labels] [-p pipeline] [--json|-q]
+zh epic update <issue#> [-t "New Title"] [-d "New body"]
+zh epic add <parent#> <issue#> [...]    # Attach sub-issues
+zh epic remove <parent#> <issue#> [...] # Detach sub-issues
+zh epic close <issue#> [comment]   # Close the issue
+zh epic reopen <issue#>            # Reopen the issue
+zh initiative <sub> / zh project <sub> / zh subtask <sub>  # Same surface, other levels
+# To delete an epic, delete the issue: zh delete <issue#> (DANGER, prefer close)
+
+# Sub-issues (the parent/child wiring; epic add is sugar over this)
 zh subissue add <parent#> <child#> [...]      # Link issues as sub-issues
 zh subissue remove <parent#> <child#> [...]   # Unlink sub-issues
 zh subissue list <parent#>                    # List sub-issues of a parent
@@ -76,7 +88,8 @@ zh -w "Backend Team" <cmd>                    # Target a specific workspace
 # Or set ZH_REPO / ZH_WORKSPACE in env or ~/.config/zh/config
 
 # Discovery
-zh types                # List issue types
+zh types                # List assignable issue types (name, level, disposition, source)
+zh priorities           # List configured priorities
 zh labels               # List labels
 zh pipelines            # List pipelines
 zh workspaces           # List workspaces (● marks active target)
