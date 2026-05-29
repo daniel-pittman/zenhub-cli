@@ -2141,3 +2141,142 @@ def test_verb_wording_update_and_reopen_same_pattern() -> None:
     for verb in ("update", "reopen"):
         out = _verb_wording(verb)
         assert f"{verb} still applied to #42" in out
+
+
+# ===========================================================================
+# v1.9.1 round-5 fixes (PR #25 round-4 review findings 1 and 2 only;
+# subsequent findings are symmetric-gap / polish, deferred to v1.9.2
+# per the explicit reviewer recommendation to pause here).
+# ===========================================================================
+
+
+# Round-5 finding #1: the round-4 #1 envelope added a new `else` branch
+# for the moveIssue failure, but did NOT clear priority_id the way the
+# sibling "Pipeline not found" branch does. Without this, the priority
+# block at the bottom of cmd_create binds the priority to whichever
+# pipelineIssue exists for the new issue (the default Triage pipeline,
+# since the move did not land) and the operator believes both flags
+# applied.
+_MOVE_FAILSOFT_PRIORITY_CLEANUP_SNIPPET = r"""
+set -euo pipefail
+priority_id="prio-high-id"
+priority_name="High"
+new_issue_num="100"
+pipeline="In Progress"
+
+warn() { echo "WARN: $1" >&2; }
+
+# Mirror the round-5 #1 fail-soft `else` arm for the move mutation.
+move_failed="$1"  # "yes" / "no"
+if [[ "$move_failed" == "no" ]]; then
+    echo "MOVE_OK"
+else
+    warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed."
+    if [[ -n "$priority_id" ]]; then
+        warn "Skipping --priority '${priority_name}' because the move-to-'${pipeline}' mutation failed."
+        priority_id=""
+    fi
+fi
+
+if [[ -n "$priority_id" ]]; then
+    echo "PRIORITY_WILL_APPLY:${priority_id}"
+else
+    echo "PRIORITY_CLEARED"
+fi
+"""
+
+
+def _move_failsoft(move_failed: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _MOVE_FAILSOFT_PRIORITY_CLEANUP_SNIPPET, "_", move_failed],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_move_failure_clears_priority_id() -> None:
+    """When moveIssue fails after the pipeline_id resolved, the
+    fail-soft `else` must clear priority_id so the priority block
+    does not bind the priority to the wrong (default) pipeline.
+    """
+    r = _move_failsoft("yes")
+    assert r.returncode == 0
+    assert r.stdout.strip() == "PRIORITY_CLEARED"
+    assert "Skipping --priority" in r.stderr
+
+
+def test_move_success_keeps_priority_id() -> None:
+    """When moveIssue succeeds, priority_id is preserved so the
+    priority block applies it to the correctly-placed pipelineIssue.
+    Regression guard so the round-5 #1 fix does not over-clear.
+    """
+    r = _move_failsoft("no")
+    assert r.returncode == 0
+    assert "MOVE_OK" in r.stdout
+    assert "PRIORITY_WILL_APPLY:prio-high-id" in r.stdout
+    assert "PRIORITY_CLEARED" not in r.stdout
+
+
+# Round-5 finding #2: cmd_hierarchy_create's `--flag=value` normalizer
+# must reject empty values like cmd_create does. Without it, a
+# wrapper script with an unset shell variable (`--description=$DESC`
+# where DESC is unset) silently creates a body-less planning issue.
+_HIERARCHY_EMPTY_VALUE_SNIPPET = r"""
+set -euo pipefail
+error() { echo "ERROR: $1" >&2; exit 1; }
+passthrough=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        _hnorm_flag="${1%%=*}"
+        _hnorm_val="${1#*=}"
+        if [[ -z "$_hnorm_val" ]]; then
+            error "Option ${_hnorm_flag} requires a value (received empty string from '${1}')"
+        fi
+        set -- "$_hnorm_flag" "$_hnorm_val" "${@:2}"
+    fi
+    case "$1" in
+        -d|--description) passthrough+=("-b" "$2"); shift 2 ;;
+        *) passthrough+=("$1"); shift ;;
+    esac
+done
+echo "OK:${passthrough[*]:-}"
+"""
+
+
+def _hierarchy_empty(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _HIERARCHY_EMPTY_VALUE_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_hierarchy_create_rejects_empty_description() -> None:
+    """`zh epic create "X" --description=` (unset DESC) hard-errors at
+    the planning-noun layer. Pre-round-5 the empty value silently
+    propagated through to cmd_create as `-b ""` and produced an
+    empty-body issue.
+    """
+    r = _hierarchy_empty("Title", "--description=")
+    assert r.returncode == 1
+    assert "requires a value" in r.stderr
+    assert "--description" in r.stderr
+
+
+def test_hierarchy_create_rejects_empty_labels() -> None:
+    """Same guard covers every long flag (not just --description)."""
+    r = _hierarchy_empty("Title", "--labels=")
+    assert r.returncode == 1
+    assert "requires a value" in r.stderr
+    assert "--labels" in r.stderr
+
+
+def test_hierarchy_create_accepts_non_empty_value() -> None:
+    """Regression guard: the round-5 #2 rejection does not break the
+    happy path. A populated description still routes through the `-d`
+    -> `-b` translation.
+    """
+    r = _hierarchy_empty("Title", "--description=Body")
+    assert r.returncode == 0
+    out = r.stdout.strip()
+    assert out.startswith("OK:")
+    assert "-b" in out
+    assert "Body" in out

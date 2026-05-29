@@ -2792,6 +2792,17 @@ Examples:
                 fi
             else
                 warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed. Retry with 'zh move #${new_issue_num} \"${pipeline}\"'."
+                # Round-5 finding #1: mirror the "Pipeline not found"
+                # defense. setPriorityOnPipelineIssues binds to whichever
+                # pipelineIssue exists for the issue, which is still the
+                # default placement when the move did not land. Skip
+                # priority application here for the same reason as the
+                # not-found branch; the user retries both with explicit
+                # follow-ups.
+                if [[ -n "$priority_id" ]]; then
+                    warn "Skipping --priority '${priority_name}' because the move-to-'${pipeline}' mutation failed: priority lives on the pipelineIssue and would bind to the wrong placement. Re-run 'zh priority #${new_issue_num} \"${priority_name}\"' after the move retries."
+                    priority_id=""
+                fi
             fi
         else
             warn "Pipeline '${pipeline}' not found"
@@ -3576,10 +3587,22 @@ cmd_hierarchy_create() {
     # `-t` conflict-detection error) instead of falling through to the
     # `*)` arm and being silently forwarded to cmd_create as opaque
     # tokens that lose the user's intent.
+    #
+    # Round-5 finding #2: mirror the cmd_create round-4 #4 empty-value
+    # rejection. Without it, `zh epic create "X" --description=` (an
+    # unset shell variable expanded to nothing) splits to
+    # `--description ""` BEFORE cmd_create sees the token, so
+    # cmd_create's own empty-value guard never fires and the planning
+    # noun creates an empty-body issue. Reject here for symmetry.
     local -a passthrough=()
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == --*=* ]]; then
-            set -- "${1%%=*}" "${1#*=}" "${@:2}"
+            local _hnorm_flag="${1%%=*}"
+            local _hnorm_val="${1#*=}"
+            if [[ -z "$_hnorm_val" ]]; then
+                error "Option ${_hnorm_flag} requires a value (received empty string from '${1}')"
+            fi
+            set -- "$_hnorm_flag" "$_hnorm_val" "${@:2}"
         fi
         case "$1" in
             -d|--description)
