@@ -101,7 +101,7 @@ query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!, $after: String) {
     number
     title
     state
-    zenhubChildIssues(first: 100, after: $after) {
+    githubChildIssues(first: 100, after: $after) {
       totalCount
       pageInfo {
         hasNextPage
@@ -141,7 +141,7 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
             parent_number: int
             parent_title: str
             parent_state: str | None
-            total_count: int — API's zenhubChildIssues.totalCount
+            total_count: int (the API's githubChildIssues.totalCount)
             fetched_count: int — what we actually walked
             children: list[dict] with
                 id: str — workspace-global GraphQL gid
@@ -213,11 +213,11 @@ def list_sub_issues(ctx: RepoContext, parent_number: int) -> dict:
             parent_title = issue.get("title") or ""
             parent_state = issue.get("state")
             total_count = (
-                (issue.get("zenhubChildIssues") or {}).get("totalCount") or 0
+                (issue.get("githubChildIssues") or {}).get("totalCount") or 0
             )
             first_page = False
 
-        conn = issue.get("zenhubChildIssues") or {}
+        conn = issue.get("githubChildIssues") or {}
         for node in conn.get("nodes") or []:
             # Defensive normalization: skip a None entry rather than
             # crashing on `node.get(...)`. The API contract is a non-

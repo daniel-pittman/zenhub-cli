@@ -44,39 +44,43 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh mine [user]` — issues assigned to current or specified user
 - `zh users` — list assignable users in workspace
 - `zh workspaces` — list workspaces for the connected repo
-- `zh types` — list available issue types (Task, Feature, Bug, Spike, Research, Sub-task, Epic, etc.)
+- `zh types`: list the workspace's assignable issue types with name, level (1-5), disposition (PLANNING_PANEL vs BOARD), and source (ZenhubIssueType vs GithubIssueType). Backed by `assignableIssueTypes`, so it shows the full hierarchy (Initiative/Project/Epic plus Bug/Feature/Task/Sub-task), not just the board-level GitHub types.
+- `zh priorities`: list the workspace's configured priorities (name + color). Priorities are workspace-defined, not a fixed high/medium/low set.
 - `zh labels` — list available labels
-- `zh epic list` — list all epics in workspace
-- `zh epic show <epic#>` — show epic detail + child issues
+- `zh epic list`: list issues of type Epic in the workspace. (An epic is now a normal issue typed Epic; the same surface exists as `zh initiative list`, `zh project list`, `zh subtask list`.)
+- `zh epic show <issue#>`: show an Epic issue's detail + its child issues
 - `zh subissue list <parent#>` — list sub-issues (children) of a parent issue
 - `zh issue <N>` — also shows `Parent: #<N>` and `Sub-issues: <count>` when present, giving cheap 3-tier hierarchy visibility
 - `zh sprints [--all]` — list sprints in the workspace (● marks the active sprint). `--all` includes closed sprints.
 - `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
 
 ### Write operations (issue lifecycle)
-- `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>` — create issue
+- `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`. Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number.
+- `zh type <issue#> <type-name>`: change an existing issue's type (aliases: `set-type`, `retype`). Resolves the name via `zh types`; works for both ZenhubIssueType (Epic/Initiative/Project/Sub-task) and GithubIssueType (Bug/Feature/Task) via the unified type id.
 - `zh comment <issue#> -m "<text>" | -f <file> | --stdin` — add comment
 - `zh close <issue#> [comment]` — close (moves to Closed pipeline; optional closing comment)
 - `zh reopen <issue#>` — reopen
-- `zh delete <issue#> [-y]` — **PERMANENTLY delete** a GitHub issue (via `gh issue delete`; also removes it from the ZenHub board, and covers sub-issues since a sub-issue is just an issue). **DANGER / propose-first ALWAYS** — irreversible, needs admin/triage on the repo. Prefer `zh close` in almost every case. Interactive terminals are prompted to retype the issue number to confirm; `-y`/`--yes` skips the prompt and is implied for non-interactive callers, so an agent invocation will not hang waiting on a prompt — your propose-first protocol is the guardrail there. Wraps GitHub deletion (not ZenHub's `deleteZenhubIssue`, which only accepts ZenHub-only cards with no GitHub issue behind them — those must be removed in the ZenHub web UI). For epics use `zh epic delete`.
+- `zh delete <issue#> [-y]`: **PERMANENTLY delete** a GitHub issue (via `gh issue delete`; also removes it from the ZenHub board, and covers sub-issues since a sub-issue is just an issue). **DANGER / propose-first ALWAYS**: irreversible, needs admin/triage on the repo. Prefer `zh close` in almost every case. Interactive terminals are prompted to retype the issue number to confirm; `-y`/`--yes` skips the prompt and is implied for non-interactive callers, so an agent invocation will not hang waiting on a prompt (your propose-first protocol is the guardrail there). Wraps GitHub deletion (not ZenHub's `deleteZenhubIssue`, which only accepts ZenHub-only cards with no GitHub issue behind them; those must be removed in the ZenHub web UI). Epics are normal issues now, so delete one the same way: `zh delete <issue#>`.
 - `zh move <issue#> "<pipeline>"` — move between pipelines
 - `zh reorder <issue#> <position|top|bottom>` — reorder within current pipeline (numeric positions supported, top = 1)
 - `zh estimate <issue#> <points|clear>` — set/clear story-point estimate
 - `zh assign <issue#> <user>` — assign user
 - `zh unassign <issue#> [user]` — remove assignee(s)
-- `zh priority <issue#> <high|medium|low|clear>` — set priority
+- `zh priority <issue#> <name|clear>`: set priority by name. Priorities are workspace-defined, NOT a fixed high/medium/low set: the name is matched case-insensitively against the configured priorities (discover with `zh priorities`). An unconfigured name errors and lists the available ones rather than silently mis-setting. `clear` removes the priority.
 
 ### Write operations (relationships)
 - `zh block <blocked#> <blocking#>` — set dependency (blocked is blocked BY blocking)
 - `zh unblock <blocked#> <blocking#>` — remove dependency (requires `ZH_REST_TOKEN` because GraphQL API has no deleteBlockage mutation)
 
-### Write operations (epics)
-- `zh epic create "<title>" [-d desc] [-l labels]` — create epic
-- `zh epic update <epic#> [-t title] [-d body]` — edit title/description (aliases: `edit`, `modify`)
-- `zh epic add <epic#> <issue#> [<issue#> ...]` — add one or more issues to an epic (single API call)
-- `zh epic remove <epic#> <issue#> [...]` — remove issues
-- `zh epic close <epic#>` / `zh epic reopen <epic#>` — toggle state
-- `zh epic delete <epic#>` — permanently delete (DANGER — propose-first ALWAYS)
+### Write operations (planning hierarchy: epics and the other levels)
+ZenHub removed Legacy Epics and ZenhubEpics in June 2025 ("Epics and Projects have been replaced with Issue Types and Sub-Issues"). An **epic is now a normal issue whose issue-type is Epic** (level 3), with an ordinary `#number` and issue URL; children are attached via Sub-Issues. The same command surface exists for every ZenHub-managed level: `zh initiative` (level 1), `zh project` (level 2), `zh epic` (level 3), `zh subtask` (level 5). Board-level Bug/Feature/Task use `zh create -t <type>`.
+- `zh epic create "<title>" [-d desc] [-l labels] [-p pipeline] [--json|-q]`: create an Epic-typed issue
+- `zh epic update <issue#> [-t title] [-d body]`: edit title/description (aliases: `edit`, `modify`)
+- `zh epic add <parent#> <issue#> [<issue#> ...]`: attach one or more sub-issues (single `addSubIssues` call)
+- `zh epic remove <parent#> <issue#> [...]`: detach sub-issues
+- `zh epic close <issue#> [comment]` / `zh epic reopen <issue#>`: close/reopen the issue
+- To delete an epic, delete the issue: `zh delete <issue#>` (DANGER, propose-first ALWAYS; prefer close)
+- `zh initiative ...` / `zh project ...` / `zh subtask ...`: identical subcommands on their respective levels
 
 ### Write operations (sub-issues — 3rd hierarchy tier)
 Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue is a regular Issue whose `parentIssue` points to another Issue. Use this when an issue is too large for a single ticket but doesn't justify its own epic.
@@ -120,6 +124,8 @@ These are exposed by the MCP server (`mcp_server.py`) on top of the `zh` CLI. Av
 - **Pre-flight duplicate check on `create_issue`** — every `create_issue` call (including yours) automatically runs `check_duplicate(title, body)` before invoking `zh create`. See Hard Rule #5 below for how to handle the response.
 
 > **MCP architecture note (v1.6.0):** the `subissue_*` and `sprint_*` MCP tools talk to ZenHub's GraphQL API directly from Python (via `zh_api.py` / `zh_graphql_ops.py`), returning untruncated structured data with no text-parsing layer. Earlier versions parsed `zh --machine` TSV output; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap the bash `zh` because human-facing rendering already gives them everything they need.
+>
+> **MCP planning tools (v1.9.0):** the epic_* tools no longer hit the dead ZenhubEpic API. They (plus `initiative_*`, `project_*`, `subtask_*`, `set_issue_type`, and `list_priorities`) wrap the new bash planning nouns over the issue-type + sub-issue model. `create_issue` and the `*_create` tools call `zh ... create --json` and parse the new number from a clean JSON object on stdout rather than scraping a colorized success line (closing the batch parse-miss gap). `create_issue` gained a `type` (any assignable type) and a `parent` argument; `list_types` now reports level + disposition + source.
 
 ---
 
@@ -135,6 +141,12 @@ For internal local task IDs that may collide with real GitHub issue numbers, use
 - Spell it out: *"addresses the X→Y flow fix"* instead of `#400`
 
 A real-world incident this rule guards against: a project used internal task IDs `#369`, `#370`, …, `#411` in commit messages for traceability. Those numbers all existed as real GitHub issues in the same repo covering unrelated work. When the PR merged, GitHub auto-closed **10 unrelated tickets**. Recovery was a manual `gh issue reopen` on each.
+
+**`#N` is reserved for real GitHub issues in that repo. Never use it for any foreign ID.** The same parser that auto-closes also auto-LINKS: any `#N` in an issue/epic body or comment renders as a link to GitHub issue N in the current repo. So when authoring bodies or comments, never write `#<number>` to reference:
+- a ZenHub-only card (one with no GitHub issue behind it), or
+- any other foreign identifier (a ZenHub object id, a tracker ticket from another system).
+
+Doing so 404s if no such GitHub issue exists, or wrongly links to (or closes) an unrelated real issue that happens to share the number. Reference foreign objects by NAME plus a full, correct URL instead (for example, the card title plus its ZenHub web URL). Note that in the modern model an epic IS a real GitHub issue, so an epic's own `#number` is a legitimate `#N` reference; this rule is about ZenHub-only cards and non-GitHub identifiers, not about epics.
 
 ### 2. Propose-first for ALL destructive operations
 
@@ -288,11 +300,12 @@ For routine operations:
 
 ### Epic management
 
-- **Create** an epic: `zh epic create "Title" -d "body"`. Convention: prefix epic titles with a project tag for visibility in the workspace-wide epic list (the team's project should document the prefix in project conventions).
-- **Add children**: `zh epic add <epic#> <issue#> [<issue#> ...]` — batch in single call.
+- **Create** an epic: `zh epic create "Title" -d "body"` (it becomes an issue typed Epic). Convention: prefix epic titles with a project tag for visibility in the workspace-wide epic list (the team's project should document the prefix in project conventions).
+- **Add children**: `zh epic add <parent#> <issue#> [<issue#> ...]` (batch in a single call; attaches sub-issues).
 - **Restructure** (move children between epics): propose-first. Restructuring epic boundaries affects how the team views grouped work.
 - **Close**: propose-first. Closing an epic doesn't close its children, but it does change board visibility.
-- **Delete**: NEVER without explicit confirmation. The `zh epic delete` operation is irreversible.
+- **Delete**: NEVER without explicit confirmation. An epic is an issue, so deletion is `zh delete <issue#>`, which is irreversible. Prefer close.
+- **Other levels**: `zh initiative`, `zh project`, and `zh subtask` expose the identical surface on their respective hierarchy levels; `zh type <issue#> <name>` retypes an existing issue (for example to promote a Task to an Epic).
 
 ### Sub-issue management (3rd tier)
 
