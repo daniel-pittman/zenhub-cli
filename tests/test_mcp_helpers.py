@@ -1214,9 +1214,14 @@ def test_planning_create_confirm_create_overrides_block(monkeypatch):
 
 
 def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
-    """`skip_duplicate_check=True` skips the pre-flight entirely. The
-    similarity layer is never consulted; the response carries no
-    duplicate_check key.
+    """`skip_duplicate_check=True` skips the pre-flight similarity
+    machinery entirely (the similarity layer is never consulted).
+
+    v1.9.2 round-4 (PR #27) finding #9: the docstring contract
+    promises `duplicate_check` is always present on every successful
+    return. When the pre-flight is bypassed, the key carries a
+    `{"recommendation": "skipped", "matches": []}` placeholder so
+    clients reading the field uniformly do not KeyError.
     """
     sim_called = {"ran": False}
 
@@ -1242,7 +1247,12 @@ def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
         skip_duplicate_check=True,
     )
     assert out["ok"] is True
-    assert "duplicate_check" not in out
+    # The key is now ALWAYS present (round-4 #9); the placeholder
+    # distinguishes "skipped" from a real recommendation.
+    assert "duplicate_check" in out
+    assert out["duplicate_check"] == {"recommendation": "skipped",
+                                      "matches": []}
+    # And the similarity machinery still wasn't invoked.
     assert sim_called["ran"] is False
 
 

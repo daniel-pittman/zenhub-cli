@@ -1777,8 +1777,16 @@ SUBISSUE_LIST_KEYS = {
 }
 
 SUBISSUE_MUTATION_KEYS = {
-    "ok", "partial_applied", "parent_number", "outcome",
+    # v1.9.2 round-4 (PR #27) finding #14: `unaccounted` and
+    # `failed_unknown_count` are returned by every path of
+    # subissue_add_children / subissue_remove_children and are in
+    # the docstrings; adding them here so a regression dropping
+    # them from any return path is caught by the shape tests.
+    # v1.9.2 round-4 #2: `parent` is the cross-surface alias; both
+    # `parent_number` (legacy) and `parent` are required.
+    "ok", "partial_applied", "parent_number", "parent", "outcome",
     "success_count", "failed_count", "succeeded", "failed",
+    "unaccounted", "failed_unknown_count",
     "github_errors", "partial_success_warning", "stderr",
 }
 

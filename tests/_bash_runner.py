@@ -36,12 +36,37 @@ should target production via this runner.
 
 from __future__ import annotations
 
+import atexit
+import shutil
 import subprocess
 from pathlib import Path
 
 # Repo root resolves through whatever cwd the test is invoked from.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ZH_SCRIPT = REPO_ROOT / "zh"
+
+# v1.9.2 round-4 (PR #27) finding #11: track every isolated-HOME
+# tempdir the harness creates and remove them all at process exit.
+# Each `run_zh_with_stubs` call provisions a fresh tempdir to defeat
+# stray `/tmp/.config/zh/config` interference (round-3 #10); over a
+# full ~50-test cycle that's dozens of dirs left in TMPDIR for local
+# devs. CI runners wipe scratch between jobs so this didn't matter
+# there, but local-iteration tempdirs accumulate without a sweeper.
+_HARNESS_TEMPDIRS: list[str] = []
+
+
+def _cleanup_harness_tempdirs() -> None:
+    """atexit hook: remove every tempdir provisioned by the harness.
+
+    `ignore_errors=True` so a dir already removed by a prior cleanup,
+    a file the test process locked, or a permission glitch on shared
+    CI tmpfs cannot fail the test suite at exit.
+    """
+    for path in _HARNESS_TEMPDIRS:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_harness_tempdirs)
 
 
 def run_zh_with_stubs(
@@ -100,6 +125,9 @@ def run_zh_with_stubs(
     # jobs, so this does not leak across runs.
     import tempfile
     _isolated_home = tempfile.mkdtemp(prefix="zh-test-home-")
+    # v1.9.2 round-4 (PR #27) finding #11: register for atexit cleanup
+    # so local-iteration runs don't accumulate dozens of tempdirs.
+    _HARNESS_TEMPDIRS.append(_isolated_home)
     env_defaults = {
         # PATH must include common locations so jq/gh/curl resolve if
         # tests actually invoke them (they shouldn't, but the harness
@@ -142,17 +170,29 @@ def run_zh_with_stubs(
     if args:
         cmd.extend(args)
 
-    # v1.9.2 round-3 (PR #27) finding #7: inherit the parent
-    # environment so locale (LANG / LC_*), TMPDIR, TERM, USER,
-    # PYTHONIOENCODING and similar inherited vars survive. Pre-fix,
-    # `env=env_defaults` REPLACED the parent environment entirely;
-    # on a CI runner whose default locale is C, jq could emit ASCII-
-    # escaped sequences for the ✓ glyph in `success()`, and a missing
-    # TMPDIR forced mktemp onto /tmp regardless of developer setup.
-    # Explicit overrides still win because `**env_defaults` spreads
-    # AFTER os.environ in the merge.
+    # v1.9.2 round-3 (PR #27) finding #7: inherit specific parent-env
+    # vars so locale (LANG / LC_*), TMPDIR, TERM, USER,
+    # PYTHONIOENCODING and similar harness-friendly vars survive.
+    #
+    # v1.9.2 round-4 (PR #27) finding #4: use an ALLOWLIST instead of
+    # `dict(os.environ, **env_defaults)`. The earlier merge passed
+    # through every `ZH_*` var from the developer's shell — most
+    # consequentially ZH_REST_TOKEN, which a test that ran a
+    # REST-using code path without stubbing the REST helper would
+    # send to the live ZenHub API along with the developer's real
+    # credential. The allowlist restricts inheritance to a curated
+    # set of environment-shaping vars (locale / tmpdir / etc.) that
+    # affect rendering but carry no secrets, then layers
+    # env_defaults on top so the harness's explicit overrides win.
     import os as _os
-    merged_env = dict(_os.environ, **env_defaults)
+    _ALLOWED_INHERIT = (
+        "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_TIME",
+        "LC_NUMERIC", "LC_MESSAGES",
+        "TMPDIR", "TERM", "USER", "LOGNAME", "SHELL",
+        "PYTHONIOENCODING",
+    )
+    inherited = {k: _os.environ[k] for k in _ALLOWED_INHERIT if k in _os.environ}
+    merged_env = {**inherited, **env_defaults}
     return subprocess.run(
         cmd,
         capture_output=True,

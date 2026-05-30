@@ -100,19 +100,68 @@ success() {
 # with a trailing "..." marker if truncated. Reads from a file path
 # (which may be /dev/null per the round-1 #2 fail-soft fallback);
 # returns empty when the file is missing / empty / /dev/null.
+#
+# v1.9.2 round-4 (PR #27) finding #12: prefer the coreutils pipeline
+# (sed + awk + paste + tr) but fall back to a pure-bash implementation
+# when any of those tools are missing (alpine/busybox containers).
+# Without the fallback, the pipeline returns empty and every warn
+# silently lost its cause clause with no diagnostic. The pure-bash
+# variant strips CSI ANSI escapes, OSC sequences (round-4 finding
+# #15), drops empty lines, joins with "; ", and caps at 240 chars
+# using only built-in parameter expansion.
 zh_cause_hint() {
     local _f="$1"
     if [[ -z "$_f" || "$_f" == "/dev/null" || ! -s "$_f" ]]; then
         printf '%s' ""
         return 0
     fi
-    # Strip ANSI, drop empties, join with "; ", cap at 240 chars.
-    local _raw
-    _raw=$(LC_ALL=C sed -E $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$_f" 2>/dev/null \
-        | awk 'NF>0' \
-        | paste -sd';' - \
-        | tr -s ';' \
-        | sed -e 's/;/; /g' 2>/dev/null || true)
+    local _raw=""
+    # Detect coreutils availability up-front; if any are missing,
+    # use the pure-bash fallback. `command -v` returns 0 iff the
+    # tool resolves on PATH.
+    if command -v sed >/dev/null 2>&1 \
+        && command -v awk >/dev/null 2>&1 \
+        && command -v paste >/dev/null 2>&1 \
+        && command -v tr >/dev/null 2>&1; then
+        _raw=$(LC_ALL=C sed -E $'s/\033\\[[0-9;]*[a-zA-Z]//g; s/\033\\][^\007\033]*(\007|\033\\\\)//g' "$_f" 2>/dev/null \
+            | awk 'NF>0' \
+            | paste -sd';' - \
+            | tr -s ';' \
+            | sed -e 's/;/; /g' 2>/dev/null || true)
+    else
+        # Pure-bash fallback: read the file line-by-line, strip
+        # ANSI escape sequences via regex match-and-replace, drop
+        # empties, join with "; ". Uses pre-computed sentinel
+        # strings instead of inline $'\033' interpolation so the
+        # bash 3.2 / 4.x regex parser doesn't choke.
+        local _esc _csi_re _osc_re
+        _esc=$'\033'
+        # CSI: ESC [ <params/intermediates> <final-byte>
+        _csi_re="${_esc}\[[0-9;]*[a-zA-Z]"
+        # OSC: ESC ] <text> BEL (also covers most ESC ] ... ESC \)
+        _osc_re="${_esc}\][^"$'\007'"]*"$'\007'
+        local _line _out=""
+        while IFS= read -r _line || [[ -n "$_line" ]]; do
+            # Strip every CSI sequence on this line.
+            while [[ "$_line" =~ $_csi_re ]]; do
+                _line="${_line//${BASH_REMATCH[0]}/}"
+            done
+            # Strip every OSC sequence on this line.
+            while [[ "$_line" =~ $_osc_re ]]; do
+                _line="${_line//${BASH_REMATCH[0]}/}"
+            done
+            # Skip empty / whitespace-only lines.
+            local _trimmed="${_line#"${_line%%[![:space:]]*}"}"
+            if [[ -n "$_trimmed" ]]; then
+                if [[ -n "$_out" ]]; then
+                    _out="${_out}; ${_line}"
+                else
+                    _out="$_line"
+                fi
+            fi
+        done < "$_f"
+        _raw="$_out"
+    fi
     if [[ ${#_raw} -gt 240 ]]; then
         _raw="${_raw:0:237}..."
     fi
@@ -3713,7 +3762,13 @@ Examples:
     response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_resp_err_file") || response=""
     if [[ "$_resp_err_file" != "/dev/null" ]]; then
         response_err=$(zh_cause_hint "$_resp_err_file")
-        rm -f "$_resp_err_file"
+        # v1.9.2 round-4 (PR #27) finding #10: under set -euo pipefail
+        # a bare `rm -f` that fails (read-only TMPDIR mid-test, file
+        # removed by a sibling process) aborts cmd_set_type AFTER
+        # the mutation has run, losing both the partial-applied warn
+        # and the exit-2 signal the MCP wrapper depends on. Match
+        # the cmd_create envelope pattern.
+        rm -f "$_resp_err_file" 2>/dev/null || true
     fi
     if [[ -z "$response" ]]; then
         if [[ -n "$response_err" ]]; then
@@ -5899,8 +5954,32 @@ Example: zh subissue add 42 100 101"
         }
     }'
 
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
+    # v1.9.2 round-4 (PR #27) finding #1: fail-soft envelope mirroring
+    # cmd_set_type (zh:3713) and the six cmd_create envelopes. The
+    # pre-fix bare assignment died under `set -euo pipefail` whenever
+    # zh_graphql exited 1 on a `.errors` response. Under the
+    # round-3 #2 partial-applied contract, the divergence-only
+    # partial path (data block populated + .errors envelope) is
+    # EXACTLY the scenario the gate at zh:6042 is meant to detect;
+    # the bare assignment aborted before reaching it. With this
+    # envelope the partial classifier stays reachable, and an
+    # empty response is treated as a real failure with the cause
+    # hint surfaced.
+    local response="" response_err=""
+    local _ssa_err_file
+    _ssa_err_file=$(mktemp -t zh_ssadd.XXXXXX 2>/dev/null) || _ssa_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_ssa_err_file") || response=""
+    if [[ "$_ssa_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_ssa_err_file")
+        [[ "$_ssa_err_file" != "/dev/null" ]] && rm -f "$_ssa_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ -n "$response_err" ]]; then
+            error "Failed to add sub-issues to #${parent_num} (cause: ${response_err}). Verify with 'zh subissue list ${parent_num}' before retrying."
+        else
+            error "Failed to add sub-issues to #${parent_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh subissue list ${parent_num}' before retrying)."
+        fi
+    fi
 
     local success_count failed_count
     success_count=$(echo "$response" | jq -r '.data.addSubIssues.successCount // 0')
@@ -6037,14 +6116,20 @@ Example: zh subissue add 42 100 101"
     # collapsed any failed_count>0 to exit 1, which made the bash
     # side treat partial-success as full failure, silently
     # contradicting the MCP-GraphQL-direct surface.
+    #
+    # v1.9.2 round-4 (PR #27) finding #5: outcome=noop (zero positives,
+    # zero negatives) is idempotent success for add — every input was
+    # already linked, so the desired state is already true. Exit 0
+    # with the noop wording. The pre-fix exit 1 made agents retry an
+    # operation whose intent was already satisfied.
     if [[ "$outcome" == "ok" ]]; then
         :  # exit 0 (implicit)
+    elif [[ "$outcome" == "noop" ]]; then
+        :  # exit 0 — idempotent success (children already attached)
     elif [[ "$outcome" == "partial" ]]; then
         exit 2  # partial-applied: some succeeded, agent should not retry blindly
     elif [[ "$outcome" == "fail" ]]; then
         exit 1  # all-fail: safe to retry
-    elif [[ "$outcome" == "noop" ]]; then
-        exit 1  # zero positives = real failure (mirrors cmd_sprint_remove)
     else
         exit 2  # divergence-only partial = coverage incomplete
     fi
@@ -6204,8 +6289,25 @@ parent relationship before retrying."
         }
     }'
 
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
+    # v1.9.2 round-4 (PR #27) finding #1: same fail-soft envelope as
+    # cmd_subissue_add. The bare assignment died under set -e when
+    # zh_graphql exited 1 on a `.errors` response, missing the
+    # partial classifier at zh:6313.
+    local response="" response_err=""
+    local _ssr_err_file
+    _ssr_err_file=$(mktemp -t zh_ssrm.XXXXXX 2>/dev/null) || _ssr_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_ssr_err_file") || response=""
+    if [[ "$_ssr_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_ssr_err_file")
+        [[ "$_ssr_err_file" != "/dev/null" ]] && rm -f "$_ssr_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ -n "$response_err" ]]; then
+            error "Failed to remove sub-issues from #${parent_num} (cause: ${response_err}). Verify with 'zh subissue list ${parent_num}' before retrying."
+        else
+            error "Failed to remove sub-issues from #${parent_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh subissue list ${parent_num}' before retrying)."
+        fi
+    fi
 
     local success_count failed_count
     success_count=$(echo "$response" | jq -r '.data.removeSubIssues.successCount // 0')
@@ -6308,14 +6410,19 @@ state with 'zh subissue list ${stripped_parent}'."
     # exit 2 so MCP _planning_remove_children correctly reports
     # partial_applied=True and matches subissue_remove_children's
     # GraphQL-direct contract.
+    #
+    # v1.9.2 round-4 (PR #27) finding #5: outcome=noop for REMOVE
+    # means "none of the requested inputs were linked to begin with"
+    # — the desired state ("not linked") is already true. Exit 0 for
+    # idempotent-success symmetry with cmd_subissue_add's noop arm.
     if [[ "$outcome" == "ok" ]]; then
         :  # exit 0 (implicit)
+    elif [[ "$outcome" == "noop" ]]; then
+        :  # exit 0 — idempotent success (none were linked to remove)
     elif [[ "$outcome" == "partial" ]]; then
         exit 2  # partial-applied: some succeeded, agent should not retry blindly
     elif [[ "$outcome" == "fail" ]]; then
         exit 1  # all-fail: safe to retry
-    elif [[ "$outcome" == "noop" ]]; then
-        exit 1  # zero positives = real failure
     else
         exit 2  # divergence-only partial = coverage incomplete
     fi

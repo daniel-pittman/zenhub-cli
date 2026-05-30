@@ -114,8 +114,12 @@ def test_sprint_remove_full_shape_includes_new_fields():
 # ---- subissue_add_children / subissue_remove_children (round-3 #4) -------
 
 SUBISSUE_MUTATION_KEYS = {
-    "ok", "partial_applied", "parent_number", "outcome",
+    # v1.9.2 round-4 (PR #27) findings #2 + #14: `parent` (cross-surface
+    # alias for parent_number), `unaccounted`, and `failed_unknown_count`
+    # are all part of the documented contract on every return path.
+    "ok", "partial_applied", "parent_number", "parent", "outcome",
     "success_count", "failed_count", "succeeded", "failed",
+    "unaccounted", "failed_unknown_count",
     "github_errors", "partial_success_warning", "stderr",
 }
 

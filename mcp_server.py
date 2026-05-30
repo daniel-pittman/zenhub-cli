@@ -868,8 +868,21 @@ ZH_BIN = Path(os.environ.get("ZH_BIN_PATH", str(HERE / "zh")))
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-# ANSI color code regex — zh emits colored output for terminals; strip for MCP.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# ANSI escape regex — zh emits colored output for terminals; strip for MCP.
+#
+# v1.9.2 round-4 (PR #27) finding #15: extend beyond pure SGR/CSI
+# `\x1b[...m` to handle the broader CSI family (any final letter,
+# not just 'm') plus OSC sequences (`ESC ] ... BEL` / `ESC ] ... ESC \`).
+# Downstream tools that emit OSC-8 hyperlinks (`gh` with terminal-link
+# autodetect, modern `jq --rgb`) used to leak raw escape bytes through
+# this regex into MCP `stderr_plain` / `stdout_plain`, surfacing in the
+# client as garbled diagnostics. The order matters: CSI strip runs
+# first; OSC strip handles whatever remains. Both alternation branches
+# are non-greedy.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]"  # CSI: ESC [ params final-byte (any letter)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] text BEL or ST
+)
 # Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
 # `  #645 │ owner/repo │ ...` (2-space indent). Two tightening choices
 # both implemented as `[ \t]` (horizontal whitespace only, never \n):
@@ -900,6 +913,35 @@ def _resolve_cwd(repo_path: str = "") -> str:
     if repo_path:
         return repo_path
     return os.environ.get("ZH_DEFAULT_REPO_PATH", os.getcwd())
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """Coerce `value` to int defensively; never raise.
+
+    v1.9.2 round-4 (PR #27) finding #8: round-3 #11 added
+    `int(r.get("exit_code") or 0)` to guard against `None` / `0` /
+    empty-string from a hypothetical serialization roundtrip. That
+    still raises `ValueError` on any non-numeric string (e.g. a
+    future `_run_zh` middleware emitting `exit_code='timeout'`
+    or `exit_code='killed'`). Wrapping it here means every
+    partial_applied derivation site degrades to `default` (0)
+    instead of raising MCP InternalError, which preserves the rest
+    of the response envelope for the agent.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        # `bool` is a subclass of `int` in Python; treat False/True
+        # as `default` so a serialization layer that flips numeric 0
+        # to False doesn't accidentally become exit_code=0 (clean
+        # success) or exit_code=1 (False is 0, True is 1 — the latter
+        # would imply hard-failure for a partial signal we cannot
+        # trust to be honest).
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _run_zh(args: list[str], *, cwd: str | None = None,
@@ -1715,8 +1757,15 @@ def create_issue(title: str, body: str, type: str = "Task",
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
+    # v1.9.2 round-4 (PR #27) finding #9: always set duplicate_check
+    # so clients reading it per the docstring contract don't KeyError
+    # on a skip_duplicate_check=True call (or a repo-resolution
+    # failure that left dup_info as None).
     if dup_info is not None:
         out["duplicate_check"] = dup_info
+    else:
+        out["duplicate_check"] = {"recommendation": "skipped",
+                                  "matches": []}
     return out
 
 
@@ -2022,7 +2071,7 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
     # safe to retry, but a partial apply (exit 2) means the change
     # already landed and a retry would be wasted (or hit a no-op
     # error). Expose `partial_applied: True` so an agent can branch.
-    partial_applied = int(r.get("exit_code") or 0) == 2
+    partial_applied = _safe_int(r.get("exit_code")) == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2241,8 +2290,19 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
+    # v1.9.2 round-4 (PR #27) finding #9: always set the key. When the
+    # pre-flight ran, `dup_info` carries the recommendation + matches.
+    # When `skip_duplicate_check=True` (or the repo couldn't be
+    # resolved and dup_info is None), use a placeholder marker so
+    # clients reading `out["duplicate_check"]` per the documented
+    # contract do not KeyError. The placeholder uses
+    # recommendation="skipped" so an agent can distinguish "we
+    # asked but it was bypassed" from a real match-or-skip outcome.
     if dup_info is not None:
         out["duplicate_check"] = dup_info
+    else:
+        out["duplicate_check"] = {"recommendation": "skipped",
+                                  "matches": []}
     return out
 
 
@@ -2284,7 +2344,15 @@ def _planning_update(noun: str, number: int, title: str, description: str,
         # match the success-path shape so clients reading out["raw"]
         # per the docstring (epic_update / initiative_update / ...)
         # do not KeyError. Same shape-drift family as F8/F9.
+        #
+        # v1.9.2 round-4 (PR #27) finding #3: include partial_applied
+        # for uniform-key parity with set_issue_type and
+        # _planning_close / _planning_reopen. Round-3 #8 added the
+        # field to close/reopen; the sibling update verb was missed.
+        # zh's update path uses `gh issue edit` and has no exit-2
+        # partial signal today, so this is always False here.
         return {"ok": False,
+                "partial_applied": False,
                 "stderr": "Must provide title and/or description",
                 "number": number,
                 "raw": ""}
@@ -2294,8 +2362,11 @@ def _planning_update(noun: str, number: int, title: str, description: str,
     if description:
         args.extend(["-d", description])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # v1.9.2 round-4 (PR #27) finding #3: same partial_applied shape
+    # parity for the success path.
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
@@ -2336,7 +2407,7 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     #     if r["partial_applied"]: re-verify via subissue_list
     #     elif r["ok"]: log(f"Added {len(r['added'])} children")
     #     else: log(f"Failed (requested: {r['added_requested']})")
-    partial_applied = int(r.get("exit_code") or 0) == 2
+    partial_applied = _safe_int(r.get("exit_code")) == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2360,7 +2431,7 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
     # v1.9.2 round-2 (PR #27) finding #5: same removed/removed_requested
     # split — on partial, `removed` is empty (verify via
     # subissue_list), `removed_requested` is the input list always.
-    partial_applied = int(r.get("exit_code") or 0) == 2
+    partial_applied = _safe_int(r.get("exit_code")) == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2498,7 +2569,12 @@ def epic_update(epic_number: int, title: str = "", description: str = "",
 
     At least one of `title` or `description` must be provided.
 
-    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
+    Returns: dict with ok, partial_applied, number, epic_number
+    (back-compat alias), raw, stderr. v1.9.2 round-4 #13:
+    partial_applied is False here (close / reopen use `gh issue`
+    and have no exit-2 partial signal today); included for
+    uniform-key parity with set_issue_type and the children
+    wrappers.
     """
     return _with_epic_number_alias(_planning_update(
         "epic", epic_number, title, description, repo_path,
@@ -2548,7 +2624,12 @@ def epic_close(epic_number: int, comment: str = "", repo_path: str = "") -> dict
 
     DESTRUCTIVE: affects board visibility and notifies watchers. Pre-confirm.
 
-    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
+    Returns: dict with ok, partial_applied, number, epic_number
+    (back-compat alias), raw, stderr. v1.9.2 round-4 #13:
+    partial_applied is False here (close / reopen use `gh issue`
+    and have no exit-2 partial signal today); included for
+    uniform-key parity with set_issue_type and the children
+    wrappers.
     """
     return _with_epic_number_alias(_planning_close(
         "epic", epic_number, comment, repo_path,
@@ -2559,7 +2640,12 @@ def epic_close(epic_number: int, comment: str = "", repo_path: str = "") -> dict
 def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
     """Reopen a closed epic issue.
 
-    Returns: dict with ok, number, epic_number (back-compat alias), raw, stderr.
+    Returns: dict with ok, partial_applied, number, epic_number
+    (back-compat alias), raw, stderr. v1.9.2 round-4 #13:
+    partial_applied is False here (close / reopen use `gh issue`
+    and have no exit-2 partial signal today); included for
+    uniform-key parity with set_issue_type and the children
+    wrappers.
     """
     return _with_epic_number_alias(_planning_reopen(
         "epic", epic_number, repo_path,
@@ -2656,7 +2742,11 @@ def initiative_close(number: int, comment: str = "",
                      repo_path: str = "") -> dict:
     """Close an Initiative issue. DESTRUCTIVE.
 
-    Returns: dict with ok, number, raw, stderr.
+    Returns: dict with ok, partial_applied, number, raw, stderr.
+    v1.9.2 round-4 #13: partial_applied is included for uniform-key
+    parity with set_issue_type and the children wrappers. Always
+    False here (close / reopen use `gh issue` and have no exit-2
+    partial signal today).
     """
     return _planning_close("initiative", number, comment, repo_path)
 
@@ -2665,7 +2755,11 @@ def initiative_close(number: int, comment: str = "",
 def initiative_reopen(number: int, repo_path: str = "") -> dict:
     """Reopen a closed Initiative issue.
 
-    Returns: dict with ok, number, raw, stderr.
+    Returns: dict with ok, partial_applied, number, raw, stderr.
+    v1.9.2 round-4 #13: partial_applied is included for uniform-key
+    parity with set_issue_type and the children wrappers. Always
+    False here (close / reopen use `gh issue` and have no exit-2
+    partial signal today).
     """
     return _planning_reopen("initiative", number, repo_path)
 
@@ -2754,7 +2848,11 @@ def project_close(number: int, comment: str = "",
                   repo_path: str = "") -> dict:
     """Close a Project issue. DESTRUCTIVE.
 
-    Returns: dict with ok, number, raw, stderr.
+    Returns: dict with ok, partial_applied, number, raw, stderr.
+    v1.9.2 round-4 #13: partial_applied is included for uniform-key
+    parity with set_issue_type and the children wrappers. Always
+    False here (close / reopen use `gh issue` and have no exit-2
+    partial signal today).
     """
     return _planning_close("project", number, comment, repo_path)
 
@@ -2763,7 +2861,11 @@ def project_close(number: int, comment: str = "",
 def project_reopen(number: int, repo_path: str = "") -> dict:
     """Reopen a closed Project issue.
 
-    Returns: dict with ok, number, raw, stderr.
+    Returns: dict with ok, partial_applied, number, raw, stderr.
+    v1.9.2 round-4 #13: partial_applied is included for uniform-key
+    parity with set_issue_type and the children wrappers. Always
+    False here (close / reopen use `gh issue` and have no exit-2
+    partial signal today).
     """
     return _planning_reopen("project", number, repo_path)
 
@@ -2855,7 +2957,11 @@ def subtask_close(number: int, comment: str = "",
                   repo_path: str = "") -> dict:
     """Close a Sub-task issue. DESTRUCTIVE.
 
-    Returns: dict with ok, number, raw, stderr.
+    Returns: dict with ok, partial_applied, number, raw, stderr.
+    v1.9.2 round-4 #13: partial_applied is included for uniform-key
+    parity with set_issue_type and the children wrappers. Always
+    False here (close / reopen use `gh issue` and have no exit-2
+    partial signal today).
     """
     return _planning_close("subtask", number, comment, repo_path)
 
@@ -2864,7 +2970,11 @@ def subtask_close(number: int, comment: str = "",
 def subtask_reopen(number: int, repo_path: str = "") -> dict:
     """Reopen a closed Sub-task issue.
 
-    Returns: dict with ok, number, raw, stderr.
+    Returns: dict with ok, partial_applied, number, raw, stderr.
+    v1.9.2 round-4 #13: partial_applied is included for uniform-key
+    parity with set_issue_type and the children wrappers. Always
+    False here (close / reopen use `gh issue` and have no exit-2
+    partial signal today).
     """
     return _planning_reopen("subtask", number, repo_path)
 
@@ -2999,12 +3109,17 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
 
     Returns:
         dict with:
-            ok: bool — true iff outcome in ("ok", "partial"). v1.9.2
-                round-3 #2: aligned with _planning_add_children and
-                set_issue_type so the same `addSubIssues` mutation
-                yields the same `ok` semantic across both MCP
-                surfaces. Branch on `partial_applied` first to
+            ok: bool — true iff outcome in ("ok", "partial", "noop").
+                v1.9.2 round-3 #2: aligned with _planning_add_children
+                and set_issue_type so the same `addSubIssues`
+                mutation yields the same `ok` semantic across both
+                MCP surfaces. Branch on `partial_applied` first to
                 distinguish full-success from partial-applied.
+                v1.9.2 round-4 #5: outcome="noop" (every input was
+                already in the desired state) is idempotent success
+                — the bash CLI now exits 0 here too. Agents that
+                read `succeeded` should check outcome to distinguish
+                fresh adds (ok) from already-attached (noop).
             partial_applied: bool — true iff outcome == "partial".
                 Mirrors set_issue_type's signal: the mutation
                 accepted on the ZenHub side but some inputs were
@@ -3012,7 +3127,13 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
                 check partial_applied first; retrying a partial
                 produces duplicate adds for the children that DID
                 land.
-            parent_number: int
+            parent_number: int — v1.9.2 round-4 #2: legacy field;
+                prefer `parent` (added below for cross-surface parity
+                with _planning_add_children / _planning_remove_children).
+            parent: int — same value as parent_number. Use this for
+                portable code that switches between subissue_* and the
+                planning-noun children wrappers; parent_number stays
+                for back-compat.
             outcome: "ok" | "partial" | "fail" | "noop"
             success_count: int — API-reported successCount
             failed_count: int — API-reported failedIssues length
@@ -3063,6 +3184,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         return {
             "ok": False,
             "partial_applied": False,
+            "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3092,6 +3214,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         return {
             "ok": False,
             "partial_applied": False,
+            "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3114,8 +3237,9 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     outcome = result.get("outcome", "fail")
     partial_applied = outcome == "partial"
     return {
-        "ok": outcome in ("ok", "partial"),
+        "ok": outcome in ("ok", "partial", "noop"),  # round-4 #5: noop is idempotent success
         "partial_applied": partial_applied,
+        "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
         "parent_number": parent_number,
         "outcome": outcome,
         "success_count": result.get("success_count", 0),
@@ -3151,12 +3275,18 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
 
     Returns:
         dict with:
-            ok: bool — true iff outcome in ("ok", "partial"). v1.9.2
+            ok: bool — true iff outcome in ("ok", "partial", "noop"). v1.9.2
                 round-3 #2: aligned with subissue_add_children's
                 semantic and the planning-children wrappers.
             partial_applied: bool — true iff outcome == "partial".
                 Branch on this BEFORE ok to detect partials.
-            parent_number: int
+            parent_number: int — v1.9.2 round-4 #2: legacy field;
+                prefer `parent` (added below for cross-surface parity
+                with _planning_add_children / _planning_remove_children).
+            parent: int — same value as parent_number. Use this for
+                portable code that switches between subissue_* and the
+                planning-noun children wrappers; parent_number stays
+                for back-compat.
             outcome: "ok" | "partial" | "fail" | "noop"
             success_count: int
             failed_count: int
@@ -3191,6 +3321,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         return {
             "ok": False,
             "partial_applied": False,
+            "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3220,6 +3351,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         return {
             "ok": False,
             "partial_applied": False,
+            "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3236,8 +3368,9 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     outcome = result.get("outcome", "fail")
     partial_applied = outcome == "partial"
     return {
-        "ok": outcome in ("ok", "partial"),
+        "ok": outcome in ("ok", "partial", "noop"),  # round-4 #5: noop is idempotent success
         "partial_applied": partial_applied,
+        "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
         "parent_number": parent_number,
         "outcome": outcome,
         "success_count": result.get("success_count", 0),
