@@ -4202,7 +4202,15 @@ zh_hierarchy_warn_type_mismatch() {
                 # v1.9.2 round-7 finding #14: no good redirect target
                 # (e.g. update on a non-planning type). Acknowledge the
                 # apply landed and stop there; do not invent a redirect.
-                trailing="The ${verb} still applied to #${issue_num}. (No matching top-level command exists for ${actual_type}; retype with 'zh type ${issue_num} <NounType>' first if you want planning-noun semantics.)"
+                #
+                # v1.9.2 round-2 (PR #27) finding #1: the round-1 fix
+                # shipped a literal `<NounType>` token in the user-
+                # visible message, expecting the operator to mentally
+                # substitute. Copy-paste of the suggested command then
+                # failed because `<NounType>` is not a valid type name.
+                # Use $expected_type so the rendered command is
+                # directly runnable.
+                trailing="The ${verb} still applied to #${issue_num}. (No matching top-level command exists for ${actual_type}; retype with 'zh type ${issue_num} ${expected_type}' first if you want ${expected_type} semantics.)"
             fi
             ;;
     esac
@@ -7159,8 +7167,8 @@ Run 'zh help' for usage information."
 }
 
 # v1.9.2: sourceable-mode guard. The test suite sources this script
-# (via tests/conftest.py's `bash_source_zh` fixture) to invoke the
-# actual `cmd_*` functions against production logic, instead of
+# (via tests/_bash_runner.py's `run_zh_with_stubs` helper) to invoke
+# the actual `cmd_*` functions against production logic, instead of
 # carrying parallel snippets that re-implement them. The standard
 # bash idiom `(return 0 2>/dev/null)` succeeds only when the script
 # is sourced — when executed, `return` outside a function is a

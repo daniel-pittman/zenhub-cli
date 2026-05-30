@@ -1598,10 +1598,30 @@ def create_issue(title: str, body: str, type: str = "Task",
             requested but the setEstimate mutation did not confirm
             (retry, do NOT assume it landed).
     """
+    # v1.9.2 round-2 (PR #27) finding #2: validation early returns
+    # must match the full documented key set so clients reading
+    # out["number"] / out["raw"] / out["estimate_requested"] / etc.
+    # per the docstring contract do not KeyError on a bad-input call.
+    # Same shape-drift family as round-7 #8 / #11 (which fixed
+    # set_issue_type and _planning_update); the create_issue sibling
+    # validation paths were left at the old 2-key shape.
+    _empty_create_shape = {
+        "ok": False,
+        "number": None,
+        "url": None,
+        "type": None,
+        "pipeline": None,
+        "parent": None,
+        "estimate": None,
+        "estimate_requested": None,
+        "priority": None,
+        "priority_requested": None,
+        "raw": "",
+    }
     if not title.strip():
-        return {"ok": False, "stderr": "title must be non-empty"}
+        return {**_empty_create_shape, "stderr": "title must be non-empty"}
     if not body.strip():
-        return {"ok": False, "stderr": "body must be non-empty"}
+        return {**_empty_create_shape, "stderr": "body must be non-empty"}
 
     # Pre-flight similarity check
     dup_info = None
@@ -1954,6 +1974,19 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
 
     Returns:
         dict with: ok, partial_applied, number, issue_type, raw, stderr.
+
+        v1.9.2 round-2 #6 (compat note): `ok` is True when EITHER the
+        underlying call succeeded cleanly OR the partial-applied path
+        fired. This is a semantic flip from v1.9.1 (which surfaced
+        the partial as `ok=False`). Callers that branch ONLY on `ok`
+        miss the partial signal and skip re-verification of an
+        operation whose follow-on errors should be inspected before
+        the next mutation. Correct idiom from v1.9.2 on:
+            if r["partial_applied"]: re-verify with zh issue <number>
+            elif r["ok"]: trust the type change
+            else: hard failure, safe to retry
+        Same shape as the planning-children wrappers (round-7 #10).
+
         v1.9.2 round-7 finding #9: `partial_applied` is True when the
         underlying `zh type` exited 2 (round-6 #4 convention: ZenHub
         side accepted the change but the mutation reported follow-on
@@ -2056,9 +2089,25 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         skip_duplicate_check: pass True to skip the pre-flight entirely.
     """
     if not title.strip():
-        return {"ok": False, "stderr": "title must be non-empty",
-                "number": None, "url": None, "type": None,
-                "pipeline": None, "parent": None, "estimate": None}
+        # v1.9.2 round-2 (PR #27) finding #3: full key-set so the
+        # validation path matches the success / blocked-path shape.
+        # Missing keys (estimate_requested, priority,
+        # priority_requested, raw) were the same drift class as
+        # the round-2 #2 fix for create_issue.
+        return {
+            "ok": False,
+            "number": None,
+            "url": None,
+            "type": None,
+            "pipeline": None,
+            "parent": None,
+            "estimate": None,
+            "estimate_requested": None,
+            "priority": None,
+            "priority_requested": None,
+            "raw": "",
+            "stderr": "title must be non-empty",
+        }
 
     # v1.9.1 item #5: pre-flight similarity check, identical machinery
     # to create_issue. Same shape: a "block" recommendation
@@ -2250,8 +2299,8 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
         # v1.9.2 round-1 (PR #27) finding #9: include `raw` for shape
         # parity with the success / partial paths.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "parent": parent, "added": [], "partial_applied": False,
-                "raw": ""}
+                "parent": parent, "added": [], "added_requested": [],
+                "partial_applied": False, "raw": ""}
     args = [noun, "add", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: cmd_subissue_add exits 2 on a
@@ -2262,24 +2311,29 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     # children that DID land. Surface partial_applied analogous to
     # set_issue_type so the agent can branch.
     #
-    # v1.9.2 round-1 (PR #27) finding #3: the first version of this PR
-    # shipped `ok=True (or partial_applied)` with `added=[]` on
-    # partial. That shape contradicts itself: `ok=True` says success,
-    # `added=[]` says nothing landed, so an agent's natural idiom
-    # `if r["ok"]: log(f"Added {len(r['added'])} children")` would
-    # report "Added 0 children" while some actually attached. Return
-    # the ATTEMPTED list when partial_applied so the agent sees the
-    # count it asked to apply (and the docstring's note tells it to
-    # re-verify before trusting). The bash side doesn't emit a
-    # structured success/failure breakdown for this wrapper, so
-    # there's no way to enumerate landed-vs-failed from here; the
-    # agent must consult subissue_list to confirm.
+    # v1.9.2 round-1 (PR #27) finding #3 + round-2 finding #5: the
+    # contract is now:
+    #   - `added`: confirmed-landed list. On full success: == input.
+    #     On partial: empty (the bash wrapper can't enumerate
+    #     per-issue; the agent must consult subissue_list).
+    #     On hard failure: empty.
+    #   - `added_requested`: the input list, ALWAYS. Mirrors the
+    #     estimate_requested / priority_requested pattern from
+    #     create_issue: agents that want to know what was attempted
+    #     read this field; agents that want what's confirmed read
+    #     `added`. Past-tense `added` no longer overstates on partial.
+    # On partial, `ok=True or partial_applied=True` (mirrors
+    # set_issue_type). An agent's correct idiom is:
+    #     if r["partial_applied"]: re-verify via subissue_list
+    #     elif r["ok"]: log(f"Added {len(r['added'])} children")
+    #     else: log(f"Failed (requested: {r['added_requested']})")
     partial_applied = r.get("exit_code") == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
         "parent": parent,
-        "added": children if (r["ok"] or partial_applied) else [],
+        "added": children if r["ok"] else [],
+        "added_requested": children,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -2288,20 +2342,22 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
 def _planning_remove_children(noun: str, parent: int, children: list[int],
                               repo_path: str) -> dict:
     if not children:
-        # v1.9.2 round-1 (PR #27) finding #9: include `raw`.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "parent": parent, "removed": [], "partial_applied": False,
-                "raw": ""}
+                "parent": parent, "removed": [], "removed_requested": [],
+                "partial_applied": False, "raw": ""}
     args = [noun, "remove", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: same partial signal as the add path.
-    # v1.9.2 round-1 (PR #27) finding #3: same attempted-list logic.
+    # v1.9.2 round-2 (PR #27) finding #5: same removed/removed_requested
+    # split — on partial, `removed` is empty (verify via
+    # subissue_list), `removed_requested` is the input list always.
     partial_applied = r.get("exit_code") == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
         "parent": parent,
-        "removed": children if (r["ok"] or partial_applied) else [],
+        "removed": children if r["ok"] else [],
+        "removed_requested": children,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -2400,9 +2456,13 @@ def epic_create(title: str, description: str = "", labels: str = "",
 
     Returns:
         dict with: ok, number, epic_number (back-compat alias for number),
-        url, type, pipeline, parent, estimate, raw, stderr,
-        duplicate_check (when the pre-flight ran). On block: ok=False,
-        blocked=True, duplicate_check populated, no number.
+        url, type, pipeline, parent, estimate, estimate_requested,
+        priority, priority_requested, raw, stderr, duplicate_check
+        (when the pre-flight ran). v1.9.2 round-2 #4: the three-state
+        estimate / priority splits documented for create_issue apply
+        here too (compare *_requested against *). On block: ok=False,
+        blocked=True, all key placeholders None / "" with
+        duplicate_check populated.
     """
     return _with_epic_number_alias(_planning_create(
         "epic", title, description, labels, pipeline,
@@ -2432,11 +2492,15 @@ def epic_add_children(epic_number: int, issue_numbers: list[int],
     """Attach one or more issues as sub-issues of an epic (addSubIssues).
 
     Returns: dict with ok, partial_applied, parent, epic_number (back-compat
-    alias for parent), added (list of issue numbers), raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: partial_applied is True when the
+    alias for parent), added, added_requested, raw, stderr.
+    v1.9.2 round-7 #10 / round-2 #5: partial_applied is True when the
     underlying cmd_subissue_add exited 2 (some children attached, others
-    did not). When partial_applied is True, `added` echoes the input
-    list as "attempted"; re-verify via subissue_list before trusting.
+    did not). `added` is the confirmed-landed list (== added_requested on
+    full success; empty on partial — the bash wrapper cannot enumerate
+    per-issue, consult subissue_list to verify). `added_requested` is
+    the input list, always. The correct branching idiom is `if
+    r["partial_applied"]: re-verify` first, then `elif r["ok"]: trust
+    r["added"]`, else hard failure.
     """
     return _with_epic_number_alias(_planning_add_children(
         "epic", epic_number, issue_numbers, repo_path,
@@ -2449,9 +2513,10 @@ def epic_remove_children(epic_number: int, issue_numbers: list[int],
     """Detach one or more sub-issues from an epic (removeSubIssues).
 
     Returns: dict with ok, partial_applied, parent, epic_number (back-compat
-    alias for parent), removed (list of issue numbers), raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics as
-    the add path; `removed` echoes the attempted list on partial.
+    alias for parent), removed, removed_requested, raw, stderr.
+    v1.9.2 round-7 #10 / round-2 #5: same partial_applied / requested
+    split as the add path; `removed_requested` always echoes the input,
+    `removed` is empty on partial (verify via subissue_list).
     """
     return _with_epic_number_alias(_planning_remove_children(
         "epic", epic_number, issue_numbers, repo_path,
@@ -2502,7 +2567,12 @@ def initiative_create(title: str, description: str = "", labels: str = "",
     skip_duplicate_check=True to bypass.
 
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    raw, stderr, duplicate_check (when the pre-flight ran).
+    estimate_requested, priority, priority_requested, raw, stderr,
+    duplicate_check (when the pre-flight ran). v1.9.2 round-2 #4:
+    the three-state estimate / priority splits documented for
+    create_issue apply here too — compare estimate vs
+    estimate_requested (null/null = not requested, N/N = applied,
+    N/null = requested but setEstimate did not confirm; retry).
     """
     return _planning_create("initiative", title, description, labels,
                             pipeline, assignee, estimate, parent, repo_path,
@@ -2538,10 +2608,12 @@ def initiative_add_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Attach issues (typically Projects/Epics) under an Initiative.
 
-    Returns: dict with ok, partial_applied, parent, added, raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: partial_applied=True means some
-    children attached and some did not (cmd_subissue_add exit 2); `added`
-    echoes the attempted list, verify via subissue_list before trusting.
+    Returns: dict with ok, partial_applied, parent, added, added_requested,
+    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: partial_applied=True
+    means some children attached and some did not (cmd_subissue_add exit
+    2); `added_requested` is the input list always, `added` is empty
+    on partial (the wrapper cannot enumerate per-issue, verify via
+    subissue_list).
     """
     return _planning_add_children("initiative", number, issue_numbers,
                                   repo_path)
@@ -2552,8 +2624,9 @@ def initiative_remove_children(number: int, issue_numbers: list[int],
                                repo_path: str = "") -> dict:
     """Detach sub-issues from an Initiative.
 
-    Returns: dict with ok, partial_applied, parent, removed, raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics.
+    Returns: dict with ok, partial_applied, parent, removed, removed_requested,
+    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: same partial_applied /
+    requested split as the add path.
     """
     return _planning_remove_children("initiative", number, issue_numbers,
                                      repo_path)
@@ -2594,7 +2667,12 @@ def project_create(title: str, description: str = "", labels: str = "",
     skip_duplicate_check=True to bypass.
 
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    raw, stderr, duplicate_check (when the pre-flight ran).
+    estimate_requested, priority, priority_requested, raw, stderr,
+    duplicate_check (when the pre-flight ran). v1.9.2 round-2 #4:
+    the three-state estimate / priority splits documented for
+    create_issue apply here too — compare estimate vs
+    estimate_requested (null/null = not requested, N/N = applied,
+    N/null = requested but setEstimate did not confirm; retry).
     """
     return _planning_create("project", title, description, labels, pipeline,
                             assignee, estimate, parent, repo_path,
@@ -2629,10 +2707,12 @@ def project_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach issues (typically Epics) under a Project.
 
-    Returns: dict with ok, partial_applied, parent, added, raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: partial_applied=True means some
-    children attached and some did not (cmd_subissue_add exit 2); `added`
-    echoes the attempted list, verify via subissue_list before trusting.
+    Returns: dict with ok, partial_applied, parent, added, added_requested,
+    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: partial_applied=True
+    means some children attached and some did not (cmd_subissue_add exit
+    2); `added_requested` is the input list always, `added` is empty
+    on partial (the wrapper cannot enumerate per-issue, verify via
+    subissue_list).
     """
     return _planning_add_children("project", number, issue_numbers, repo_path)
 
@@ -2642,8 +2722,9 @@ def project_remove_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Detach sub-issues from a Project.
 
-    Returns: dict with ok, partial_applied, parent, removed, raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics.
+    Returns: dict with ok, partial_applied, parent, removed, removed_requested,
+    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: same partial_applied /
+    requested split as the add path.
     """
     return _planning_remove_children("project", number, issue_numbers,
                                      repo_path)
@@ -2684,7 +2765,12 @@ def subtask_create(title: str, description: str = "", labels: str = "",
     skip_duplicate_check=True to bypass.
 
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    raw, stderr, duplicate_check (when the pre-flight ran).
+    estimate_requested, priority, priority_requested, raw, stderr,
+    duplicate_check (when the pre-flight ran). v1.9.2 round-2 #4:
+    the three-state estimate / priority splits documented for
+    create_issue apply here too — compare estimate vs
+    estimate_requested (null/null = not requested, N/N = applied,
+    N/null = requested but setEstimate did not confirm; retry).
     """
     return _planning_create("subtask", title, description, labels, pipeline,
                             assignee, estimate, parent, repo_path,
@@ -2722,10 +2808,12 @@ def subtask_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach further sub-issues under a Sub-task.
 
-    Returns: dict with ok, partial_applied, parent, added, raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: partial_applied=True means some
-    children attached and some did not (cmd_subissue_add exit 2); `added`
-    echoes the attempted list, verify via subissue_list before trusting.
+    Returns: dict with ok, partial_applied, parent, added, added_requested,
+    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: partial_applied=True
+    means some children attached and some did not (cmd_subissue_add exit
+    2); `added_requested` is the input list always, `added` is empty
+    on partial (the wrapper cannot enumerate per-issue, verify via
+    subissue_list).
     """
     return _planning_add_children("subtask", number, issue_numbers, repo_path)
 
@@ -2735,8 +2823,9 @@ def subtask_remove_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Detach sub-issues from a Sub-task.
 
-    Returns: dict with ok, partial_applied, parent, removed, raw, stderr.
-    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics.
+    Returns: dict with ok, partial_applied, parent, removed, removed_requested,
+    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: same partial_applied /
+    requested split as the add path.
     """
     return _planning_remove_children("subtask", number, issue_numbers,
                                      repo_path)

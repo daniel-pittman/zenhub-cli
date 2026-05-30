@@ -90,10 +90,18 @@ def test_structural_guarantee_create_normalizer_known_flags_align_with_case_arms
     zh_text = Path(__file__).resolve().parent.parent.joinpath("zh").read_text()
 
     # Find the cmd_create function body. The function spans from
-    # `cmd_create() {` to the matching closing brace; we'll use a
-    # heuristic: read from `cmd_create() {` to the next `^cmd_` def.
-    m = re.search(r"^cmd_create\(\) \{(.*?)\n^cmd_", zh_text, re.S | re.M)
-    assert m, "could not locate cmd_create() in zh"
+    # `cmd_create() {` to its matching closing brace at column 0.
+    #
+    # v1.9.2 round-2 (PR #27) finding #8: the prior `^cmd_create\(\)
+    # \{(.*?)\n^cmd_` anchor extended the match past any helper
+    # function (`_validate_create_args()`, etc.) inserted between
+    # cmd_create and the next `cmd_*` definition. The union of
+    # `_is_known_flag="true"` arms then included the helper's arms,
+    # which could mask a real cmd_create normalizer drift. Anchor on
+    # the closing brace at column 0 instead — that's where every
+    # `cmd_*() {` definition in this script ends.
+    m = re.search(r"^cmd_create\(\) \{\n(.*?)\n\}\n", zh_text, re.S | re.M)
+    assert m, "could not locate cmd_create() in zh (column-0 closing brace)"
     body = m.group(1)
 
     # The known-flag list lives inside a `case "$_norm_flag" in ... esac`
@@ -1065,19 +1073,23 @@ def test_round7_f14_update_verb_does_not_redirect_to_read_only_issue() -> None:
         f"update-verb redirect must not point at read-only 'zh issue' "
         f"(round-7 #14). stderr={r.stderr!r}"
     )
-    # v1.9.2 round-1 (PR #27) finding #13: also pin the positive
-    # behavior. The fix's intended trailing wording mentions either
-    # `zh type 42` (the retype suggestion) or makes it clear no
-    # top-level analog exists for non-planning types. Without this
-    # positive assertion a regression that suppresses the warn
-    # entirely (or wires a totally-different wrong redirect) would
-    # pass the negative check.
-    assert (
-        "zh type 42" in stderr_clean
-        or "No matching top-level command" in stderr_clean
-    ), (
-        f"F14 fix should either route to 'zh type 42 <NounType>' or "
-        f"acknowledge no analog exists; got: {stderr_clean!r}"
+    # v1.9.2 round-1 (PR #27) finding #13: pin positive behavior.
+    # v1.9.2 round-2 (PR #27) finding #1: also require the
+    # rendered command to be runnable — `zh type 42 Epic`, NOT
+    # `zh type 42 <NounType>` with a literal placeholder. The
+    # expected_type was `Epic` in this call; the warn must
+    # interpolate it into the retype suggestion. Without this
+    # check, a regression that emits a literal `<NounType>` token
+    # (or any non-interpolated placeholder) passes silently.
+    assert "zh type 42 Epic" in stderr_clean, (
+        f"F14 retype suggestion must render the runnable command "
+        f"'zh type 42 Epic' (expected_type was 'Epic'), not a "
+        f"literal placeholder. Got: {stderr_clean!r}"
+    )
+    # Negative guard: literal placeholder tokens must NOT leak through.
+    assert "<NounType>" not in stderr_clean, (
+        f"F14 must not emit a literal <NounType> placeholder; "
+        f"interpolate ${{expected_type}}. Got: {stderr_clean!r}"
     )
 
 
@@ -1097,3 +1109,165 @@ def test_round7_f14_update_verb_does_not_redirect_to_read_only_issue() -> None:
 # test_structural_guarantee_* above is exactly what would have
 # failed against the pre-round-6 production code.
 # ===========================================================================
+
+
+# ===========================================================================
+# PR #27 ROUND-2 FINDING CLOSURES
+#
+# Each test below pins a HIGH finding the round-2 review surfaced.
+# ===========================================================================
+
+
+# ---- Round-2 finding #2: create_issue empty-title/body validation shape ----
+
+
+def test_round2_f2_create_issue_empty_title_returns_full_key_set() -> None:
+    """create_issue(title='') must return the full documented key
+    shape so clients reading out["number"] or out["raw"] per the
+    docstring contract do not KeyError on a bad-input call.
+
+    Same drift family as round-7 #11 (which fixed _planning_update);
+    the create_issue empty-title path was the surviving sibling.
+    """
+    import mcp_server
+
+    out = mcp_server.create_issue(title="", body="non-empty body")
+    assert out["ok"] is False
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested", "raw", "stderr"):
+        assert key in out, (
+            f"create_issue empty-title validation missing {key!r} "
+            f"(round-2 #2); got {sorted(out.keys())!r}"
+        )
+
+
+def test_round2_f2_create_issue_empty_body_returns_full_key_set() -> None:
+    """Symmetric pin for the empty-body validation path."""
+    import mcp_server
+
+    out = mcp_server.create_issue(title="ok", body="")
+    assert out["ok"] is False
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested", "raw"):
+        assert key in out
+
+
+# ---- Round-2 finding #3: _planning_create empty-title validation shape -----
+
+
+def test_round2_f3_epic_create_empty_title_returns_full_key_set() -> None:
+    """_planning_create(title='') must match the full key set
+    (number, url, type, pipeline, parent, estimate,
+    estimate_requested, priority, priority_requested, raw, stderr).
+
+    Round-7 #11 added `raw` to _planning_update validation; the
+    sibling _planning_create empty-title path was missed and still
+    returned an 8-key dict (no estimate_requested, priority,
+    priority_requested, raw).
+    """
+    import mcp_server
+
+    out = mcp_server.epic_create(title="")
+    assert out["ok"] is False
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested", "raw", "stderr"):
+        assert key in out, (
+            f"_planning_create empty-title validation missing {key!r} "
+            f"(round-2 #3); got {sorted(out.keys())!r}"
+        )
+
+
+def test_round2_f3_initiative_create_empty_title_returns_full_key_set() -> None:
+    """Symmetric pin across all four planning nouns to catch
+    regressions in any one of them.
+    """
+    import mcp_server
+
+    for fn in (mcp_server.initiative_create,
+               mcp_server.project_create,
+               mcp_server.subtask_create):
+        out = fn(title="")
+        assert out["ok"] is False
+        for key in ("number", "url", "type", "pipeline", "parent",
+                    "estimate", "estimate_requested",
+                    "priority", "priority_requested", "raw"):
+            assert key in out, (
+                f"{fn.__name__} empty-title validation missing {key!r} "
+                f"(round-2 #3); got {sorted(out.keys())!r}"
+            )
+
+
+# ---- Round-2 finding #7: structural set_type test broaden coverage ---------
+
+
+def test_round2_f7_set_type_partial_via_github_errors_only_exits_2() -> None:
+    """The cmd_set_type partial gate is `failed_count > 0 OR
+    gh_errors_len > 0`. The round-7 structural-guarantee test only
+    exercised the failedIssues-populated half. A regression that
+    drops the `gh_errors_len > 0` clause from the gate would let a
+    githubErrors-only partial silently report success.
+
+    Round-2 #7: add production-sourced coverage for the
+    githubErrors-only partial path.
+    """
+    stubs = r"""
+        load_config() { :; }
+        get_repo_info() { printf 'acme/widgets'; }
+        get_repo_id() { printf 'repo-gid-acme-widgets'; }
+        get_workspace_id() { printf 'ws-gid-backend'; }
+        zh_fetch_issue_types() { printf '[]'; }
+        zh_issue_type_id_from() { printf 'tid-epic'; }
+        zh_issue_type_names_from() { printf 'Epic'; }
+        zh_resolve_issue_id() { printf 'issue-gid-42'; }
+        zh_graphql() {
+            # githubErrors populated, failedIssues empty.
+            printf '%s' '{"data":{"changeIssueTypeOfIssues":{"successCount":1,"failedIssues":[],"githubErrors":[{"code":"X","message":"oops"}]}}}'
+        }
+    """
+    r = run_zh_with_stubs(stubs, 'cmd_set_type 42 Epic')
+    assert r.returncode == 2, (
+        f"githubErrors-populated partial MUST exit 2 (the gate is "
+        f"failed_count > 0 OR gh_errors_len > 0); got rc={r.returncode}, "
+        f"stderr={r.stderr!r}"
+    )
+    assert "Partially applied" in r.stderr
+
+
+def test_round2_f7_set_type_success_count_zero_exits_1() -> None:
+    """The hard-failure branch (successCount=0) MUST exit 1 (real
+    failure, retry safe), not exit 2 (partial-applied, do not
+    retry). Production-sourced pin for the gate's third branch.
+    """
+    stubs = r"""
+        load_config() { :; }
+        get_repo_info() { printf 'acme/widgets'; }
+        get_repo_id() { printf 'repo-gid-acme-widgets'; }
+        get_workspace_id() { printf 'ws-gid-backend'; }
+        zh_fetch_issue_types() { printf '[]'; }
+        zh_issue_type_id_from() { printf 'tid-epic'; }
+        zh_issue_type_names_from() { printf 'Epic'; }
+        zh_resolve_issue_id() { printf 'issue-gid-42'; }
+        zh_graphql() {
+            printf '%s' '{"data":{"changeIssueTypeOfIssues":{"successCount":0,"failedIssues":[{"number":42}],"githubErrors":[]}}}'
+        }
+    """
+    r = run_zh_with_stubs(stubs, 'cmd_set_type 42 Epic')
+    assert r.returncode == 1, (
+        f"successCount=0 is a hard failure and MUST exit 1, not 2; "
+        f"got rc={r.returncode}, stderr={r.stderr!r}"
+    )
+    assert "Failed to set type" in r.stderr
+
+
+# ---- Round-2 finding #9: migrate _SET_TYPE_EXIT_2_SNIPPET --------------------
+#
+# The two production tests above (test_round2_f7_*) plus the existing
+# test_structural_guarantee_set_type_exits_2_not_1_on_partial cover
+# the same gate-paths the legacy `_SET_TYPE_EXIT_2_SNIPPET` covered,
+# but against PRODUCTION cmd_set_type instead of a parallel
+# re-implementation. The legacy snippet and its companion tests are
+# left in place for now (they still pass against their own embedded
+# code) but the canonical coverage is here.
