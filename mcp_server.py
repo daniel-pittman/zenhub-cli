@@ -1538,16 +1538,17 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
 @mcp.tool()
 def create_issue(title: str, body: str, type: str = "Task",
                  pipeline: str = "Product Backlog",
-                 labels: str = "", parent: int = 0, repo_path: str = "",
+                 labels: str = "", parent: int = 0,
+                 priority: str = "", repo_path: str = "",
                  confirm_create: bool = False,
                  skip_duplicate_check: bool = False) -> dict:
     """Create a new ZenHub issue.
 
     Runs a pre-flight similarity check against existing open issues
-    (via the sentence-embedding index — see `zh_similar`). When a
+    (via the sentence-embedding index, see `zh_similar`). When a
     near-duplicate is detected (cosine similarity above the hard
     threshold), the create is BLOCKED and the candidate matches are
-    returned — pass `confirm_create=True` to override and create
+    returned. Pass `confirm_create=True` to override and create
     anyway. Soft matches are surfaced as a warning but don't block.
 
     v1.9.0: `type` is resolved via assignableIssueTypes, so any
@@ -1567,6 +1568,13 @@ def create_issue(title: str, body: str, type: str = "Task",
             wired as a sub-issue of that parent (ZenHub-native
             addSubIssues, so it shows up under epic_show / subissue
             reads).
+        priority: Optional priority name (resolved case-insensitively
+            against the workspace's configured priorities; discover
+            names with list_priorities). Round-6 finding #6: same
+            surface the bash `--priority` flag exposes. When set, the
+            response carries `priority_requested` mirroring the input
+            and `priority` reflecting the post-create mutation
+            confirmation. Compare the two to detect partial apply.
         repo_path: Optional absolute path of a git checkout to run zh from.
         confirm_create: pass True to bypass the duplicate-check block.
             Use ONLY after reviewing the returned matches and confirming
@@ -1581,7 +1589,8 @@ def create_issue(title: str, body: str, type: str = "Task",
             candidate matches and recommendation), and a clear message
             explaining how to override.
         On success: dict with ok=True, number (new issue number), url,
-            type, pipeline, parent, raw, stderr, duplicate_check
+            type, pipeline, parent, estimate, priority,
+            priority_requested, raw, stderr, duplicate_check
             (informational; may include soft matches).
     """
     if not title.strip():
@@ -1636,8 +1645,14 @@ def create_issue(title: str, body: str, type: str = "Task",
         args.extend(["-l", labels])
     if parent and parent > 0:
         args.extend(["--parent", str(parent)])
+    if priority:
+        args.extend(["--priority", priority])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
 
+    # Round-6 finding #6: shape parity with _planning_create. The bash
+    # --json emit carries priority / priority_requested / estimate;
+    # propagate them all so MCP clients reading either create surface
+    # see the same key set.
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     out = {
         "ok": r["ok"] and created is not None,
@@ -1646,6 +1661,11 @@ def create_issue(title: str, body: str, type: str = "Task",
         "type": created.get("type") if created else None,
         "pipeline": created.get("pipeline") if created else None,
         "parent": created.get("parent") if created else None,
+        "estimate": created.get("estimate") if created else None,
+        "priority": created.get("priority") if created else None,
+        "priority_requested": (
+            created.get("priority_requested") if created else None
+        ),
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -1913,8 +1933,18 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
         return {"ok": False, "stderr": "issue_type must be non-empty"}
     r = _run_zh(["type", str(number), issue_type],
                 cwd=_resolve_cwd(repo_path))
+    # Round-6 finding #4: surface the exit-code convention. The bash
+    # cmd_set_type uses exit 2 for the divergence-only partial case
+    # (ZenHub side accepted the type change but the mutation also
+    # reported a GitHub-side error or a populated failedIssues). For
+    # MCP callers the distinction matters: a true failure (exit 1) is
+    # safe to retry, but a partial apply (exit 2) means the change
+    # already landed and a retry would be wasted (or hit a no-op
+    # error). Expose `partial_applied: True` so an agent can branch.
+    partial_applied = r.get("exit_code") == 2
     return {
-        "ok": r["ok"],
+        "ok": r["ok"] or partial_applied,
+        "partial_applied": partial_applied,
         "number": number,
         "issue_type": issue_type,
         "raw": r["stdout_plain"],
@@ -1964,19 +1994,93 @@ def block_issue(blocked: int, blocking: int, repo_path: str = "") -> dict:
 
 def _planning_create(noun: str, title: str, description: str, labels: str,
                      pipeline: str, assignee: str, estimate: str,
-                     parent: int, repo_path: str) -> dict:
+                     parent: int, repo_path: str,
+                     confirm_create: bool = False,
+                     skip_duplicate_check: bool = False) -> dict:
     """Shared `zh <noun> create --json` wrapper for the planning nouns.
 
     Forwards every meaningful create-time flag the bash side exposes:
     description, labels, pipeline, assignee, estimate, parent. The
-    duplicate-check pre-flight that `create_issue` runs is deliberately
-    NOT applied here (deferred to v1.9.1): planning nouns get created
-    rarely and per-noun similarity tuning is its own work item.
+    duplicate-check pre-flight mirrors create_issue (v1.9.1 item #5):
+    every planning-noun create now runs the same similarity guard, so
+    an agent calling `epic_create("Auth redesign")` gets blocked on a
+    near-duplicate the same way `create_issue(..., type="Epic")` would.
+
+    Args:
+        noun: planning noun (initiative / project / epic / subtask).
+        title: issue title.
+        description: optional body / description.
+        labels, pipeline, assignee, estimate: optional create-time flags.
+        parent: optional parent issue number (0 = none).
+        repo_path: optional absolute path of a git checkout.
+        confirm_create: pass True to bypass a duplicate-check block.
+        skip_duplicate_check: pass True to skip the pre-flight entirely.
     """
     if not title.strip():
         return {"ok": False, "stderr": "title must be non-empty",
                 "number": None, "url": None, "type": None,
                 "pipeline": None, "parent": None, "estimate": None}
+
+    # v1.9.1 item #5: pre-flight similarity check, identical machinery
+    # to create_issue. Same shape: a "block" recommendation
+    # short-circuits the create with the candidate matches; "warn" only
+    # annotates the response. Embedding failures or missing index fall
+    # through to create rather than blocking, so a transient infra
+    # problem cannot become a planning-noun outage.
+    #
+    # Round-3 finding #8: the two entry points differ on input
+    # validation. create_issue requires a non-empty body, so its
+    # embedding always sees both title and body. _planning_create
+    # accepts an empty description (planning items are often title-
+    # only). At the SOFT/HARD threshold boundary the same title can
+    # therefore land on different sides of the gate from the two
+    # surfaces. Equalizing this would mean either tightening
+    # _planning_create (hurts UX for legitimate title-only initiatives
+    # / epics) or relaxing create_issue (lowers a useful hint). The
+    # tradeoff is documented here so a future maintainer sees the
+    # asymmetry rather than treating it as a bug; agents that need
+    # identical scoring across surfaces should always pass description.
+    dup_info = None
+    if not skip_duplicate_check:
+        repo, err = _similarity_repo(repo_path)
+        if err:
+            dup_info = {"ok": False, "stderr": err, "matches": []}
+        else:
+            try:
+                from similarity import check_duplicate
+
+                dup_info = check_duplicate(title, description, repo)
+            except Exception as e:
+                dup_info = {
+                    "ok": False,
+                    "stderr": (
+                        "duplicate check failed: "
+                        + _similarity_exc_to_stderr(e)
+                    ),
+                    "matches": [],
+                }
+
+        if (dup_info and dup_info.get("recommendation") == "block"
+                and not confirm_create):
+            # Round-2 finding #6: mirror create_issue's minimal block
+            # response shape (ok / blocked / stderr / duplicate_check).
+            # The 10-key version with `None` placeholders that this
+            # branch previously returned diverged from create_issue,
+            # which broke MCP clients that handled both entry points
+            # uniformly via `out["raw"]`.
+            return {
+                "ok": False,
+                "blocked": True,
+                "stderr": (
+                    "Refused: a similar open issue already exists "
+                    "(cosine similarity >= "
+                    f"{dup_info.get('hard_threshold')}). "
+                    "Review duplicate_check.matches; if the new ticket is "
+                    "genuinely distinct, retry with confirm_create=True."
+                ),
+                "duplicate_check": dup_info,
+            }
+
     args = [noun, "create", title, "--json"]
     if description:
         args.extend(["-d", description])
@@ -1992,7 +2096,7 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         args.extend(["--parent", str(parent)])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
-    return {
+    out = {
         "ok": r["ok"] and created is not None,
         "number": created.get("number") if created else None,
         "url": created.get("url") if created else None,
@@ -2000,9 +2104,22 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         "pipeline": created.get("pipeline") if created else None,
         "parent": created.get("parent") if created else None,
         "estimate": created.get("estimate") if created else None,
+        # Round-4 finding #7: propagate the priority fields so the
+        # planning-noun create returns the same key set create_issue
+        # does. Planning creates do not accept --priority today, so
+        # these will normally be null; including them keeps shape parity
+        # against the future case where they DO get a priority flag,
+        # and lets MCP clients read both entry points uniformly.
+        "priority": created.get("priority") if created else None,
+        "priority_requested": (
+            created.get("priority_requested") if created else None
+        ),
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
+    if dup_info is not None:
+        out["duplicate_check"] = dup_info
+    return out
 
 
 def _planning_list(noun: str, repo_path: str) -> dict:
@@ -2122,11 +2239,23 @@ def _with_epic_number_alias(d: dict) -> dict:
     of `number` or `parent` is the epic's identifier in that shape. Tool
     docstrings note the alias is for back-compat and may be removed in a
     future major release.
+
+    v1.9.1 round-3 finding #3: the round-2 #6 fix minimized the
+    `_planning_create` blocked-response to 4 keys (ok / blocked / stderr
+    / duplicate_check), dropping the `number` and `parent` placeholders
+    the alias used to set. Without a fallback, a v1.8.x agent reading
+    `out["epic_number"]` on a blocked create gets `KeyError`. Always
+    ensure the alias key is present (None when no identifier is
+    available, e.g. on blocked / error paths).
     """
     if "number" in d and "epic_number" not in d:
         d["epic_number"] = d.get("number")
     elif "parent" in d and "epic_number" not in d:
         d["epic_number"] = d.get("parent")
+    # Fallback for paths that carry neither (blocked / pre-flight
+    # errors). v1.8.x clients use `out["epic_number"]` directly; this
+    # guarantees the key exists.
+    d.setdefault("epic_number", None)
     return d
 
 
@@ -2138,13 +2267,21 @@ def _with_epic_number_alias(d: dict) -> dict:
 @mcp.tool()
 def epic_create(title: str, description: str = "", labels: str = "",
                 pipeline: str = "", assignee: str = "", estimate: str = "",
-                parent: int = 0, repo_path: str = "") -> dict:
+                parent: int = 0, repo_path: str = "",
+                confirm_create: bool = False,
+                skip_duplicate_check: bool = False) -> dict:
     """Create an Epic (an issue with issue-type Epic).
 
     v1.9.0: an epic is a normal issue typed Epic, with a normal issue
     number and URL (the ZenhubEpic id concept is gone). Every `zh create`
-    flag is forwarded; the duplicate-check pre-flight that `create_issue`
-    runs is deferred to v1.9.1 (track via list_priorities-style follow-up).
+    flag is forwarded.
+
+    v1.9.1 item #5: the duplicate-check pre-flight that create_issue runs
+    now applies here too. A blocked match short-circuits the create with
+    the candidate matches; pass `confirm_create=True` to override after
+    reviewing, or `skip_duplicate_check=True` to bypass entirely (e.g.
+    during a bulk migration). Soft matches surface as a warning without
+    blocking.
 
     Args:
         title: Epic title (required, non-empty).
@@ -2156,14 +2293,20 @@ def epic_create(title: str, description: str = "", labels: str = "",
         parent: Optional parent issue number; the new epic is wired as a
             sub-issue of that parent via addSubIssues.
         repo_path: Optional absolute path of a git checkout to run zh from.
+        confirm_create: pass True to bypass the duplicate-check block.
+        skip_duplicate_check: pass True to skip the pre-flight entirely.
 
     Returns:
         dict with: ok, number, epic_number (back-compat alias for number),
-        url, type, pipeline, parent, estimate, raw, stderr.
+        url, type, pipeline, parent, estimate, raw, stderr,
+        duplicate_check (when the pre-flight ran). On block: ok=False,
+        blocked=True, duplicate_check populated, no number.
     """
     return _with_epic_number_alias(_planning_create(
         "epic", title, description, labels, pipeline,
         assignee, estimate, parent, repo_path,
+        confirm_create=confirm_create,
+        skip_duplicate_check=skip_duplicate_check,
     ))
 
 
@@ -2241,14 +2384,22 @@ def epic_reopen(epic_number: int, repo_path: str = "") -> dict:
 def initiative_create(title: str, description: str = "", labels: str = "",
                       pipeline: str = "", assignee: str = "",
                       estimate: str = "", parent: int = 0,
-                      repo_path: str = "") -> dict:
+                      repo_path: str = "",
+                      confirm_create: bool = False,
+                      skip_duplicate_check: bool = False) -> dict:
     """Create an Initiative (issue-type Initiative, level 1).
 
+    v1.9.1 item #5: runs the same duplicate-check pre-flight as
+    create_issue. Use confirm_create=True to override a block,
+    skip_duplicate_check=True to bypass.
+
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    raw, stderr.
+    raw, stderr, duplicate_check (when the pre-flight ran).
     """
     return _planning_create("initiative", title, description, labels,
-                            pipeline, assignee, estimate, parent, repo_path)
+                            pipeline, assignee, estimate, parent, repo_path,
+                            confirm_create=confirm_create,
+                            skip_duplicate_check=skip_duplicate_check)
 
 
 @mcp.tool()
@@ -2321,14 +2472,22 @@ def initiative_reopen(number: int, repo_path: str = "") -> dict:
 def project_create(title: str, description: str = "", labels: str = "",
                    pipeline: str = "", assignee: str = "",
                    estimate: str = "", parent: int = 0,
-                   repo_path: str = "") -> dict:
+                   repo_path: str = "",
+                   confirm_create: bool = False,
+                   skip_duplicate_check: bool = False) -> dict:
     """Create a Project (issue-type Project, level 2).
 
+    v1.9.1 item #5: runs the same duplicate-check pre-flight as
+    create_issue. Use confirm_create=True to override a block,
+    skip_duplicate_check=True to bypass.
+
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    raw, stderr.
+    raw, stderr, duplicate_check (when the pre-flight ran).
     """
     return _planning_create("project", title, description, labels, pipeline,
-                            assignee, estimate, parent, repo_path)
+                            assignee, estimate, parent, repo_path,
+                            confirm_create=confirm_create,
+                            skip_duplicate_check=skip_duplicate_check)
 
 
 @mcp.tool()
@@ -2399,14 +2558,22 @@ def project_reopen(number: int, repo_path: str = "") -> dict:
 def subtask_create(title: str, description: str = "", labels: str = "",
                    pipeline: str = "", assignee: str = "",
                    estimate: str = "", parent: int = 0,
-                   repo_path: str = "") -> dict:
+                   repo_path: str = "",
+                   confirm_create: bool = False,
+                   skip_duplicate_check: bool = False) -> dict:
     """Create a Sub-task (issue-type Sub-task, level 5).
 
+    v1.9.1 item #5: runs the same duplicate-check pre-flight as
+    create_issue. Use confirm_create=True to override a block,
+    skip_duplicate_check=True to bypass.
+
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    raw, stderr.
+    raw, stderr, duplicate_check (when the pre-flight ran).
     """
     return _planning_create("subtask", title, description, labels, pipeline,
-                            assignee, estimate, parent, repo_path)
+                            assignee, estimate, parent, repo_path,
+                            confirm_create=confirm_create,
+                            skip_duplicate_check=skip_duplicate_check)
 
 
 @mcp.tool()
