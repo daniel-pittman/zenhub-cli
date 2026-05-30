@@ -212,14 +212,21 @@ def run_zh_with_stubs(
                 st = _os.stat(entry)
             except OSError:
                 continue
-            # Skip world-writable directories (other-write bit set
-            # AND not sticky). The sticky-bit carve-out lets /tmp-like
-            # shared directories through if they're explicitly marked,
-            # though those should normally not be on PATH at all.
+            # Skip every world-writable directory. v1.9.3 round-2 (PR
+            # #29) finding #4: the previous sticky-bit carve-out was
+            # the wrong threat model — sticky prevents non-owners from
+            # DELETING files, but does NOT prevent any local user from
+            # CREATING a binary in the directory. A test running on a
+            # host where `/tmp` (or any sticky world-writable dir)
+            # ended up on PATH would happily resolve `jq` / `gh` to an
+            # attacker-planted binary. The hardcoded floor PATH
+            # (`/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin`) covers
+            # every legitimate case for which tools need to resolve in
+            # the test harness; no production PATH should require an
+            # exemption for a world-writable entry.
             mode = st.st_mode
             world_writable = bool(mode & 0o002)
-            sticky = bool(mode & 0o1000)
-            if world_writable and not sticky:
+            if world_writable:
                 continue
             safe_path_parts.append(entry)
     if safe_path_parts:

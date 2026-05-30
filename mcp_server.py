@@ -1666,6 +1666,15 @@ def create_issue(title: str, body: str, type: str = "Task",
     # validation paths were left at the old 2-key shape.
     _empty_create_shape = {
         "ok": False,
+        # v1.9.3 round-2 (PR #29) finding #1: include partial_applied in
+        # the shared validation shape so create_issue parses the same
+        # `out["partial_applied"]` key as every other write wrapper.
+        # cmd_create has no exit-2 partial today (the parent-wire
+        # addSubIssues failure is reported separately as `parent=null`,
+        # not as a partial-applied state), so this is always False.
+        # Agents that uniformly read out["partial_applied"] on every
+        # write tool no longer KeyError on a create.
+        "partial_applied": False,
         "number": None,
         "url": None,
         "type": None,
@@ -1726,6 +1735,8 @@ def create_issue(title: str, body: str, type: str = "Task",
             # like out["number"], out["estimate_requested"], etc.
             return {
                 "ok": False,
+                # v1.9.3 round-2 (PR #29) finding #1: uniform-key parity.
+                "partial_applied": False,
                 "blocked": True,
                 "number": None,
                 "url": None,
@@ -1766,6 +1777,13 @@ def create_issue(title: str, body: str, type: str = "Task",
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     out = {
         "ok": r["ok"] and created is not None,
+        # v1.9.3 round-2 (PR #29) finding #1: uniform-key parity with
+        # every other write wrapper. cmd_create has no exit-2 partial
+        # path today (parent-wire addSubIssues failure is reported as
+        # `parent=null`, not as a partial-applied state), so this is
+        # always False. Agents that branch on out["partial_applied"]
+        # uniformly across write tools no longer KeyError here.
+        "partial_applied": False,
         "number": created.get("number") if created else None,
         "url": created.get("url") if created else None,
         "type": created.get("type") if created else None,
@@ -2215,6 +2233,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         # the sibling site that was missed.
         return {
             "ok": False,
+            # v1.9.3 round-2 (PR #29) finding #1: uniform-key parity.
+            "partial_applied": False,
             "number": None,
             "url": None,
             "type": None,
@@ -2285,6 +2305,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             # so every documented key is present.
             return {
                 "ok": False,
+                # v1.9.3 round-2 (PR #29) finding #1: uniform-key parity.
+                "partial_applied": False,
                 "blocked": True,
                 "number": None,
                 "url": None,
@@ -2323,6 +2345,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     out = {
         "ok": r["ok"] and created is not None,
+        # v1.9.3 round-2 (PR #29) finding #1: uniform-key parity.
+        "partial_applied": False,
         "number": created.get("number") if created else None,
         "url": created.get("url") if created else None,
         "type": created.get("type") if created else None,
@@ -2435,7 +2459,10 @@ def _planning_update(noun: str, number: int, title: str, description: str,
     }
 
 
-_OUTCOME_SENTINEL_RE = re.compile(r"__ZH_OUTCOME__:([a-z]+)")
+_OUTCOME_SENTINEL_RE = re.compile(
+    r"^__ZH_OUTCOME__:(ok|noop|partial|fail)\s*$",
+    re.MULTILINE,
+)
 
 
 def _stderr_plain(r: dict) -> str:
@@ -2463,11 +2490,22 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     (both exit 0 under the round-4 #5 idempotent-success contract) so
     `added` / `removed` no longer claim children landed when none did.
     Returns the outcome string when found, or None if absent.
+
+    v1.9.3 round-2 (PR #29) findings #2 / #8: the regex is anchored to a
+    line boundary AND constrained to the four known outcomes; we also
+    prefer the LAST match. The bash side emits the sentinel as the
+    final stderr line right before exit, but earlier `warn` lines can
+    carry user-controllable text (e.g. raw GraphQL error envelopes via
+    `warn "  githubErrors: ${gh_errors}"`). A payload whose error text
+    happened to contain the literal `__ZH_OUTCOME__:ok` would have
+    poisoned the classification with the previous `re.search`
+    first-match-wins behavior. Last-match + line-anchor + alternation
+    closes that seam without changing behavior for clean output.
     """
     if not stderr_plain:
         return None
-    m = _OUTCOME_SENTINEL_RE.search(stderr_plain)
-    return m.group(1) if m else None
+    matches = _OUTCOME_SENTINEL_RE.findall(stderr_plain)
+    return matches[-1] if matches else None
 
 
 def _planning_add_children(noun: str, parent: int, children: list[int],
@@ -2477,8 +2515,12 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
         # parity with the success / partial paths.
         # v1.9.3 pattern-sweep: include `outcome` for shape parity with
         # the success / partial / noop paths below.
+        # v1.9.3 round-2 (PR #29) finding #6: drop `stderr_plain` from
+        # the early-return dict. The success/partial paths return only
+        # `"stderr": _stderr_plain(r)` (the _plain already collapsed
+        # into the canonical key); exposing both keys here was shape
+        # drift in the wrong direction.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "stderr_plain": "issue_numbers must be non-empty",
                 "parent": parent, "added": [], "added_requested": [],
                 "partial_applied": False, "outcome": "fail", "raw": ""}
     args = [noun, "add", str(parent)] + [str(n) for n in children]
@@ -2517,14 +2559,22 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     #     elif r["ok"]: log(f"Added {len(r['added'])} children")
     #     else: log(f"Failed (requested: {r['added_requested']})")
     partial_applied = _safe_int(r.get("exit_code")) == 2
-    outcome = _parse_outcome_sentinel(_stderr_plain(r))
-    if outcome is None:
+    sentinel_outcome = _parse_outcome_sentinel(_stderr_plain(r))
+    sentinel_seen = sentinel_outcome is not None
+    if sentinel_seen:
+        outcome = sentinel_outcome
+    else:
         # Defensive default: an older zh without the sentinel falls back
         # to the round-4 #5 contract. Production zh always emits the
         # sentinel; this is for the during-rollout window.
         outcome = "partial" if partial_applied else ("ok" if r["ok"] else "fail")
-    # v1.9.3 pattern-sweep finding #1: noop must NOT overstate `added`.
-    is_landed = outcome == "ok"
+    # v1.9.3 finding #1 + round-2 #7: noop must NOT overstate
+    # `added`, and the inference fallback above CANNOT distinguish ok
+    # from noop on its own (both have exit 0 + r["ok"]=True). Require
+    # the explicit sentinel signal to credit children as landed; absent
+    # the sentinel, default `added=[]` so a future bash change that
+    # accidentally drops the sentinel emit can't silently overstate.
+    is_landed = sentinel_seen and outcome == "ok"
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2545,8 +2595,9 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
                               repo_path: str) -> dict:
     if not children:
         # v1.9.3 pattern-sweep: include `outcome` for shape parity.
+        # v1.9.3 round-2 (PR #29) finding #6: drop `stderr_plain` for
+        # consistency with the success path (see _planning_add_children).
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "stderr_plain": "issue_numbers must be non-empty",
                 "parent": parent, "removed": [], "removed_requested": [],
                 "partial_applied": False, "outcome": "fail", "raw": ""}
     args = [noun, "remove", str(parent)] + [str(n) for n in children]
@@ -2555,12 +2606,17 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
     # v1.9.2 round-2 (PR #27) finding #5: same removed/removed_requested
     # split — on partial, `removed` is empty (verify via
     # subissue_list), `removed_requested` is the input list always.
-    # v1.9.3 pattern-sweep finding #1: noop must NOT overstate `removed`.
+    # v1.9.3 finding #1 + round-2 #7: noop must NOT overstate
+    # `removed`; the inference fallback can't distinguish ok from noop,
+    # so require the sentinel to credit children as landed.
     partial_applied = _safe_int(r.get("exit_code")) == 2
-    outcome = _parse_outcome_sentinel(_stderr_plain(r))
-    if outcome is None:
+    sentinel_outcome = _parse_outcome_sentinel(_stderr_plain(r))
+    sentinel_seen = sentinel_outcome is not None
+    if sentinel_seen:
+        outcome = sentinel_outcome
+    else:
         outcome = "partial" if partial_applied else ("ok" if r["ok"] else "fail")
-    is_landed = outcome == "ok"
+    is_landed = sentinel_seen and outcome == "ok"
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,

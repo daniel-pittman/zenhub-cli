@@ -161,8 +161,18 @@ zh_cause_hint() {
         # ESC `\` outside an OSC is not a thing terminals emit. ESC
         # alone is excluded from the OSC body class so the BEL regex
         # still terminates at the right byte.
-        local _bel
+        local _bel _st8 _csi8
         _bel=$'\007'
+        # v1.9.3 round-2 (PR #29) finding #3 / LOW #3: also normalize 8-bit C1 controls.
+        # 0x9C is the 8-bit ST (string terminator); fold to BEL so the
+        # BEL OSC regex catches OSC sequences that used the single-byte
+        # ST. 0x9B is the 8-bit CSI introducer; expand to ESC `[` so
+        # the existing CSI regex picks it up. Locales other than LC_ALL=C
+        # may UTF-8-encode these as 0xC2 0x9C / 0xC2 0x9B, which this
+        # branch does not handle; the coreutils sed branch above is the
+        # comprehensive path for any C1-emitting terminal.
+        _st8=$'\234'
+        _csi8=$'\233'
         local _line _out=""
         while IFS= read -r _line || [[ -n "$_line" ]]; do
             # Normalize OSC ST → OSC BEL FIRST. We can't use
@@ -178,8 +188,17 @@ zh_cause_hint() {
                 _ch="${_line:_i:1}"
                 _next="${_line:_i+1:1}"
                 if [[ "$_ch" == "$_esc" && "$_next" == "\\" ]]; then
+                    # 7-bit ST: ESC \ → BEL
                     _norm+="$_bel"
                     _i=$((_i + 2))
+                elif [[ "$_ch" == "$_st8" ]]; then
+                    # 8-bit ST (0x9C) → BEL
+                    _norm+="$_bel"
+                    _i=$((_i + 1))
+                elif [[ "$_ch" == "$_csi8" ]]; then
+                    # 8-bit CSI (0x9B) → ESC [
+                    _norm+="${_esc}["
+                    _i=$((_i + 1))
                 else
                     _norm+="$_ch"
                     _i=$((_i + 1))
