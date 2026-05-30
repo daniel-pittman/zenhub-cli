@@ -30,33 +30,142 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 ZENHUB_API="https://api.zenhub.com/public/graphql"
 
 # Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-BOLD='\033[1m'
+#
+# v1.9.2 round-3 (PR #27) finding #9: honor the NO_COLOR informal
+# standard (https://no-color.org). When NO_COLOR is set to ANY
+# non-empty value, suppress every ANSI escape so the output is plain
+# text. Tests can set NO_COLOR=1 to skip the ANSI-strip helper, and
+# users on terminals that don't render ANSI (or who prefer plain
+# output) get a clean rendering. The variable is checked once at
+# script-load time; we don't re-evaluate per-call.
+if [[ -n "${NO_COLOR:-}" ]]; then
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    NC=''
+    BOLD=''
+else
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    NC='\033[0m' # No Color
+    BOLD='\033[1m'
+fi
 
 # =============================================================================
 # Helper Functions
 # =============================================================================
 
+# v1.9.2 round-7 finding #13: switch error/warn/info/success from
+# `echo -e` to `printf '%s\n'`. The `echo -e` form interprets
+# escape sequences (\n, \t, \\) inside the payload, which silently
+# corrupts ZenHub-side error messages that contain `jq -c` JSON
+# strings: a value like `"permission denied:\nrepo is archived"`
+# rendered as a real newline, fragmenting the single-line warn
+# across multiple stderr lines and invalidating the embedded JSON
+# for downstream parsers. The round-6 #4 partial-applied warn at
+# zh:3569 embeds `jq -c` output via `${gh_errors}`, so this fix
+# matters most there but it's correct everywhere.
+#
+# The color escapes themselves stay (they're literal ANSI bytes in
+# the format string, not in the payload, so printf passes them
+# through unchanged). Trailing `\n` is added explicitly.
 error() {
-    echo -e "${RED}Error:${NC} $1" >&2
+    printf "${RED}Error:${NC} %s\n" "$1" >&2
     exit 1
 }
 
 warn() {
-    echo -e "${YELLOW}Warning:${NC} $1" >&2
+    printf "${YELLOW}Warning:${NC} %s\n" "$1" >&2
 }
 
 info() {
-    echo -e "${BLUE}Info:${NC} $1"
+    printf "${BLUE}Info:${NC} %s\n" "$1"
 }
 
 success() {
-    echo -e "${GREEN}✓${NC} $1"
+    printf "${GREEN}\xe2\x9c\x93${NC} %s\n" "$1"
+}
+
+# v1.9.2 round-3 (PR #27) finding #5: build a single-line cause-hint
+# from a possibly-multi-line stderr capture so post-create envelope
+# warns can include the actionable detail (e.g. ZenHub's
+# "Error: ZenHub API error:\n  Hint: regenerate at https://...")
+# rather than only the header line. Collapses internal newlines to
+# "; ", strips ANSI escapes, drops empty lines, caps at 240 chars
+# with a trailing "..." marker if truncated. Reads from a file path
+# (which may be /dev/null per the round-1 #2 fail-soft fallback);
+# returns empty when the file is missing / empty / /dev/null.
+#
+# v1.9.2 round-4 (PR #27) finding #12: prefer the coreutils pipeline
+# (sed + awk + paste + tr) but fall back to a pure-bash implementation
+# when any of those tools are missing (alpine/busybox containers).
+# Without the fallback, the pipeline returns empty and every warn
+# silently lost its cause clause with no diagnostic. The pure-bash
+# variant strips CSI ANSI escapes, OSC sequences (round-4 finding
+# #15), drops empty lines, joins with "; ", and caps at 240 chars
+# using only built-in parameter expansion.
+zh_cause_hint() {
+    local _f="$1"
+    if [[ -z "$_f" || "$_f" == "/dev/null" || ! -s "$_f" ]]; then
+        printf '%s' ""
+        return 0
+    fi
+    local _raw=""
+    # Detect coreutils availability up-front; if any are missing,
+    # use the pure-bash fallback. `command -v` returns 0 iff the
+    # tool resolves on PATH.
+    if command -v sed >/dev/null 2>&1 \
+        && command -v awk >/dev/null 2>&1 \
+        && command -v paste >/dev/null 2>&1 \
+        && command -v tr >/dev/null 2>&1; then
+        _raw=$(LC_ALL=C sed -E $'s/\033\\[[0-9;]*[a-zA-Z]//g; s/\033\\][^\007\033]*(\007|\033\\\\)//g' "$_f" 2>/dev/null \
+            | awk 'NF>0' \
+            | paste -sd';' - \
+            | tr -s ';' \
+            | sed -e 's/;/; /g' 2>/dev/null || true)
+    else
+        # Pure-bash fallback: read the file line-by-line, strip
+        # ANSI escape sequences via regex match-and-replace, drop
+        # empties, join with "; ". Uses pre-computed sentinel
+        # strings instead of inline $'\033' interpolation so the
+        # bash 3.2 / 4.x regex parser doesn't choke.
+        local _esc _csi_re _osc_re
+        _esc=$'\033'
+        # CSI: ESC [ <params/intermediates> <final-byte>
+        _csi_re="${_esc}\[[0-9;]*[a-zA-Z]"
+        # OSC: ESC ] <text> BEL (also covers most ESC ] ... ESC \)
+        _osc_re="${_esc}\][^"$'\007'"]*"$'\007'
+        local _line _out=""
+        while IFS= read -r _line || [[ -n "$_line" ]]; do
+            # Strip every CSI sequence on this line.
+            while [[ "$_line" =~ $_csi_re ]]; do
+                _line="${_line//${BASH_REMATCH[0]}/}"
+            done
+            # Strip every OSC sequence on this line.
+            while [[ "$_line" =~ $_osc_re ]]; do
+                _line="${_line//${BASH_REMATCH[0]}/}"
+            done
+            # Skip empty / whitespace-only lines.
+            local _trimmed="${_line#"${_line%%[![:space:]]*}"}"
+            if [[ -n "$_trimmed" ]]; then
+                if [[ -n "$_out" ]]; then
+                    _out="${_out}; ${_line}"
+                else
+                    _out="$_line"
+                fi
+            fi
+        done < "$_f"
+        _raw="$_out"
+    fi
+    if [[ ${#_raw} -gt 240 ]]; then
+        _raw="${_raw:0:237}..."
+    fi
+    printf '%s' "$_raw"
 }
 
 # Lowercase a string portably. bash 3.2 (macOS default, and a CI matrix
@@ -2410,12 +2519,28 @@ cmd_create() {
             local _norm_flag="${1%%=*}"
             local _norm_val="${1#*=}"
             local _is_known_flag="false"
+            local _is_boolean_flag="false"
             case "$_norm_flag" in
-                --type|--parent|--priority|--label|--labels|--assign|--assignee|--pipeline|--estimate|--body|--file|--body-file|--description|--json|--quiet|--stdin)
+                --type|--parent|--priority|--label|--labels|--assign|--assignee|--pipeline|--estimate|--body|--file|--body-file|--description)
                     _is_known_flag="true"
+                    ;;
+                --json|--quiet|--stdin)
+                    # v1.9.2 round-7 finding #2: these flags are boolean
+                    # (their case arms use single shift, no value
+                    # consumed). The pre-fix code listed them as known
+                    # flags and let the normalizer split them; the case
+                    # arm consumed only the flag token and left the
+                    # value as the next positional, which would fall to
+                    # `*)` and become the title. Reject the GNU-equals
+                    # form up-front with a clear diagnostic.
+                    _is_known_flag="true"
+                    _is_boolean_flag="true"
                     ;;
             esac
             if [[ -n "$title" || "$_is_known_flag" == "true" ]]; then
+                if [[ "$_is_boolean_flag" == "true" ]]; then
+                    error "Option ${_norm_flag} is a boolean flag and does not accept a value (received '${1}')"
+                fi
                 if [[ -z "$_norm_val" ]]; then
                     error "Option ${_norm_flag} requires a value (received empty string from '${1}')"
                 fi
@@ -2465,7 +2590,18 @@ cmd_create() {
                 estimate="$2"
                 shift 2
                 ;;
-            -b|--body)
+            -b|--body|--description)
+                # v1.9.2 round-7 finding #1: `--description` was in the
+                # normalizer's known-flag list at zh:2414 (so the GNU-
+                # equals form normalized) but had NO case arm. The
+                # normalized token fell to `*)` and silently dropped
+                # the body (or, if title was unset, captured `--description`
+                # as the title and dropped the user's intended title).
+                # cmd_hierarchy_create translates the planning-noun
+                # `--description` to `-b`, but a user passing
+                # `--description` directly to `zh create` lost their
+                # input. Accept it as an alias for `-b|--body` so both
+                # entry points work.
                 body="$2"
                 shift 2
                 ;;
@@ -2722,8 +2858,20 @@ Examples:
         # issue was already created. Capture failures so the parent-
         # wire becomes a recoverable warn that points at the manual
         # re-wire verb.
-        local sub_response="" sub_ok=0
-        sub_response=$(zh_graphql "$sub_mutation" "$sub_vars" 2>/dev/null) || sub_response=""
+        # v1.9.2 round-7 finding #12: capture stderr alongside stdout
+        # so the "could not attach" warn includes the root-cause
+        # diagnostic. Pre-fix, `2>/dev/null` silenced messages like
+        # "Error: ZenHub API error: Invalid token" — leaving the user
+        # with six generic "could not X" warns across the create flow
+        # and no hint that the token needed refreshing. Use a temp
+        # file to keep stdout and stderr separable; both go through
+        # the helper so additional envelopes can reuse the pattern.
+        local sub_response="" sub_err="" sub_ok=0
+        local _sub_err_file
+        _sub_err_file=$(mktemp -t zh_subwire.XXXXXX 2>/dev/null) || _sub_err_file=/dev/null
+        sub_response=$(zh_graphql "$sub_mutation" "$sub_vars" 2>"$_sub_err_file") || sub_response=""
+        sub_err=$(zh_cause_hint "$_sub_err_file")
+        [[ "$_sub_err_file" != "/dev/null" ]] && rm -f "$_sub_err_file" || true
         if [[ -n "$sub_response" ]]; then
             sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
         fi
@@ -2733,7 +2881,11 @@ Examples:
                 echo -e "  Parent: ${GREEN}#${parent_stripped}${NC}"
             fi
         else
-            warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped}. Re-wire with 'zh subissue add ${parent_stripped} ${new_issue_num}'."
+            if [[ -n "$sub_err" ]]; then
+                warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped} (cause: ${sub_err}). Re-wire with 'zh subissue add ${parent_stripped} ${new_issue_num}'."
+            else
+                warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped}. Re-wire with 'zh subissue add ${parent_stripped} ${new_issue_num}'."
+            fi
         fi
     fi
 
@@ -2767,15 +2919,25 @@ Examples:
         est_vars=$(jq -n --arg issue_id "$new_issue_id" --argjson value "$estimate" \
             '{input: {issueId: $issue_id, value: $value}}')
 
-        local est_result=""
-        est_result=$(zh_graphql "$est_mutation" "$est_vars" 2>/dev/null) || est_result=""
+        # v1.9.2 round-7 finding #12: same root-cause capture pattern
+        # as the parent-wire envelope.
+        local est_result="" est_err=""
+        local _est_err_file
+        _est_err_file=$(mktemp -t zh_estwire.XXXXXX 2>/dev/null) || _est_err_file=/dev/null
+        est_result=$(zh_graphql "$est_mutation" "$est_vars" 2>"$_est_err_file") || est_result=""
+        est_err=$(zh_cause_hint "$_est_err_file")
+        [[ "$_est_err_file" != "/dev/null" ]] && rm -f "$_est_err_file" || true
         if [[ -n "$est_result" ]]; then
             estimate_applied="true"
             if [[ "$human" == "true" ]]; then
                 echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
             fi
         else
-            warn "Created #${new_issue_num} but the estimate mutation failed. Retry with 'zh estimate #${new_issue_num} ${estimate}'."
+            if [[ -n "$est_err" ]]; then
+                warn "Created #${new_issue_num} but the estimate mutation failed (cause: ${est_err}). Retry with 'zh estimate #${new_issue_num} ${estimate}'."
+            else
+                warn "Created #${new_issue_num} but the estimate mutation failed. Retry with 'zh estimate #${new_issue_num} ${estimate}'."
+            fi
         fi
     fi
 
@@ -2802,9 +2964,15 @@ Examples:
         local pipelines_vars
         pipelines_vars=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
 
-        local pipelines_response=""
-        pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars" 2>/dev/null) || pipelines_response=""
-
+        # v1.9.2 round-7 finding #12: capture stderr so a "Pipeline
+        # '...' not found" warn that's actually caused by a network
+        # / auth failure carries the cause hint.
+        local pipelines_response="" pipelines_err=""
+        local _pipelines_err_file
+        _pipelines_err_file=$(mktemp -t zh_pipelookup.XXXXXX 2>/dev/null) || _pipelines_err_file=/dev/null
+        pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars" 2>"$_pipelines_err_file") || pipelines_response=""
+        pipelines_err=$(zh_cause_hint "$_pipelines_err_file")
+        [[ "$_pipelines_err_file" != "/dev/null" ]] && rm -f "$_pipelines_err_file" || true
         local pipeline_id=""
         if [[ -n "$pipelines_response" ]]; then
             pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline" \
@@ -2829,15 +2997,24 @@ Examples:
             # zh_graphql, so the round-5 #1 priority_id cleanup in the
             # else branch was unreachable. Now both the success arm and
             # the priority-cleanup branch run as intended.
-            local move_result=""
-            move_result=$(zh_graphql "$move_mutation" "$move_vars" 2>/dev/null) || move_result=""
+            # v1.9.2 round-7 finding #12: same root-cause capture.
+            local move_result="" move_err=""
+            local _move_err_file
+            _move_err_file=$(mktemp -t zh_movewire.XXXXXX 2>/dev/null) || _move_err_file=/dev/null
+            move_result=$(zh_graphql "$move_mutation" "$move_vars" 2>"$_move_err_file") || move_result=""
+            move_err=$(zh_cause_hint "$_move_err_file")
+            [[ "$_move_err_file" != "/dev/null" ]] && rm -f "$_move_err_file" || true
             if [[ -n "$move_result" ]]; then
                 pipeline_set="$pipeline"
                 if [[ "$human" == "true" ]]; then
                     echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
                 fi
             else
-                warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed. Retry with 'zh move #${new_issue_num} \"${pipeline}\"'."
+                if [[ -n "$move_err" ]]; then
+                    warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed (cause: ${move_err}). Retry with 'zh move #${new_issue_num} \"${pipeline}\"'."
+                else
+                    warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed. Retry with 'zh move #${new_issue_num} \"${pipeline}\"'."
+                fi
                 # Round-5 finding #1: mirror the "Pipeline not found"
                 # defense. setPriorityOnPipelineIssues binds to whichever
                 # pipelineIssue exists for the issue, which is still the
@@ -2851,7 +3028,14 @@ Examples:
                 fi
             fi
         else
-            warn "Pipeline '${pipeline}' not found"
+            # v1.9.2 round-7 finding #12: include the cause hint
+            # when the pipeline lookup actually failed (vs. a clean
+            # "name truly does not match any pipeline" outcome).
+            if [[ -z "$pipelines_response" && -n "$pipelines_err" ]]; then
+                warn "Pipeline '${pipeline}' not found (cause: ${pipelines_err})"
+            else
+                warn "Pipeline '${pipeline}' not found"
+            fi
             # Round-2 finding #3: when --priority is ALSO requested, we
             # cannot apply it cleanly. setPriorityOnPipelineIssues
             # writes to whichever pipelineIssue the create mutation
@@ -2909,14 +3093,23 @@ Examples:
         # create failed and retry, producing a duplicate. Wrap both
         # zh_graphql calls so any failure falls through to the existing
         # warn paths.
-        local pi_lookup_response="" pipeline_issue_id=""
-        pi_lookup_response=$(zh_graphql "$pi_lookup_query" "$pi_lookup_vars" 2>/dev/null) || pi_lookup_response=""
+        # v1.9.2 round-7 finding #12: capture stderr for the cause hint.
+        local pi_lookup_response="" pi_lookup_err="" pipeline_issue_id=""
+        local _pi_err_file
+        _pi_err_file=$(mktemp -t zh_pilookup.XXXXXX 2>/dev/null) || _pi_err_file=/dev/null
+        pi_lookup_response=$(zh_graphql "$pi_lookup_query" "$pi_lookup_vars" 2>"$_pi_err_file") || pi_lookup_response=""
+        pi_lookup_err=$(zh_cause_hint "$_pi_err_file")
+        [[ "$_pi_err_file" != "/dev/null" ]] && rm -f "$_pi_err_file" || true
         if [[ -n "$pi_lookup_response" ]]; then
             pipeline_issue_id=$(echo "$pi_lookup_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
         fi
 
         if [[ -z "$pipeline_issue_id" ]]; then
-            warn "Created #${new_issue_num} but could not resolve its pipelineIssue id to set priority '${priority_name}'. Retry with 'zh priority #${new_issue_num} \"${priority_name}\"'."
+            if [[ -n "$pi_lookup_err" ]]; then
+                warn "Created #${new_issue_num} but could not resolve its pipelineIssue id to set priority '${priority_name}' (cause: ${pi_lookup_err}). Retry with 'zh priority #${new_issue_num} \"${priority_name}\"'."
+            else
+                warn "Created #${new_issue_num} but could not resolve its pipelineIssue id to set priority '${priority_name}'. Retry with 'zh priority #${new_issue_num} \"${priority_name}\"'."
+            fi
         else
             local prio_mutation='
             mutation($input: SetPriorityOnPipelineIssuesInput!) {
@@ -2927,8 +3120,13 @@ Examples:
             local prio_vars
             prio_vars=$(jq -n --arg pid "$pipeline_issue_id" --arg priority_id "$priority_id" \
                 '{input: {pipelineIssueIds: [$pid], priorityId: $priority_id}}')
-            local prio_response="" prio_applied=""
-            prio_response=$(zh_graphql "$prio_mutation" "$prio_vars" 2>/dev/null) || prio_response=""
+            # v1.9.2 round-7 finding #12: capture stderr root-cause.
+            local prio_response="" prio_err="" prio_applied=""
+            local _prio_err_file
+            _prio_err_file=$(mktemp -t zh_priowire.XXXXXX 2>/dev/null) || _prio_err_file=/dev/null
+            prio_response=$(zh_graphql "$prio_mutation" "$prio_vars" 2>"$_prio_err_file") || prio_response=""
+            prio_err=$(zh_cause_hint "$_prio_err_file")
+            [[ "$_prio_err_file" != "/dev/null" ]] && rm -f "$_prio_err_file" || true
             if [[ -n "$prio_response" ]]; then
                 prio_applied=$(echo "$prio_response" | jq -r '.data.setPriorityOnPipelineIssues.pipelineIssues[0].priority.name // empty')
             fi
@@ -2938,7 +3136,11 @@ Examples:
                     echo -e "  Priority: ${GREEN}${prio_applied}${NC}"
                 fi
             else
-                warn "Created #${new_issue_num} but the priority mutation did not confirm '${priority_name}'. Retry with 'zh priority #${new_issue_num} \"${priority_name}\"'."
+                if [[ -n "$prio_err" ]]; then
+                    warn "Created #${new_issue_num} but the priority mutation did not confirm '${priority_name}' (cause: ${prio_err}). Retry with 'zh priority #${new_issue_num} \"${priority_name}\"'."
+                else
+                    warn "Created #${new_issue_num} but the priority mutation did not confirm '${priority_name}'. Retry with 'zh priority #${new_issue_num} \"${priority_name}\"'."
+                fi
             fi
         fi
     fi
@@ -3533,8 +3735,48 @@ Examples:
     mutation_vars=$(jq -n --arg id "$issue_id" --arg tid "$type_id" \
         '{input: {issueIds: [$id], issueTypeId: $tid}}')
 
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
+    # v1.9.2 round-7 finding #5: fail-soft envelope mirroring the
+    # cmd_create round-6 #1 / #2 / #5 pattern. Pre-fix this was a
+    # bare assignment `response=$(zh_graphql ...)`. Under `set -euo
+    # pipefail`, when zh_graphql `error`s and exits 1 on a `.errors`
+    # response, the subshell exits 1, the outer assignment carries
+    # the status, and cmd_set_type aborts before reaching the
+    # partial-applied gate below. With the capture-and-branch
+    # pattern the partial-detection path stays reachable; an empty
+    # response is treated as a hard failure so the caller sees a
+    # clear cmd_set_type-level diagnostic instead of a bash silent
+    # abort.
+    #
+    # v1.9.2 round-1 (PR #27) finding #1: capture stderr separately
+    # so the error message includes the root-cause hint (e.g.
+    # "Invalid token", "rate-limited"). The first version of this
+    # envelope in v1.9.2 dropped stderr to /dev/null, which left the
+    # operator with the generic "check token / network / rate
+    # limits" line and no actionable diagnostic. Mirrors the
+    # cmd_create round-7 #12 pattern. The `mktemp || /dev/null`
+    # fallback (round-1 finding #2) keeps the envelope working on
+    # systems where TMPDIR is unwritable.
+    local response="" response_err=""
+    local _resp_err_file
+    _resp_err_file=$(mktemp -t zh_settype.XXXXXX 2>/dev/null) || _resp_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_resp_err_file") || response=""
+    if [[ "$_resp_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_resp_err_file")
+        # v1.9.2 round-4 (PR #27) finding #10: under set -euo pipefail
+        # a bare `rm -f` that fails (read-only TMPDIR mid-test, file
+        # removed by a sibling process) aborts cmd_set_type AFTER
+        # the mutation has run, losing both the partial-applied warn
+        # and the exit-2 signal the MCP wrapper depends on. Match
+        # the cmd_create envelope pattern.
+        rm -f "$_resp_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ -n "$response_err" ]]; then
+            error "Failed to set type of #${issue_num} (cause: ${response_err}). Verify with 'zh issue ${issue_num}' before retrying."
+        else
+            error "Failed to set type of #${issue_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh issue ${issue_num}' before retrying)."
+        fi
+    fi
 
     local success_count failed_count gh_errors gh_errors_len
     success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
@@ -3676,14 +3918,45 @@ cmd_hierarchy_create() {
     # cmd_create's own empty-value guard never fires and the planning
     # noun creates an empty-body issue. Reject here for symmetry.
     local -a passthrough=()
+    local _h_title_seen="false"
     while [[ $# -gt 0 ]]; do
         if [[ "$1" == --*=* ]]; then
             local _hnorm_flag="${1%%=*}"
             local _hnorm_val="${1#*=}"
-            if [[ -z "$_hnorm_val" ]]; then
-                error "Option ${_hnorm_flag} requires a value (received empty string from '${1}')"
+            # v1.9.2 round-7 finding #6: two-stage disambiguation
+            # mirroring cmd_create's round-6 #8 fix. Without this,
+            # cmd_hierarchy_create unconditionally split EVERY
+            # `--foo=bar` token, including a literal title like
+            # `"--rotate=enabled fails on retry"`. The split halves
+            # then forwarded opaquely to cmd_create via passthrough,
+            # where the title was already gone — cmd_create's own
+            # disambiguation never saw the original `--*=*` token.
+            #
+            # Only normalize when (a) the prefix is a flag this verb
+            # or cmd_create actually accepts, OR (b) a positional
+            # (title) has already been captured. The known list
+            # mirrors the union of cmd_hierarchy_create's case arms
+            # and cmd_create's known long flags.
+            local _h_is_known="false"
+            local _h_is_boolean="false"
+            case "$_hnorm_flag" in
+                -d|--description|--label|--labels|--pipeline|--assign|--assignee|--estimate|--body|--file|--body-file|--parent|--priority|--type)
+                    _h_is_known="true"
+                    ;;
+                --json|--quiet|--stdin)
+                    _h_is_known="true"
+                    _h_is_boolean="true"
+                    ;;
+            esac
+            if [[ "$_h_title_seen" == "true" || "$_h_is_known" == "true" ]]; then
+                if [[ "$_h_is_boolean" == "true" ]]; then
+                    error "Option ${_hnorm_flag} is a boolean flag and does not accept a value (received '${1}')"
+                fi
+                if [[ -z "$_hnorm_val" ]]; then
+                    error "Option ${_hnorm_flag} requires a value (received empty string from '${1}')"
+                fi
+                set -- "$_hnorm_flag" "$_hnorm_val" "${@:2}"
             fi
-            set -- "$_hnorm_flag" "$_hnorm_val" "${@:2}"
         fi
         case "$1" in
             -d|--description)
@@ -3706,7 +3979,42 @@ cmd_hierarchy_create() {
                 # round-3 #2.
                 error "-t conflicts with the noun type ${type_name}. Do not pass -t to 'zh ${display_noun} create'; use 'zh create -t <type>' for an explicit type or 'zh type <issue#> <name>' to retype after create."
                 ;;
+            -l|--label|--labels|-p|--pipeline|-a|--assign|--assignee|-e|--estimate|-b|--body|-f|--file|--body-file|--parent|--priority)
+                # v1.9.2 round-3 (PR #27) finding #3: consume value-
+                # taking flags + their value as a 2-token unit so the
+                # value never reaches `*)` and flips _h_title_seen.
+                # Pre-fix, `zh epic create -l urgent "--rotate=foo"`
+                # passed `-l` through *) (it's -* prefixed, no flip),
+                # then `urgent` (the value, NOT -* prefixed) flipped
+                # the flag, and the next iteration's `--rotate=foo`
+                # got split as a flag because the title was "seen".
+                # cmd_create then captured `--rotate` as the title
+                # and silently dropped the user's text — the exact
+                # round-7 #6 failure mode this arm closes.
+                if [[ $# -lt 2 ]]; then
+                    error "Option ${1} requires a value"
+                fi
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
+            -q|--json|--quiet|--stdin)
+                # v1.9.2 round-3 (PR #27) finding #3: similarly,
+                # explicit boolean-flag arm so the next token never
+                # gets mis-classified as the boolean's "value" and
+                # then flipped to title.
+                passthrough+=("$1")
+                shift
+                ;;
             *)
+                # v1.9.2 round-7 finding #6: track whether a title (the
+                # first positional) has been captured. Subsequent
+                # `--*=*` tokens are unambiguously flags and can be
+                # split safely; before the first positional, only
+                # known flags are split so a literal `--rotate=...`
+                # title is preserved.
+                if [[ "$_h_title_seen" == "false" && "$1" != -* ]]; then
+                    _h_title_seen="true"
+                fi
                 passthrough+=("$1")
                 shift
                 ;;
@@ -3982,6 +4290,21 @@ zh_hierarchy_warn_type_mismatch() {
                 reopen)
                     redirect="zh reopen ${issue_num}"
                     ;;
+                update)
+                    # v1.9.2 round-7 finding #14: `update` against a
+                    # non-planning type (Bug/Feature/Task) cannot
+                    # redirect to a read-only `zh issue N`. There is
+                    # no top-level `zh update N` verb today. The
+                    # right user action is either to leave the type
+                    # alone (board-level types don't have an update
+                    # path on this CLI) or to retype first. Suppress
+                    # the redirect entirely for this case — the
+                    # update already applied to the underlying issue
+                    # so the operator only needs the typing mismatch
+                    # noted, not a misleading "next time use 'zh
+                    # issue 42'" instruction.
+                    redirect=""
+                    ;;
                 *)
                     redirect="zh issue ${issue_num}"
                     ;;
@@ -4000,7 +4323,22 @@ zh_hierarchy_warn_type_mismatch() {
             trailing="The data still rendered, but the matching command is '${redirect}'."
             ;;
         *)
-            trailing="The ${verb} still applied to #${issue_num}; next time the matching command is '${redirect}'."
+            if [[ -n "$redirect" ]]; then
+                trailing="The ${verb} still applied to #${issue_num}; next time the matching command is '${redirect}'."
+            else
+                # v1.9.2 round-7 finding #14: no good redirect target
+                # (e.g. update on a non-planning type). Acknowledge the
+                # apply landed and stop there; do not invent a redirect.
+                #
+                # v1.9.2 round-2 (PR #27) finding #1: the round-1 fix
+                # shipped a literal `<NounType>` token in the user-
+                # visible message, expecting the operator to mentally
+                # substitute. Copy-paste of the suggested command then
+                # failed because `<NounType>` is not a valid type name.
+                # Use $expected_type so the rendered command is
+                # directly runnable.
+                trailing="The ${verb} still applied to #${issue_num}. (No matching top-level command exists for ${actual_type}; retype with 'zh type ${issue_num} ${expected_type}' first if you want ${expected_type} semantics.)"
+            fi
             ;;
     esac
     warn "Issue #${issue_num} is typed ${actual_type}, not ${expected_type}. ${trailing}"
@@ -5616,8 +5954,32 @@ Example: zh subissue add 42 100 101"
         }
     }'
 
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
+    # v1.9.2 round-4 (PR #27) finding #1: fail-soft envelope mirroring
+    # cmd_set_type (zh:3713) and the six cmd_create envelopes. The
+    # pre-fix bare assignment died under `set -euo pipefail` whenever
+    # zh_graphql exited 1 on a `.errors` response. Under the
+    # round-3 #2 partial-applied contract, the divergence-only
+    # partial path (data block populated + .errors envelope) is
+    # EXACTLY the scenario the gate at zh:6042 is meant to detect;
+    # the bare assignment aborted before reaching it. With this
+    # envelope the partial classifier stays reachable, and an
+    # empty response is treated as a real failure with the cause
+    # hint surfaced.
+    local response="" response_err=""
+    local _ssa_err_file
+    _ssa_err_file=$(mktemp -t zh_ssadd.XXXXXX 2>/dev/null) || _ssa_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_ssa_err_file") || response=""
+    if [[ "$_ssa_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_ssa_err_file")
+        [[ "$_ssa_err_file" != "/dev/null" ]] && rm -f "$_ssa_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ -n "$response_err" ]]; then
+            error "Failed to add sub-issues to #${parent_num} (cause: ${response_err}). Verify with 'zh subissue list ${parent_num}' before retrying."
+        else
+            error "Failed to add sub-issues to #${parent_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh subissue list ${parent_num}' before retrying)."
+        fi
+    fi
 
     local success_count failed_count
     success_count=$(echo "$response" | jq -r '.data.addSubIssues.successCount // 0')
@@ -5744,12 +6106,30 @@ Example: zh subissue add 42 100 101"
     else
         outcome="ok"
     fi
+    # v1.9.2 round-3 (PR #27) finding #2: align partial-applied
+    # exit-code convention with cmd_set_type and the rest of the
+    # v1.9.x cycle. outcome=partial (some succeeded, some failed)
+    # is exit 2, not exit 1. This makes the bash CLI's exit code
+    # match what `subissue_add_children` MCP returns
+    # (partial_applied=True) and what `_planning_add_children`
+    # (which keys partial_applied on exit==2) reports. The old gate
+    # collapsed any failed_count>0 to exit 1, which made the bash
+    # side treat partial-success as full failure, silently
+    # contradicting the MCP-GraphQL-direct surface.
+    #
+    # v1.9.2 round-4 (PR #27) finding #5: outcome=noop (zero positives,
+    # zero negatives) is idempotent success for add — every input was
+    # already linked, so the desired state is already true. Exit 0
+    # with the noop wording. The pre-fix exit 1 made agents retry an
+    # operation whose intent was already satisfied.
     if [[ "$outcome" == "ok" ]]; then
         :  # exit 0 (implicit)
-    elif [[ "$failed_count" -gt 0 ]]; then
-        exit 1  # real failure
     elif [[ "$outcome" == "noop" ]]; then
-        exit 1  # zero positives = real failure (mirrors cmd_sprint_remove)
+        :  # exit 0 — idempotent success (children already attached)
+    elif [[ "$outcome" == "partial" ]]; then
+        exit 2  # partial-applied: some succeeded, agent should not retry blindly
+    elif [[ "$outcome" == "fail" ]]; then
+        exit 1  # all-fail: safe to retry
     else
         exit 2  # divergence-only partial = coverage incomplete
     fi
@@ -5909,8 +6289,25 @@ parent relationship before retrying."
         }
     }'
 
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
+    # v1.9.2 round-4 (PR #27) finding #1: same fail-soft envelope as
+    # cmd_subissue_add. The bare assignment died under set -e when
+    # zh_graphql exited 1 on a `.errors` response, missing the
+    # partial classifier at zh:6313.
+    local response="" response_err=""
+    local _ssr_err_file
+    _ssr_err_file=$(mktemp -t zh_ssrm.XXXXXX 2>/dev/null) || _ssr_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_ssr_err_file") || response=""
+    if [[ "$_ssr_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_ssr_err_file")
+        [[ "$_ssr_err_file" != "/dev/null" ]] && rm -f "$_ssr_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ -n "$response_err" ]]; then
+            error "Failed to remove sub-issues from #${parent_num} (cause: ${response_err}). Verify with 'zh subissue list ${parent_num}' before retrying."
+        else
+            error "Failed to remove sub-issues from #${parent_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh subissue list ${parent_num}' before retrying)."
+        fi
+    fi
 
     local success_count failed_count
     success_count=$(echo "$response" | jq -r '.data.removeSubIssues.successCount // 0')
@@ -6008,12 +6405,24 @@ state with 'zh subissue list ${stripped_parent}'."
     else
         outcome="ok"
     fi
+    # v1.9.2 round-3 (PR #27) finding #2: align partial exit code
+    # with cmd_subissue_add (see comment there). outcome=partial is
+    # exit 2 so MCP _planning_remove_children correctly reports
+    # partial_applied=True and matches subissue_remove_children's
+    # GraphQL-direct contract.
+    #
+    # v1.9.2 round-4 (PR #27) finding #5: outcome=noop for REMOVE
+    # means "none of the requested inputs were linked to begin with"
+    # — the desired state ("not linked") is already true. Exit 0 for
+    # idempotent-success symmetry with cmd_subissue_add's noop arm.
     if [[ "$outcome" == "ok" ]]; then
         :  # exit 0 (implicit)
-    elif [[ "$failed_count" -gt 0 ]]; then
-        exit 1  # real failure
     elif [[ "$outcome" == "noop" ]]; then
-        exit 1  # zero positives = real failure
+        :  # exit 0 — idempotent success (none were linked to remove)
+    elif [[ "$outcome" == "partial" ]]; then
+        exit 2  # partial-applied: some succeeded, agent should not retry blindly
+    elif [[ "$outcome" == "fail" ]]; then
+        exit 1  # all-fail: safe to retry
     else
         exit 2  # divergence-only partial = coverage incomplete
     fi
@@ -6955,4 +7364,15 @@ Run 'zh help' for usage information."
     esac
 }
 
-main "$@"
+# v1.9.2: sourceable-mode guard. The test suite sources this script
+# (via tests/_bash_runner.py's `run_zh_with_stubs` helper) to invoke
+# the actual `cmd_*` functions against production logic, instead of
+# carrying parallel snippets that re-implement them. The standard
+# bash idiom `(return 0 2>/dev/null)` succeeds only when the script
+# is sourced — when executed, `return` outside a function is a
+# syntax error, so the subshell exits non-zero. Without this guard,
+# sourcing `zh` would fire `main "$@"` with the test process's argv,
+# which is never what we want.
+if ! (return 0 2>/dev/null); then
+    main "$@"
+fi
