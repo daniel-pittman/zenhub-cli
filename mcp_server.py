@@ -1589,9 +1589,14 @@ def create_issue(title: str, body: str, type: str = "Task",
             candidate matches and recommendation), and a clear message
             explaining how to override.
         On success: dict with ok=True, number (new issue number), url,
-            type, pipeline, parent, estimate, priority,
-            priority_requested, raw, stderr, duplicate_check
-            (informational; may include soft matches).
+            type, pipeline, parent, estimate, estimate_requested,
+            priority, priority_requested, raw, stderr, duplicate_check
+            (informational; may include soft matches). v1.9.2 round-7
+            finding #3: `estimate_requested` mirrors the priority
+            request/applied split. Compare it against `estimate`:
+            null/null = not requested, N/N = applied, N/null =
+            requested but the setEstimate mutation did not confirm
+            (retry, do NOT assume it landed).
     """
     if not title.strip():
         return {"ok": False, "stderr": "title must be non-empty"}
@@ -1624,9 +1629,23 @@ def create_issue(title: str, body: str, type: str = "Task",
 
         if (dup_info and dup_info.get("recommendation") == "block"
                 and not confirm_create):
+            # v1.9.2 round-7 finding #7: full key-set on the blocked
+            # path so create_issue and the planning-noun creates
+            # behave the same way for clients reading documented keys
+            # like out["number"], out["estimate_requested"], etc.
             return {
                 "ok": False,
                 "blocked": True,
+                "number": None,
+                "url": None,
+                "type": None,
+                "pipeline": None,
+                "parent": None,
+                "estimate": None,
+                "estimate_requested": None,
+                "priority": None,
+                "priority_requested": None,
+                "raw": "",
                 "stderr": (
                     "Refused: a similar open issue already exists "
                     "(cosine similarity >= "
@@ -1662,6 +1681,13 @@ def create_issue(title: str, body: str, type: str = "Task",
         "pipeline": created.get("pipeline") if created else None,
         "parent": created.get("parent") if created else None,
         "estimate": created.get("estimate") if created else None,
+        # v1.9.2 round-7 finding #3: bash --json emits the three-state
+        # estimate split (estimate / estimate_requested). Propagate the
+        # `_requested` half so MCP callers can detect a setEstimate
+        # mutation that lost the value (estimate=null, requested=N).
+        "estimate_requested": (
+            created.get("estimate_requested") if created else None
+        ),
         "priority": created.get("priority") if created else None,
         "priority_requested": (
             created.get("priority_requested") if created else None
@@ -1927,10 +1953,23 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, issue_type, raw, stderr.
+        dict with: ok, partial_applied, number, issue_type, raw, stderr.
+        v1.9.2 round-7 finding #9: `partial_applied` is True when the
+        underlying `zh type` exited 2 (round-6 #4 convention: ZenHub
+        side accepted the change but the mutation reported follow-on
+        errors). Agents that retry on ok=False MUST branch on
+        partial_applied — a retry of a partial-applied change runs a
+        second mutation against an issue whose type already changed,
+        which can no-op or fail in confusing ways. Re-verify the
+        type with `zh issue N` before deciding.
     """
     if not issue_type.strip():
-        return {"ok": False, "stderr": "issue_type must be non-empty"}
+        # v1.9.2 round-7 finding #8: validation early-return must
+        # include partial_applied so clients that uniformly key-check
+        # `out["partial_applied"]` do not KeyError.
+        return {"ok": False, "partial_applied": False,
+                "number": number, "issue_type": issue_type,
+                "raw": "", "stderr": "issue_type must be non-empty"}
     r = _run_zh(["type", str(number), issue_type],
                 cwd=_resolve_cwd(repo_path))
     # Round-6 finding #4: surface the exit-code convention. The bash
@@ -2062,15 +2101,32 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
 
         if (dup_info and dup_info.get("recommendation") == "block"
                 and not confirm_create):
-            # Round-2 finding #6: mirror create_issue's minimal block
-            # response shape (ok / blocked / stderr / duplicate_check).
-            # The 10-key version with `None` placeholders that this
-            # branch previously returned diverged from create_issue,
-            # which broke MCP clients that handled both entry points
-            # uniformly via `out["raw"]`.
+            # v1.9.2 round-7 finding #7: the round-2 #6 fix dropped
+            # this branch to a 4-key shape (ok / blocked / stderr /
+            # duplicate_check). That worked for clients that only
+            # read create_issue's blocked path (whose docstring is
+            # explicit about the truncation), but the planning-noun
+            # docstrings list the full 10-key contract. Agents
+            # reading `out["number"]` per the documented shape would
+            # KeyError on a blocked initiative_create / project_create
+            # / subtask_create. epic_create was partly insulated by
+            # _with_epic_number_alias setting `epic_number=None`, but
+            # only that one key was patched; the others stayed
+            # missing. Restore the full shape with None placeholders
+            # so every documented key is present.
             return {
                 "ok": False,
                 "blocked": True,
+                "number": None,
+                "url": None,
+                "type": None,
+                "pipeline": None,
+                "parent": None,
+                "estimate": None,
+                "estimate_requested": None,
+                "priority": None,
+                "priority_requested": None,
+                "raw": "",
                 "stderr": (
                     "Refused: a similar open issue already exists "
                     "(cosine similarity >= "
@@ -2104,6 +2160,16 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         "pipeline": created.get("pipeline") if created else None,
         "parent": created.get("parent") if created else None,
         "estimate": created.get("estimate") if created else None,
+        # v1.9.2 round-7 finding #4: mirror create_issue's
+        # estimate_requested propagation so epic_create /
+        # initiative_create / project_create / subtask_create all
+        # expose the three-state estimate signal. Without this an
+        # agent calling `epic_create(estimate="5")` against a
+        # transient setEstimate failure sees estimate=null with no
+        # way to tell "didn't ask" from "asked but lost".
+        "estimate_requested": (
+            created.get("estimate_requested") if created else None
+        ),
         # Round-4 finding #7: propagate the priority fields so the
         # planning-noun create returns the same key set create_issue
         # does. Planning creates do not accept --priority today, so
@@ -2156,9 +2222,14 @@ def _planning_show(noun: str, number: int, repo_path: str) -> dict:
 def _planning_update(noun: str, number: int, title: str, description: str,
                      repo_path: str) -> dict:
     if not title and not description:
+        # v1.9.2 round-7 finding #11: validation early-return must
+        # match the success-path shape so clients reading out["raw"]
+        # per the docstring (epic_update / initiative_update / ...)
+        # do not KeyError. Same shape-drift family as F8/F9.
         return {"ok": False,
                 "stderr": "Must provide title and/or description",
-                "number": number}
+                "number": number,
+                "raw": ""}
     args = [noun, "update", str(number)]
     if title:
         args.extend(["-t", title])
@@ -2177,12 +2248,27 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
                            repo_path: str) -> dict:
     if not children:
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "parent": parent, "added": []}
+                "parent": parent, "added": [], "partial_applied": False}
     args = [noun, "add", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # v1.9.2 round-7 finding #10: cmd_subissue_add exits 2 on a
+    # divergence-only partial (some children attached, others didn't).
+    # The pre-fix code collapsed both non-zero codes to ok=False,
+    # added=[], which an agent reads as total failure. Retrying a
+    # total-failure of a partial-success produces double-adds for the
+    # children that DID land. Surface partial_applied analogous to
+    # set_issue_type so the agent can branch.
+    partial_applied = r.get("exit_code") == 2
     return {
-        "ok": r["ok"],
+        "ok": r["ok"] or partial_applied,
+        "partial_applied": partial_applied,
         "parent": parent,
+        # On partial we cannot tell from the exit code alone which
+        # subset landed (the bash side prints them but doesn't emit
+        # structured JSON for the planning-noun wrapper). Returning
+        # the full `children` list on partial_applied=True would be
+        # misleading; an empty list signals "verify via zh subissue
+        # list before assuming". The agent must re-verify regardless.
         "added": children if r["ok"] else [],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
@@ -2193,11 +2279,14 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
                               repo_path: str) -> dict:
     if not children:
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "parent": parent, "removed": []}
+                "parent": parent, "removed": [], "partial_applied": False}
     args = [noun, "remove", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # v1.9.2 round-7 finding #10: same partial signal as the add path.
+    partial_applied = r.get("exit_code") == 2
     return {
-        "ok": r["ok"],
+        "ok": r["ok"] or partial_applied,
+        "partial_applied": partial_applied,
         "parent": parent,
         "removed": children if r["ok"] else [],
         "raw": r["stdout_plain"],

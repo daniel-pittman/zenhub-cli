@@ -1152,12 +1152,19 @@ def test_planning_create_blocks_on_duplicate(monkeypatch):
     )
     assert out["ok"] is False
     assert out.get("blocked") is True
-    # Round-2 finding #6: the block response now mirrors create_issue's
-    # minimal 4-key shape (ok, blocked, stderr, duplicate_check) so MCP
-    # clients can handle both entry points uniformly. No None-valued
-    # placeholders for number / url / type / etc.
-    assert "number" not in out
-    assert "raw" not in out
+    # v1.9.2 round-7 finding #7: the block response now carries the
+    # full documented key set with None placeholders so initiative /
+    # project / subtask docstrings (which list `number, url, type,
+    # pipeline, parent, estimate, raw, stderr, duplicate_check`) hold
+    # for the blocked path too. Round-2 finding #6's minimal-4-key
+    # shape was reverted because it made clients KeyError on the
+    # documented contract.
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested", "raw"):
+        assert key in out, f"blocked response missing {key!r}"
+        assert out[key] in (None, ""), (
+            f"blocked-path {key!r} should be None/empty, got {out[key]!r}"
+        )
     assert out["duplicate_check"] == blocked_info
     assert "confirm_create=True" in out["stderr"]
     assert called["ran"] is False, "bash create must NOT run when blocked"
