@@ -134,20 +134,33 @@ zh_cause_hint() {
         # empties, join with "; ". Uses pre-computed sentinel
         # strings instead of inline $'\033' interpolation so the
         # bash 3.2 / 4.x regex parser doesn't choke.
-        local _esc _csi_re _osc_re
+        local _esc _csi_re _osc_bel_re _osc_st_re
         _esc=$'\033'
         # CSI: ESC [ <params/intermediates> <final-byte>
         _csi_re="${_esc}\[[0-9;]*[a-zA-Z]"
-        # OSC: ESC ] <text> BEL (also covers most ESC ] ... ESC \)
-        _osc_re="${_esc}\][^"$'\007'"]*"$'\007'
+        # OSC, BEL-terminated:    ESC ] <text> BEL
+        _osc_bel_re="${_esc}\][^"$'\007\033'"]*"$'\007'
+        # v1.9.3 pattern-sweep: also handle ESC-backslash (ST) terminators.
+        # The coreutils sed branch above already strips both BEL and ST
+        # via the `(\007|\033\\\\)` alternation; the pure-bash fallback
+        # was BEL-only, so a terminal emitting ST-terminated OSC sequences
+        # on a busybox / alpine host had its diagnostic stuck in the
+        # error file. ESC and ESC-backslash both excluded from the OSC
+        # body class so a nested ESC closes the run; the dedicated ST
+        # regex then matches the final ESC \ pair.
+        _osc_st_re="${_esc}\][^"$'\033'"]*${_esc}\\\\"
         local _line _out=""
         while IFS= read -r _line || [[ -n "$_line" ]]; do
             # Strip every CSI sequence on this line.
             while [[ "$_line" =~ $_csi_re ]]; do
                 _line="${_line//${BASH_REMATCH[0]}/}"
             done
-            # Strip every OSC sequence on this line.
-            while [[ "$_line" =~ $_osc_re ]]; do
+            # Strip every BEL-terminated OSC sequence on this line.
+            while [[ "$_line" =~ $_osc_bel_re ]]; do
+                _line="${_line//${BASH_REMATCH[0]}/}"
+            done
+            # Strip every ST-terminated OSC sequence on this line.
+            while [[ "$_line" =~ $_osc_st_re ]]; do
                 _line="${_line//${BASH_REMATCH[0]}/}"
             done
             # Skip empty / whitespace-only lines.
@@ -2871,7 +2884,12 @@ Examples:
         _sub_err_file=$(mktemp -t zh_subwire.XXXXXX 2>/dev/null) || _sub_err_file=/dev/null
         sub_response=$(zh_graphql "$sub_mutation" "$sub_vars" 2>"$_sub_err_file") || sub_response=""
         sub_err=$(zh_cause_hint "$_sub_err_file")
-        [[ "$_sub_err_file" != "/dev/null" ]] && rm -f "$_sub_err_file" || true
+        # v1.9.3 pattern-sweep: harden rm-f against set-e abort (mirrors
+        # the round-4 #10 fix already applied to cmd_subissue_add /
+        # cmd_subissue_remove / cmd_set_type). A read-only TMPDIR or a
+        # sibling-process unlink would otherwise abort the function AFTER
+        # the mutation has run.
+        [[ "$_sub_err_file" != "/dev/null" ]] && rm -f "$_sub_err_file" 2>/dev/null || true
         if [[ -n "$sub_response" ]]; then
             sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
         fi
@@ -2926,7 +2944,8 @@ Examples:
         _est_err_file=$(mktemp -t zh_estwire.XXXXXX 2>/dev/null) || _est_err_file=/dev/null
         est_result=$(zh_graphql "$est_mutation" "$est_vars" 2>"$_est_err_file") || est_result=""
         est_err=$(zh_cause_hint "$_est_err_file")
-        [[ "$_est_err_file" != "/dev/null" ]] && rm -f "$_est_err_file" || true
+        # v1.9.3 pattern-sweep: rm-f hardening (see _sub_err_file comment).
+        [[ "$_est_err_file" != "/dev/null" ]] && rm -f "$_est_err_file" 2>/dev/null || true
         if [[ -n "$est_result" ]]; then
             estimate_applied="true"
             if [[ "$human" == "true" ]]; then
@@ -2972,7 +2991,8 @@ Examples:
         _pipelines_err_file=$(mktemp -t zh_pipelookup.XXXXXX 2>/dev/null) || _pipelines_err_file=/dev/null
         pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars" 2>"$_pipelines_err_file") || pipelines_response=""
         pipelines_err=$(zh_cause_hint "$_pipelines_err_file")
-        [[ "$_pipelines_err_file" != "/dev/null" ]] && rm -f "$_pipelines_err_file" || true
+        # v1.9.3 pattern-sweep: rm-f hardening (see _sub_err_file comment).
+        [[ "$_pipelines_err_file" != "/dev/null" ]] && rm -f "$_pipelines_err_file" 2>/dev/null || true
         local pipeline_id=""
         if [[ -n "$pipelines_response" ]]; then
             pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline" \
@@ -3003,7 +3023,8 @@ Examples:
             _move_err_file=$(mktemp -t zh_movewire.XXXXXX 2>/dev/null) || _move_err_file=/dev/null
             move_result=$(zh_graphql "$move_mutation" "$move_vars" 2>"$_move_err_file") || move_result=""
             move_err=$(zh_cause_hint "$_move_err_file")
-            [[ "$_move_err_file" != "/dev/null" ]] && rm -f "$_move_err_file" || true
+            # v1.9.3 pattern-sweep: rm-f hardening (see _sub_err_file comment).
+            [[ "$_move_err_file" != "/dev/null" ]] && rm -f "$_move_err_file" 2>/dev/null || true
             if [[ -n "$move_result" ]]; then
                 pipeline_set="$pipeline"
                 if [[ "$human" == "true" ]]; then
@@ -3099,7 +3120,8 @@ Examples:
         _pi_err_file=$(mktemp -t zh_pilookup.XXXXXX 2>/dev/null) || _pi_err_file=/dev/null
         pi_lookup_response=$(zh_graphql "$pi_lookup_query" "$pi_lookup_vars" 2>"$_pi_err_file") || pi_lookup_response=""
         pi_lookup_err=$(zh_cause_hint "$_pi_err_file")
-        [[ "$_pi_err_file" != "/dev/null" ]] && rm -f "$_pi_err_file" || true
+        # v1.9.3 pattern-sweep: rm-f hardening (see _sub_err_file comment).
+        [[ "$_pi_err_file" != "/dev/null" ]] && rm -f "$_pi_err_file" 2>/dev/null || true
         if [[ -n "$pi_lookup_response" ]]; then
             pipeline_issue_id=$(echo "$pi_lookup_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
         fi
@@ -3126,7 +3148,8 @@ Examples:
             _prio_err_file=$(mktemp -t zh_priowire.XXXXXX 2>/dev/null) || _prio_err_file=/dev/null
             prio_response=$(zh_graphql "$prio_mutation" "$prio_vars" 2>"$_prio_err_file") || prio_response=""
             prio_err=$(zh_cause_hint "$_prio_err_file")
-            [[ "$_prio_err_file" != "/dev/null" ]] && rm -f "$_prio_err_file" || true
+            # v1.9.3 pattern-sweep: rm-f hardening (see _sub_err_file comment).
+            [[ "$_prio_err_file" != "/dev/null" ]] && rm -f "$_prio_err_file" 2>/dev/null || true
             if [[ -n "$prio_response" ]]; then
                 prio_applied=$(echo "$prio_response" | jq -r '.data.setPriorityOnPipelineIssues.pipelineIssues[0].priority.name // empty')
             fi
@@ -5309,7 +5332,21 @@ zh_resolve_issue_ids_for_sprint() {
         variables=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
             '{repoId: $repo_id, issueNumber: $n}')
 
-        issue_response=$(zh_graphql "$query" "$variables")
+        # v1.9.3 pattern-sweep: fail-soft envelope mirroring the
+        # subissue-side lookups. cmd_sprint_add / cmd_sprint_remove
+        # rely on this helper to build a per-input "missing" list;
+        # bailing under set-e on the first transient zh_graphql
+        # `.errors` would lose every name discovered before it.
+        local _spr_err_file
+        _spr_err_file=$(mktemp -t zh_sprresolve.XXXXXX 2>/dev/null) || _spr_err_file=/dev/null
+        issue_response=$(zh_graphql "$query" "$variables" 2>"$_spr_err_file") || issue_response=""
+        if [[ "$_spr_err_file" != "/dev/null" ]]; then
+            rm -f "$_spr_err_file" 2>/dev/null || true
+        fi
+        if [[ -z "$issue_response" ]]; then
+            missing="${missing} #${stripped}"
+            continue
+        fi
         issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
         issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title // ""')
 
@@ -5423,8 +5460,28 @@ Examples:
     mutation_vars=$(jq -n --arg sprint_id "$sprint_id" --argjson issue_ids "$issue_ids_json" \
         '{input: {sprintIds: [$sprint_id], issueIds: $issue_ids}}')
 
-    local response
-    response=$(zh_graphql "$mutation" "$mutation_vars")
+    # v1.9.3 pattern-sweep: fail-soft envelope mirroring the
+    # cmd_subissue_add (zh:5971) and cmd_set_type (zh:3762) pattern.
+    # Under set-e a bare assignment died when zh_graphql exited 1 on a
+    # `.errors` response, aborting cmd_sprint_add before the partial-
+    # applied gate below could classify the outcome. With this envelope
+    # the partial classifier stays reachable; an empty response is a
+    # hard failure surfaced with the cause hint.
+    local response="" response_err=""
+    local _sprintadd_err_file
+    _sprintadd_err_file=$(mktemp -t zh_sprintadd.XXXXXX 2>/dev/null) || _sprintadd_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_sprintadd_err_file") || response=""
+    if [[ "$_sprintadd_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_sprintadd_err_file")
+        rm -f "$_sprintadd_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        if [[ -n "$response_err" ]]; then
+            error "Failed to add issue(s) to sprint '${sprint_actual_name}' (cause: ${response_err}). Verify with 'zh sprint show \"${sprint_actual_name}\"' before retrying."
+        else
+            error "Failed to add issue(s) to sprint '${sprint_actual_name}': ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh sprint show \"${sprint_actual_name}\"' before retrying)."
+        fi
+    fi
 
     # Detect which input numbers came back as links. Filter by sprint id
     # AND by repo so a sibling repo's same-numbered issue can't credit
@@ -5823,8 +5880,30 @@ zh_resolve_issue_ids() {
         variables=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
             '{repoId: $repo_id, issueNumber: $n}')
 
-        local response
-        response=$(zh_graphql "$query" "$variables")
+        # v1.9.3 pattern-sweep: fail-soft envelope mirroring the
+        # cmd_subissue_add mutation pattern (round-4 #1). This helper
+        # feeds cmd_subissue_add via the dedup loop above; a bare
+        # `response=$(zh_graphql ...)` aborts the whole script under
+        # `set -euo pipefail` when zh_graphql `error`s on `.errors`,
+        # so the loop above can never reach the cmd-level "not found
+        # in this repository" diagnostic. Capture-and-branch keeps
+        # the lookup loop responsible for its own error surface, with
+        # the cause hint surfaced when available.
+        local response="" response_err=""
+        local _resolve_err_file
+        _resolve_err_file=$(mktemp -t zh_resolve.XXXXXX 2>/dev/null) || _resolve_err_file=/dev/null
+        response=$(zh_graphql "$query" "$variables" 2>"$_resolve_err_file") || response=""
+        if [[ "$_resolve_err_file" != "/dev/null" ]]; then
+            response_err=$(zh_cause_hint "$_resolve_err_file")
+            rm -f "$_resolve_err_file" 2>/dev/null || true
+        fi
+        if [[ -z "$response" ]]; then
+            if [[ -n "$response_err" ]]; then
+                error "Failed to resolve issue #${stripped} (cause: ${response_err})."
+            else
+                error "Failed to resolve issue #${stripped}: ZenHub API call returned no usable response (check token / network / rate limits)."
+            fi
+        fi
 
         local issue_id
         issue_id=$(echo "$response" | jq -r '.data.issueByInfo.id // empty')
@@ -6106,6 +6185,17 @@ Example: zh subissue add 42 100 101"
     else
         outcome="ok"
     fi
+
+    # v1.9.3 pattern-sweep: machine-readable outcome sentinel on stderr.
+    # The Python `_planning_add_children` wrapper used to overstate
+    # `added=child_numbers` on a noop because exit_code was 0 (round-4 #5
+    # idempotent-success) and the wrapper couldn't distinguish "every
+    # child landed" from "every child was already attached". Emitting the
+    # sentinel as a single stderr line lets the wrapper override `added`
+    # to `[]` and report `outcome="noop"` truthfully. Stdout stays clean
+    # for human consumption.
+    echo "__ZH_OUTCOME__:${outcome}" >&2
+
     # v1.9.2 round-3 (PR #27) finding #2: align partial-applied
     # exit-code convention with cmd_set_type and the rest of the
     # v1.9.x cycle. outcome=partial (some succeeded, some failed)
@@ -6219,8 +6309,32 @@ unlink #100 from its real parent while reporting 'removed from #9999'."
         lookup_vars=$(jq -n --arg repo_id "$repo_id" --argjson n "$stripped" \
             '{repoId: $repo_id, issueNumber: $n}')
 
-        local lookup_response
-        lookup_response=$(zh_graphql "$lookup_query" "$lookup_vars")
+        # v1.9.3 pattern-sweep: fail-soft envelope for the pre-validation
+        # lookup, mirroring the round-4 #1 envelope already applied to
+        # the removeSubIssues mutation at zh:6299. Pre-fix, a transient
+        # zh_graphql `.errors` response on one child's lookup aborted
+        # the function under set-e and stole the consolidated mismatch
+        # report from the user. With this envelope an unparseable
+        # response is funneled into the same mismatches accumulator so
+        # the loop completes and the user sees every issue's status.
+        local lookup_response="" lookup_response_err=""
+        local _lookup_err_file
+        _lookup_err_file=$(mktemp -t zh_ssrlookup.XXXXXX 2>/dev/null) || _lookup_err_file=/dev/null
+        lookup_response=$(zh_graphql "$lookup_query" "$lookup_vars" 2>"$_lookup_err_file") || lookup_response=""
+        if [[ "$_lookup_err_file" != "/dev/null" ]]; then
+            lookup_response_err=$(zh_cause_hint "$_lookup_err_file")
+            rm -f "$_lookup_err_file" 2>/dev/null || true
+        fi
+        if [[ -z "$lookup_response" ]]; then
+            if [[ -n "$lookup_response_err" ]]; then
+                mismatches+="  #${stripped}: lookup failed (cause: ${lookup_response_err})
+"
+            else
+                mismatches+="  #${stripped}: lookup failed (no usable response)
+"
+            fi
+            continue
+        fi
 
         local child_id actual_parent child_owner child_repo
         child_id=$(echo "$lookup_response" | jq -r '.data.issueByInfo.id // empty')
@@ -6405,6 +6519,12 @@ state with 'zh subissue list ${stripped_parent}'."
     else
         outcome="ok"
     fi
+    # v1.9.3 pattern-sweep: machine-readable outcome sentinel on stderr
+    # (mirrors cmd_subissue_add). Lets the Python wrapper override
+    # `removed=child_numbers` to `[]` on a noop, so a remove call that
+    # finds nothing linked no longer overstates what the API touched.
+    echo "__ZH_OUTCOME__:${outcome}" >&2
+
     # v1.9.2 round-3 (PR #27) finding #2: align partial exit code
     # with cmd_subissue_add (see comment there). outcome=partial is
     # exit 2 so MCP _planning_remove_children correctly reports
