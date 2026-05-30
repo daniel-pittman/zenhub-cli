@@ -2247,8 +2247,11 @@ def _planning_update(noun: str, number: int, title: str, description: str,
 def _planning_add_children(noun: str, parent: int, children: list[int],
                            repo_path: str) -> dict:
     if not children:
+        # v1.9.2 round-1 (PR #27) finding #9: include `raw` for shape
+        # parity with the success / partial paths.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "parent": parent, "added": [], "partial_applied": False}
+                "parent": parent, "added": [], "partial_applied": False,
+                "raw": ""}
     args = [noun, "add", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: cmd_subissue_add exits 2 on a
@@ -2258,18 +2261,25 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     # total-failure of a partial-success produces double-adds for the
     # children that DID land. Surface partial_applied analogous to
     # set_issue_type so the agent can branch.
+    #
+    # v1.9.2 round-1 (PR #27) finding #3: the first version of this PR
+    # shipped `ok=True (or partial_applied)` with `added=[]` on
+    # partial. That shape contradicts itself: `ok=True` says success,
+    # `added=[]` says nothing landed, so an agent's natural idiom
+    # `if r["ok"]: log(f"Added {len(r['added'])} children")` would
+    # report "Added 0 children" while some actually attached. Return
+    # the ATTEMPTED list when partial_applied so the agent sees the
+    # count it asked to apply (and the docstring's note tells it to
+    # re-verify before trusting). The bash side doesn't emit a
+    # structured success/failure breakdown for this wrapper, so
+    # there's no way to enumerate landed-vs-failed from here; the
+    # agent must consult subissue_list to confirm.
     partial_applied = r.get("exit_code") == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
         "parent": parent,
-        # On partial we cannot tell from the exit code alone which
-        # subset landed (the bash side prints them but doesn't emit
-        # structured JSON for the planning-noun wrapper). Returning
-        # the full `children` list on partial_applied=True would be
-        # misleading; an empty list signals "verify via zh subissue
-        # list before assuming". The agent must re-verify regardless.
-        "added": children if r["ok"] else [],
+        "added": children if (r["ok"] or partial_applied) else [],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -2278,17 +2288,20 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
 def _planning_remove_children(noun: str, parent: int, children: list[int],
                               repo_path: str) -> dict:
     if not children:
+        # v1.9.2 round-1 (PR #27) finding #9: include `raw`.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
-                "parent": parent, "removed": [], "partial_applied": False}
+                "parent": parent, "removed": [], "partial_applied": False,
+                "raw": ""}
     args = [noun, "remove", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: same partial signal as the add path.
+    # v1.9.2 round-1 (PR #27) finding #3: same attempted-list logic.
     partial_applied = r.get("exit_code") == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
         "parent": parent,
-        "removed": children if r["ok"] else [],
+        "removed": children if (r["ok"] or partial_applied) else [],
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -2418,8 +2431,12 @@ def epic_add_children(epic_number: int, issue_numbers: list[int],
                       repo_path: str = "") -> dict:
     """Attach one or more issues as sub-issues of an epic (addSubIssues).
 
-    Returns: dict with ok, parent, epic_number (back-compat alias for
-    parent), added (list of issue numbers), raw, stderr.
+    Returns: dict with ok, partial_applied, parent, epic_number (back-compat
+    alias for parent), added (list of issue numbers), raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: partial_applied is True when the
+    underlying cmd_subissue_add exited 2 (some children attached, others
+    did not). When partial_applied is True, `added` echoes the input
+    list as "attempted"; re-verify via subissue_list before trusting.
     """
     return _with_epic_number_alias(_planning_add_children(
         "epic", epic_number, issue_numbers, repo_path,
@@ -2431,8 +2448,10 @@ def epic_remove_children(epic_number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Detach one or more sub-issues from an epic (removeSubIssues).
 
-    Returns: dict with ok, parent, epic_number (back-compat alias for
-    parent), removed (list of issue numbers), raw, stderr.
+    Returns: dict with ok, partial_applied, parent, epic_number (back-compat
+    alias for parent), removed (list of issue numbers), raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics as
+    the add path; `removed` echoes the attempted list on partial.
     """
     return _with_epic_number_alias(_planning_remove_children(
         "epic", epic_number, issue_numbers, repo_path,
@@ -2519,7 +2538,10 @@ def initiative_add_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Attach issues (typically Projects/Epics) under an Initiative.
 
-    Returns: dict with ok, parent, added, raw, stderr.
+    Returns: dict with ok, partial_applied, parent, added, raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: partial_applied=True means some
+    children attached and some did not (cmd_subissue_add exit 2); `added`
+    echoes the attempted list, verify via subissue_list before trusting.
     """
     return _planning_add_children("initiative", number, issue_numbers,
                                   repo_path)
@@ -2530,7 +2552,8 @@ def initiative_remove_children(number: int, issue_numbers: list[int],
                                repo_path: str = "") -> dict:
     """Detach sub-issues from an Initiative.
 
-    Returns: dict with ok, parent, removed, raw, stderr.
+    Returns: dict with ok, partial_applied, parent, removed, raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics.
     """
     return _planning_remove_children("initiative", number, issue_numbers,
                                      repo_path)
@@ -2606,7 +2629,10 @@ def project_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach issues (typically Epics) under a Project.
 
-    Returns: dict with ok, parent, added, raw, stderr.
+    Returns: dict with ok, partial_applied, parent, added, raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: partial_applied=True means some
+    children attached and some did not (cmd_subissue_add exit 2); `added`
+    echoes the attempted list, verify via subissue_list before trusting.
     """
     return _planning_add_children("project", number, issue_numbers, repo_path)
 
@@ -2616,7 +2642,8 @@ def project_remove_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Detach sub-issues from a Project.
 
-    Returns: dict with ok, parent, removed, raw, stderr.
+    Returns: dict with ok, partial_applied, parent, removed, raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics.
     """
     return _planning_remove_children("project", number, issue_numbers,
                                      repo_path)
@@ -2695,7 +2722,10 @@ def subtask_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach further sub-issues under a Sub-task.
 
-    Returns: dict with ok, parent, added, raw, stderr.
+    Returns: dict with ok, partial_applied, parent, added, raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: partial_applied=True means some
+    children attached and some did not (cmd_subissue_add exit 2); `added`
+    echoes the attempted list, verify via subissue_list before trusting.
     """
     return _planning_add_children("subtask", number, issue_numbers, repo_path)
 
@@ -2705,7 +2735,8 @@ def subtask_remove_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Detach sub-issues from a Sub-task.
 
-    Returns: dict with ok, parent, removed, raw, stderr.
+    Returns: dict with ok, partial_applied, parent, removed, raw, stderr.
+    v1.9.2 round-7 #10 / round-1 #3: same partial_applied semantics.
     """
     return _planning_remove_children("subtask", number, issue_numbers,
                                      repo_path)

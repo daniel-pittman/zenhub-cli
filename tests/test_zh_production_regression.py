@@ -97,18 +97,28 @@ def test_structural_guarantee_create_normalizer_known_flags_align_with_case_arms
     body = m.group(1)
 
     # The known-flag list lives inside a `case "$_norm_flag" in ... esac`
-    # block. Find it by anchoring on `_norm_flag`.
-    norm_m = re.search(
-        r'case "\$_norm_flag" in\s*\n\s*([^)]+)\)\s*\n\s*_is_known_flag="true"',
+    # block. v1.9.2 round-1 (PR #27) finding #6: there are now TWO
+    # arms in this case block — one for value-flags and one for the
+    # round-7 #2 boolean-flag rejection (`--json|--quiet|--stdin`).
+    # The original `re.search` only matched the first arm, so a
+    # future maintainer adding `--dry-run` to the boolean arm without
+    # a case arm would slip through silently — exactly the round-7
+    # #1 bug pattern this structural test is meant to prevent. Use
+    # `re.finditer` and union every arm.
+    known: set[str] = set()
+    for norm_m in re.finditer(
+        r'\n\s*([^)\n]+)\)\s*\n\s*_is_known_flag="true"',
         body,
+    ):
+        for tok in norm_m.group(1).split("|"):
+            tok = tok.strip()
+            if tok.startswith("-"):
+                known.add(tok)
+    assert known, (
+        "could not find ANY cmd_create _is_known_flag arm; the "
+        "harness needs an update if cmd_create restructured the "
+        "normalizer."
     )
-    assert norm_m, (
-        "could not find cmd_create's _norm_flag case arm; the harness "
-        "needs an update if cmd_create restructured the normalizer."
-    )
-    known = {tok.strip() for tok in norm_m.group(1).split("|")}
-    # Drop empties and any non-flag tokens.
-    known = {k for k in known if k.startswith("-")}
 
     # Now collect every long flag the main case arms accept. Look for
     # each `arm_pattern)` block and extract long-form `--flag` tokens.
@@ -297,7 +307,16 @@ def test_round7_f2_json_equals_value_is_rejected() -> None:
 
 
 def test_round7_f2_quiet_equals_value_is_rejected() -> None:
-    """Symmetric pin for --quiet (round-7 #2)."""
+    """Symmetric pin for --quiet (round-7 #2).
+
+    v1.9.2 round-1 (PR #27) finding #5: assert the message content,
+    not just rc != 0. Without the boolean-flag rejection arm, the
+    normalizer would split `--quiet=anything` into `--quiet anything`,
+    the case arm would single-shift, `anything` would become the
+    title, and the stubbed create would fall back to a generic
+    "Failed to create issue" error (also rc != 0). The error message
+    is the actual signal that the round-7 #2 fix is in place.
+    """
     stubs = r"""
         load_config() { :; }
         get_repo_info() { printf 'acme/widgets'; }
@@ -315,10 +334,20 @@ def test_round7_f2_quiet_equals_value_is_rejected() -> None:
     assert r.returncode != 0, (
         f"--quiet=anything should be rejected; got rc={r.returncode}"
     )
+    assert ("boolean" in r.stderr.lower()
+            or "does not accept" in r.stderr.lower()
+            or "no value" in r.stderr.lower()), (
+        f"expected clear 'boolean flag' rejection for --quiet=, got: "
+        f"{r.stderr!r}"
+    )
 
 
 def test_round7_f2_stdin_equals_value_is_rejected() -> None:
-    """Symmetric pin for --stdin (round-7 #2)."""
+    """Symmetric pin for --stdin (round-7 #2).
+
+    v1.9.2 round-1 (PR #27) finding #5: same message-content check
+    as the --quiet sibling.
+    """
     stubs = r"""
         load_config() { :; }
         get_repo_info() { printf 'acme/widgets'; }
@@ -335,6 +364,12 @@ def test_round7_f2_stdin_equals_value_is_rejected() -> None:
     )
     assert r.returncode != 0, (
         f"--stdin=ignored should be rejected; got rc={r.returncode}"
+    )
+    assert ("boolean" in r.stderr.lower()
+            or "does not accept" in r.stderr.lower()
+            or "no value" in r.stderr.lower()), (
+        f"expected clear 'boolean flag' rejection for --stdin=, got: "
+        f"{r.stderr!r}"
     )
 
 
@@ -647,14 +682,30 @@ def test_round7_f7_initiative_create_blocked_response_no_keyerror() -> None:
     # added `epic_number` to the alias for the blocked path; this
     # test extends that to the documented contract.
     assert out["blocked"] is True
-    for key in ("number", "url", "type", "pipeline", "parent", "estimate"):
-        assert key in out, (
-            f"initiative_create blocked-response missing key {key!r} "
-            f"(round-7 #7); got keys {sorted(out.keys())!r}"
-        )
+    # v1.9.2 round-1 (PR #27) finding #12: assert the full
+    # documented key set the create_issue docstring promises, not
+    # just the first six. A regression dropping estimate_requested
+    # / priority / priority_requested / raw / stderr from the
+    # blocked-path dict is exactly the contract-drift family F7
+    # exists to pin.
+    # Non-stderr scalar keys: None placeholder. `raw` is "" so json.loads
+    # would raise (round-1 #11 noted this; we keep raw="" rather than
+    # returning fake JSON because the blocked path has no real raw
+    # output to surface). `stderr` carries the refusal message and is
+    # always non-empty by design — just assert the key is present.
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested"):
+        assert key in out, f"blocked dict missing {key!r}"
         assert out[key] is None, (
             f"key {key!r} should be None on blocked path, got {out[key]!r}"
         )
+    assert "raw" in out and out["raw"] == "", (
+        f"blocked raw must be empty string, got {out.get('raw')!r}"
+    )
+    assert "stderr" in out and out["stderr"], (
+        f"blocked stderr must carry the refusal message"
+    )
 
 
 def test_round7_f7_project_create_blocked_response_no_keyerror() -> None:
@@ -675,8 +726,16 @@ def test_round7_f7_project_create_blocked_response_no_keyerror() -> None:
                 title="X", description="y",
             )
     assert out["blocked"] is True
-    for key in ("number", "url", "type", "pipeline", "parent", "estimate"):
-        assert key in out
+    # v1.9.2 round-1 (PR #27) finding #12: assert the full
+    # documented key set the create_issue docstring promises, not
+    # just the first six. A regression dropping estimate_requested
+    # / priority / priority_requested / raw / stderr from the
+    # blocked-path dict is exactly the contract-drift family F7
+    # exists to pin.
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested", "raw", "stderr"):
+        assert key in out, f"blocked dict missing {key!r}"
 
 
 def test_round7_f7_subtask_create_blocked_response_no_keyerror() -> None:
@@ -697,8 +756,16 @@ def test_round7_f7_subtask_create_blocked_response_no_keyerror() -> None:
                 title="X", description="y",
             )
     assert out["blocked"] is True
-    for key in ("number", "url", "type", "pipeline", "parent", "estimate"):
-        assert key in out
+    # v1.9.2 round-1 (PR #27) finding #12: assert the full
+    # documented key set the create_issue docstring promises, not
+    # just the first six. A regression dropping estimate_requested
+    # / priority / priority_requested / raw / stderr from the
+    # blocked-path dict is exactly the contract-drift family F7
+    # exists to pin.
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested", "raw", "stderr"):
+        assert key in out, f"blocked dict missing {key!r}"
 
 
 # ---- Finding #8: set_issue_type empty issue_type omits partial_applied -----
@@ -885,13 +952,25 @@ def test_round7_f12_parent_wire_failure_surfaces_root_cause() -> None:
         'cmd_create "$@"',
         args=["Title", "-t", "Bug", "-b", "body", "--parent", "7"],
     )
-    # The fix must surface "Invalid token" (or similar root-cause hint)
-    # to stderr alongside the "could not attach" warn. Either an inline
-    # capture (warn includes the cause) or a one-time hint at the top
-    # of the create flow satisfies this.
-    assert "Invalid token" in r.stderr or "rate-limited" in r.stderr, (
-        f"parent-wire failure root-cause not surfaced (round-7 #12). "
-        f"stderr={r.stderr!r}"
+    # The fix must surface "Invalid token" INSIDE the Warning: line
+    # that mentions the attach failure (the `(cause: ...)` clause).
+    #
+    # v1.9.2 round-1 (PR #27) finding #7: the prior assertion just
+    # checked the substring anywhere in stderr. If a regression
+    # removed the stderr capture (`2>"$_sub_err_file"`), the stub's
+    # stderr would flow directly to the parent process — `"Invalid
+    # token"` would still appear, but via the RAW leak, not via
+    # the warn's cause clause. Test passed, fix silently undone.
+    # Now require both substrings on the SAME line.
+    stderr_clean = r.stderr.replace("\x1b[0;33m", "").replace("\x1b[0m", "")
+    matched = [
+        line for line in stderr_clean.splitlines()
+        if "could not attach" in line and "Invalid token" in line
+    ]
+    assert matched, (
+        f"F12 fix not in place: expected a single Warning line "
+        f"mentioning both 'could not attach' AND the root-cause "
+        f"'Invalid token'. Got lines: {stderr_clean.splitlines()!r}"
     )
 
 
@@ -908,13 +987,24 @@ def test_round7_f13_warn_does_not_escape_interpret_embedded_json() -> None:
     `printf '%s\\n'`.
     """
     # Source zh and call warn directly with a payload containing \n.
+    #
+    # v1.9.2 round-1 (PR #27) finding #4: a previous version used
+    # Python's `repr()` to quote the bash arg, which produced a
+    # double-backslash sequence (`\\n` = four bytes: \\ \\ n n) inside
+    # the bash literal. `echo -e` collapsed that back to two bytes
+    # (`\\` \\ `n` -> `\\n`), so the test passed against pre-fix
+    # production. The real shape we need is two bytes: literal
+    # backslash + literal n, exactly the way `jq -c` emits a JSON
+    # string value containing a `\\n` escape. Use a single-quoted
+    # bash literal so $1 contains the same two-byte sequence.
     stubs = r""
-    # The payload is a jq -c-style JSON string with backslash-n inside.
-    # echo -e renders it as a real newline; printf '%s\n' does not.
     payload = r'{"message":"permission denied:\nrepo is archived"}'
+    # Single-quoted in bash: contents are literal, no escape
+    # interpretation. The `\n` inside the JSON stays as two
+    # characters (backslash + n).
     r = run_zh_with_stubs(
         stubs,
-        f'warn {repr(f"got error: {payload}")}',
+        f"warn 'got error: {payload}'",
     )
     # Strip the ANSI color sequences if they ever made it through.
     stderr_clean = r.stderr.replace("\x1b[0;33m", "").replace(
@@ -974,6 +1064,20 @@ def test_round7_f14_update_verb_does_not_redirect_to_read_only_issue() -> None:
     assert "zh issue 42" not in stderr_clean, (
         f"update-verb redirect must not point at read-only 'zh issue' "
         f"(round-7 #14). stderr={r.stderr!r}"
+    )
+    # v1.9.2 round-1 (PR #27) finding #13: also pin the positive
+    # behavior. The fix's intended trailing wording mentions either
+    # `zh type 42` (the retype suggestion) or makes it clear no
+    # top-level analog exists for non-planning types. Without this
+    # positive assertion a regression that suppresses the warn
+    # entirely (or wires a totally-different wrong redirect) would
+    # pass the negative check.
+    assert (
+        "zh type 42" in stderr_clean
+        or "No matching top-level command" in stderr_clean
+    ), (
+        f"F14 fix should either route to 'zh type 42 <NounType>' or "
+        f"acknowledge no analog exists; got: {stderr_clean!r}"
     )
 
 

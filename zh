@@ -2773,10 +2773,10 @@ Examples:
         # the helper so additional envelopes can reuse the pattern.
         local sub_response="" sub_err="" sub_ok=0
         local _sub_err_file
-        _sub_err_file=$(mktemp -t zh_subwire.XXXXXX)
+        _sub_err_file=$(mktemp -t zh_subwire.XXXXXX 2>/dev/null) || _sub_err_file=/dev/null
         sub_response=$(zh_graphql "$sub_mutation" "$sub_vars" 2>"$_sub_err_file") || sub_response=""
         sub_err=$(head -n 1 "$_sub_err_file" 2>/dev/null || true)
-        rm -f "$_sub_err_file"
+        [[ "$_sub_err_file" != "/dev/null" ]] && rm -f "$_sub_err_file" || true
         if [[ -n "$sub_response" ]]; then
             sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
         fi
@@ -2828,10 +2828,10 @@ Examples:
         # as the parent-wire envelope.
         local est_result="" est_err=""
         local _est_err_file
-        _est_err_file=$(mktemp -t zh_estwire.XXXXXX)
+        _est_err_file=$(mktemp -t zh_estwire.XXXXXX 2>/dev/null) || _est_err_file=/dev/null
         est_result=$(zh_graphql "$est_mutation" "$est_vars" 2>"$_est_err_file") || est_result=""
         est_err=$(head -n 1 "$_est_err_file" 2>/dev/null || true)
-        rm -f "$_est_err_file"
+        [[ "$_est_err_file" != "/dev/null" ]] && rm -f "$_est_err_file" || true
         if [[ -n "$est_result" ]]; then
             estimate_applied="true"
             if [[ "$human" == "true" ]]; then
@@ -2874,11 +2874,10 @@ Examples:
         # / auth failure carries the cause hint.
         local pipelines_response="" pipelines_err=""
         local _pipelines_err_file
-        _pipelines_err_file=$(mktemp -t zh_pipelookup.XXXXXX)
+        _pipelines_err_file=$(mktemp -t zh_pipelookup.XXXXXX 2>/dev/null) || _pipelines_err_file=/dev/null
         pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars" 2>"$_pipelines_err_file") || pipelines_response=""
         pipelines_err=$(head -n 1 "$_pipelines_err_file" 2>/dev/null || true)
-        rm -f "$_pipelines_err_file"
-
+        [[ "$_pipelines_err_file" != "/dev/null" ]] && rm -f "$_pipelines_err_file" || true
         local pipeline_id=""
         if [[ -n "$pipelines_response" ]]; then
             pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline" \
@@ -2906,10 +2905,10 @@ Examples:
             # v1.9.2 round-7 finding #12: same root-cause capture.
             local move_result="" move_err=""
             local _move_err_file
-            _move_err_file=$(mktemp -t zh_movewire.XXXXXX)
+            _move_err_file=$(mktemp -t zh_movewire.XXXXXX 2>/dev/null) || _move_err_file=/dev/null
             move_result=$(zh_graphql "$move_mutation" "$move_vars" 2>"$_move_err_file") || move_result=""
             move_err=$(head -n 1 "$_move_err_file" 2>/dev/null || true)
-            rm -f "$_move_err_file"
+            [[ "$_move_err_file" != "/dev/null" ]] && rm -f "$_move_err_file" || true
             if [[ -n "$move_result" ]]; then
                 pipeline_set="$pipeline"
                 if [[ "$human" == "true" ]]; then
@@ -3002,10 +3001,10 @@ Examples:
         # v1.9.2 round-7 finding #12: capture stderr for the cause hint.
         local pi_lookup_response="" pi_lookup_err="" pipeline_issue_id=""
         local _pi_err_file
-        _pi_err_file=$(mktemp -t zh_pilookup.XXXXXX)
+        _pi_err_file=$(mktemp -t zh_pilookup.XXXXXX 2>/dev/null) || _pi_err_file=/dev/null
         pi_lookup_response=$(zh_graphql "$pi_lookup_query" "$pi_lookup_vars" 2>"$_pi_err_file") || pi_lookup_response=""
         pi_lookup_err=$(head -n 1 "$_pi_err_file" 2>/dev/null || true)
-        rm -f "$_pi_err_file"
+        [[ "$_pi_err_file" != "/dev/null" ]] && rm -f "$_pi_err_file" || true
         if [[ -n "$pi_lookup_response" ]]; then
             pipeline_issue_id=$(echo "$pi_lookup_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
         fi
@@ -3029,10 +3028,10 @@ Examples:
             # v1.9.2 round-7 finding #12: capture stderr root-cause.
             local prio_response="" prio_err="" prio_applied=""
             local _prio_err_file
-            _prio_err_file=$(mktemp -t zh_priowire.XXXXXX)
+            _prio_err_file=$(mktemp -t zh_priowire.XXXXXX 2>/dev/null) || _prio_err_file=/dev/null
             prio_response=$(zh_graphql "$prio_mutation" "$prio_vars" 2>"$_prio_err_file") || prio_response=""
             prio_err=$(head -n 1 "$_prio_err_file" 2>/dev/null || true)
-            rm -f "$_prio_err_file"
+            [[ "$_prio_err_file" != "/dev/null" ]] && rm -f "$_prio_err_file" || true
             if [[ -n "$prio_response" ]]; then
                 prio_applied=$(echo "$prio_response" | jq -r '.data.setPriorityOnPipelineIssues.pipelineIssues[0].priority.name // empty')
             fi
@@ -3652,10 +3651,30 @@ Examples:
     # response is treated as a hard failure so the caller sees a
     # clear cmd_set_type-level diagnostic instead of a bash silent
     # abort.
-    local response=""
-    response=$(zh_graphql "$mutation" "$mutation_vars" 2>/dev/null) || response=""
+    #
+    # v1.9.2 round-1 (PR #27) finding #1: capture stderr separately
+    # so the error message includes the root-cause hint (e.g.
+    # "Invalid token", "rate-limited"). The first version of this
+    # envelope in v1.9.2 dropped stderr to /dev/null, which left the
+    # operator with the generic "check token / network / rate
+    # limits" line and no actionable diagnostic. Mirrors the
+    # cmd_create round-7 #12 pattern. The `mktemp || /dev/null`
+    # fallback (round-1 finding #2) keeps the envelope working on
+    # systems where TMPDIR is unwritable.
+    local response="" response_err=""
+    local _resp_err_file
+    _resp_err_file=$(mktemp -t zh_settype.XXXXXX 2>/dev/null) || _resp_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_resp_err_file") || response=""
+    if [[ "$_resp_err_file" != "/dev/null" ]]; then
+        response_err=$(head -n 1 "$_resp_err_file" 2>/dev/null || true)
+        rm -f "$_resp_err_file"
+    fi
     if [[ -z "$response" ]]; then
-        error "Failed to set type of #${issue_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh issue ${issue_num}' before retrying)."
+        if [[ -n "$response_err" ]]; then
+            error "Failed to set type of #${issue_num} (cause: ${response_err}). Verify with 'zh issue ${issue_num}' before retrying."
+        else
+            error "Failed to set type of #${issue_num}: ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh issue ${issue_num}' before retrying)."
+        fi
     fi
 
     local success_count failed_count gh_errors gh_errors_len
