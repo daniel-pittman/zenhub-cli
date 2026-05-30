@@ -971,9 +971,17 @@ def test_with_epic_number_alias_respects_explicit_value():
 
 
 def test_with_epic_number_alias_handles_missing_identifier():
-    """Error returns (no `number` / `parent`) gain no alias."""
+    """Error returns (no `number` / `parent`) get `epic_number: None`.
+
+    v1.9.1 round-3 #3: the round-2 #6 minimization of the
+    _planning_create blocked-response dropped both number and parent
+    placeholders, so without this fallback a v1.8.x agent reading
+    `out["epic_number"]` on a blocked create would get KeyError. Always
+    ensure the key is present.
+    """
     d = mcp_server._with_epic_number_alias({"ok": False, "stderr": "oops"})
-    assert "epic_number" not in d
+    assert "epic_number" in d
+    assert d["epic_number"] is None
 
 
 def test_planning_create_forwards_new_kwargs(monkeypatch):
@@ -1097,3 +1105,362 @@ def test_planning_list_returns_items_only(monkeypatch):
     out = mcp_server._planning_list("initiative", "")
     assert "items" in out
     assert "epics" not in out
+
+
+# ---------------------------------------------------------------------------
+# v1.9.1 item #5: duplicate-check pre-flight on planning-noun creates.
+# `_planning_create` now runs the same check that `create_issue` uses, so an
+# agent calling `epic_create("Auth redesign")` gets blocked on a near-
+# duplicate the same way `create_issue(..., type="Epic")` would.
+# ---------------------------------------------------------------------------
+
+
+def test_planning_create_blocks_on_duplicate(monkeypatch):
+    """A `recommendation == "block"` response from check_duplicate must
+    short-circuit the create. The bash side never runs; the caller sees
+    ok=False with the candidate matches and a clear retry hint.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+
+    blocked_info = {
+        "ok": True,
+        "recommendation": "block",
+        "hard_threshold": 0.7,
+        "matches": [
+            {"number": 42, "title": "Auth redesign", "similarity": 0.85},
+        ],
+    }
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate",
+        lambda title, body, repo: blocked_info,
+    )
+
+    called = {"ran": False}
+
+    def fake_run_zh(args, cwd=None):
+        called["ran"] = True
+        return {"ok": True, "stdout_plain": '{"number": 99}', "stderr": ""}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+
+    out = mcp_server._planning_create(
+        "epic", "Auth redesign", "body", "", "", "", "", 0, "",
+    )
+    assert out["ok"] is False
+    assert out.get("blocked") is True
+    # Round-2 finding #6: the block response now mirrors create_issue's
+    # minimal 4-key shape (ok, blocked, stderr, duplicate_check) so MCP
+    # clients can handle both entry points uniformly. No None-valued
+    # placeholders for number / url / type / etc.
+    assert "number" not in out
+    assert "raw" not in out
+    assert out["duplicate_check"] == blocked_info
+    assert "confirm_create=True" in out["stderr"]
+    assert called["ran"] is False, "bash create must NOT run when blocked"
+
+
+def test_planning_create_confirm_create_overrides_block(monkeypatch):
+    """`confirm_create=True` lets the create proceed even when the
+    pre-flight reports a block, mirroring `create_issue`.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate",
+        lambda title, body, repo: {
+            "ok": True,
+            "recommendation": "block",
+            "hard_threshold": 0.7,
+            "matches": [{"number": 42, "title": "X", "similarity": 0.9}],
+        },
+    )
+
+    def fake_run_zh(args, cwd=None):
+        return {
+            "ok": True,
+            "stdout_plain": (
+                '{"number": 99, "url": "u", "title": "T",'
+                ' "type": "Epic", "pipeline": null, "estimate": null,'
+                ' "parent": null}'
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+
+    out = mcp_server._planning_create(
+        "epic", "Auth redesign", "body", "", "", "", "", 0, "",
+        confirm_create=True,
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    # duplicate_check is still surfaced so the caller can audit the
+    # override decision.
+    assert out["duplicate_check"]["recommendation"] == "block"
+
+
+def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
+    """`skip_duplicate_check=True` skips the pre-flight entirely. The
+    similarity layer is never consulted; the response carries no
+    duplicate_check key.
+    """
+    sim_called = {"ran": False}
+
+    def fake_similarity_repo(repo_path):
+        sim_called["ran"] = True
+        return ("owner/repo", None)
+
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo", fake_similarity_repo,
+    )
+
+    def fake_run_zh(args, cwd=None):
+        return {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+
+    out = mcp_server._planning_create(
+        "epic", "X", "body", "", "", "", "", 0, "",
+        skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert "duplicate_check" not in out
+    assert sim_called["ran"] is False
+
+
+def test_planning_create_warn_recommendation_does_not_block(monkeypatch):
+    """A non-block recommendation (e.g. soft match below the hard
+    threshold) must annotate the response without short-circuiting
+    the create.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate",
+        lambda title, body, repo: {
+            "ok": True,
+            "recommendation": "warn",
+            "soft_threshold": 0.5,
+            "matches": [{"number": 7, "title": "loosely related",
+                         "similarity": 0.55}],
+        },
+    )
+
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+
+    out = mcp_server._planning_create(
+        "epic", "X", "body", "", "", "", "", 0, "",
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    assert out["duplicate_check"]["recommendation"] == "warn"
+
+
+def test_planning_create_similarity_failure_does_not_block(monkeypatch):
+    """If the similarity layer errors (missing repo, embedding deps
+    unavailable, etc.) the create still proceeds. The error is logged
+    in duplicate_check.stderr; an infra outage in similarity must not
+    become a planning-noun outage.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "could not derive repo"),
+    )
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+    out = mcp_server._planning_create(
+        "epic", "X", "body", "", "", "", "", 0, "",
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    assert out["duplicate_check"]["matches"] == []
+    assert "could not derive repo" in out["duplicate_check"]["stderr"]
+
+
+# ---------------------------------------------------------------------------
+# v1.9.1 round-6 fixes: MCP-side surface (PR #25 round-5 findings #4 and #6).
+# ---------------------------------------------------------------------------
+
+
+def test_set_issue_type_exposes_partial_applied_on_exit_2(monkeypatch):
+    """Round-6 finding #4: when `zh type` exits 2 (the divergence-only
+    partial convention added in this round), the MCP wrapper must
+    surface `partial_applied: True` so an agent does not retry a
+    change that already landed. `ok` flips to True under this
+    condition because the type DID land.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": False,
+            "exit_code": 2,
+            "stdout_plain": "",
+            "stderr": "WARN: Partially applied: type change on #42 landed...",
+        },
+    )
+    out = mcp_server.set_issue_type(42, "Epic")
+    assert out["ok"] is True
+    assert out["partial_applied"] is True
+    assert "Partially applied" in out["stderr"]
+
+
+def test_set_issue_type_clean_success_partial_false(monkeypatch):
+    """Regression guard: a clean success (exit 0) keeps
+    partial_applied=False. The flag is only set on the divergence
+    code, not on every success.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": "OK: Set type of #42 to Epic",
+            "stderr": "",
+        },
+    )
+    out = mcp_server.set_issue_type(42, "Epic")
+    assert out["ok"] is True
+    assert out["partial_applied"] is False
+
+
+def test_set_issue_type_real_failure_partial_false(monkeypatch):
+    """A real failure (exit 1, e.g. unknown type) keeps
+    partial_applied=False so an agent CAN safely retry with a
+    corrected input. `ok` stays False because nothing landed.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": False,
+            "exit_code": 1,
+            "stdout_plain": "",
+            "stderr": "Issue type 'BadType' not found",
+        },
+    )
+    out = mcp_server.set_issue_type(42, "BadType")
+    assert out["ok"] is False
+    assert out["partial_applied"] is False
+
+
+def test_create_issue_threads_priority_to_args(monkeypatch):
+    """Round-6 finding #6: `create_issue` now accepts a `priority`
+    arg and forwards it to `zh create` as `--priority <name>`,
+    mirroring the bash flag added in v1.9.1 item #8.
+    """
+    captured = {}
+
+    def fake_run_zh(args, cwd=None):
+        captured["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": (
+                '{"number": 99, "url": "u", "title": "T",'
+                ' "type": "Bug", "pipeline": "Backlog",'
+                ' "estimate": null, "parent": null,'
+                ' "priority": "High", "priority_requested": "High"}'
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "skip"),
+    )
+
+    out = mcp_server.create_issue(
+        "T", "body", type="Bug", priority="High",
+        skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert "--priority" in captured["args"]
+    pri_idx = captured["args"].index("--priority")
+    assert captured["args"][pri_idx + 1] == "High"
+
+
+def test_create_issue_shape_includes_priority_and_estimate(monkeypatch):
+    """Round-6 finding #6 (shape parity): create_issue's response
+    now carries `priority`, `priority_requested`, and `estimate`
+    (the keys that already exist on _planning_create's response).
+    MCP clients reading either entry point see the same key set.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": (
+                '{"number": 99, "url": "u", "title": "T",'
+                ' "type": "Bug", "pipeline": "Backlog",'
+                ' "estimate": 5, "parent": null,'
+                ' "priority": "High", "priority_requested": "High"}'
+            ),
+            "stderr": "",
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "skip"),
+    )
+
+    out = mcp_server.create_issue(
+        "T", "body", type="Bug", priority="High",
+        skip_duplicate_check=True,
+    )
+    assert out["estimate"] == 5
+    assert out["priority"] == "High"
+    assert out["priority_requested"] == "High"
+
+
+def test_create_issue_priority_omitted_when_not_passed(monkeypatch):
+    """A create_issue call without `priority` must NOT add
+    `--priority` to the argv (no stray empty-value pass-through).
+    """
+    captured = {}
+
+    def fake_run_zh(args, cwd=None):
+        captured["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "skip"),
+    )
+    mcp_server.create_issue(
+        "T", "body", skip_duplicate_check=True,
+    )
+    assert "--priority" not in captured["args"]

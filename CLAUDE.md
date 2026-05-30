@@ -33,6 +33,7 @@ zh delete <issue> [-y]        # DANGER: permanently delete a GitHub issue (via g
 
 # Create issues
 zh create "Title" -t Bug -l "label1,label2" -e 3 -p "TO DO"
+zh create "Title" -t Bug --priority "High"    # Set a workspace priority at create time
 zh create "Title" -t Epic --json              # Machine-readable JSON on stdout (batch callers)
 zh create "Title" -t Feature --parent 42 -q   # Nest under #42; emit only the new number
 zh type <issue> <name>                        # Change an existing issue's type
