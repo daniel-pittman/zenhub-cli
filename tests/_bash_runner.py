@@ -192,7 +192,46 @@ def run_zh_with_stubs(
         "PYTHONIOENCODING",
     )
     inherited = {k: _os.environ[k] for k in _ALLOWED_INHERIT if k in _os.environ}
+
+    # v1.9.3 pattern-sweep finding #8: also inherit PATH so jq / gh /
+    # curl resolve on Nix profiles, asdf shims, /opt/conda/bin,
+    # ~/.local/bin, and other non-/usr/{,local/}bin install locations.
+    # The hardcoded `env_defaults["PATH"]` line below is a "common
+    # locations" floor; the parent's PATH gets PRE-pended so a
+    # developer's own install of jq / gh wins over a stale system
+    # version, but only after a sanitization pass that drops
+    # world-writable directories (a known Nix / dev-container pitfall
+    # where `/tmp/xxxxxx-nix-shell` style entries can land on PATH).
+    parent_path = _os.environ.get("PATH", "")
+    safe_path_parts = []
+    if parent_path:
+        for entry in parent_path.split(":"):
+            if not entry:
+                continue
+            try:
+                st = _os.stat(entry)
+            except OSError:
+                continue
+            # Skip world-writable directories (other-write bit set
+            # AND not sticky). The sticky-bit carve-out lets /tmp-like
+            # shared directories through if they're explicitly marked,
+            # though those should normally not be on PATH at all.
+            mode = st.st_mode
+            world_writable = bool(mode & 0o002)
+            sticky = bool(mode & 0o1000)
+            if world_writable and not sticky:
+                continue
+            safe_path_parts.append(entry)
+    if safe_path_parts:
+        inherited["PATH"] = ":".join(safe_path_parts)
+
     merged_env = {**inherited, **env_defaults}
+    # PATH ordering: prepend the sanitized parent PATH if we inherited
+    # one, then layer env_defaults["PATH"] (the common-locations floor)
+    # after it. This way an asdf / Nix shim resolves before /usr/bin,
+    # but the floor still catches the no-parent-PATH edge case.
+    if "PATH" in inherited:
+        merged_env["PATH"] = inherited["PATH"] + ":" + env_defaults["PATH"]
     return subprocess.run(
         cmd,
         capture_output=True,
