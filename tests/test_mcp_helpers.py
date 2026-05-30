@@ -1152,12 +1152,19 @@ def test_planning_create_blocks_on_duplicate(monkeypatch):
     )
     assert out["ok"] is False
     assert out.get("blocked") is True
-    # Round-2 finding #6: the block response now mirrors create_issue's
-    # minimal 4-key shape (ok, blocked, stderr, duplicate_check) so MCP
-    # clients can handle both entry points uniformly. No None-valued
-    # placeholders for number / url / type / etc.
-    assert "number" not in out
-    assert "raw" not in out
+    # v1.9.2 round-7 finding #7: the block response now carries the
+    # full documented key set with None placeholders so initiative /
+    # project / subtask docstrings (which list `number, url, type,
+    # pipeline, parent, estimate, raw, stderr, duplicate_check`) hold
+    # for the blocked path too. Round-2 finding #6's minimal-4-key
+    # shape was reverted because it made clients KeyError on the
+    # documented contract.
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested", "raw"):
+        assert key in out, f"blocked response missing {key!r}"
+        assert out[key] in (None, ""), (
+            f"blocked-path {key!r} should be None/empty, got {out[key]!r}"
+        )
     assert out["duplicate_check"] == blocked_info
     assert "confirm_create=True" in out["stderr"]
     assert called["ran"] is False, "bash create must NOT run when blocked"
@@ -1207,9 +1214,14 @@ def test_planning_create_confirm_create_overrides_block(monkeypatch):
 
 
 def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
-    """`skip_duplicate_check=True` skips the pre-flight entirely. The
-    similarity layer is never consulted; the response carries no
-    duplicate_check key.
+    """`skip_duplicate_check=True` skips the pre-flight similarity
+    machinery entirely (the similarity layer is never consulted).
+
+    v1.9.2 round-4 (PR #27) finding #9: the docstring contract
+    promises `duplicate_check` is always present on every successful
+    return. When the pre-flight is bypassed, the key carries a
+    `{"recommendation": "skipped", "matches": []}` placeholder so
+    clients reading the field uniformly do not KeyError.
     """
     sim_called = {"ran": False}
 
@@ -1235,7 +1247,12 @@ def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
         skip_duplicate_check=True,
     )
     assert out["ok"] is True
-    assert "duplicate_check" not in out
+    # The key is now ALWAYS present (round-4 #9); the placeholder
+    # distinguishes "skipped" from a real recommendation.
+    assert "duplicate_check" in out
+    assert out["duplicate_check"] == {"recommendation": "skipped",
+                                      "matches": []}
+    # And the similarity machinery still wasn't invoked.
     assert sim_called["ran"] is False
 
 

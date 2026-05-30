@@ -1,8 +1,27 @@
-"""Regression pins for bash-side behaviour that has been broken-then-fixed
-in the past. Each test names the round where the bug was introduced and
-the round where it was caught, and replicates the production logic
-inline. If `zh` changes, the inline snippet here must be updated to
-match — keep both in sync.
+"""LEGACY regression pins for bash-side behaviour that has been
+broken-then-fixed in the past. Each test names the round where the
+bug was introduced and the round where it was caught, and replicates
+the production logic inline. If `zh` changes, the inline snippet
+here must be updated to match — keep both in sync.
+
+v1.9.2 architecture note: the snippet pattern below is LEGACY. It
+caused a six-round review cycle on PR #25 (v1.9.1) because snippet
+authors drifted from production without the test failing. New tests
+MUST source the production `zh` script via `tests/_bash_runner.py`
+and exercise real `cmd_*` functions, not parallel re-implementations.
+See `tests/test_zh_production_regression.py` for the canonical
+pattern. The existing snippet tests stay (most of them pin pure-jq
+projections that have been stable for many rounds and migrating
+them in bulk is not worth the churn), but every NEW pin lives in
+the production-sourcing file.
+
+The class-3 anti-pattern this file historically exhibited:
+parallel-stub-vs-production. Two cases were caught and DELETED in
+v1.9.2 (round-7 finding #15 — see the placeholder comments above
+their former locations) where the snippet's `exit 1` contradicted
+production's post-round-6 `exit 2`. Any future class-3 case should
+be deleted, with its production contract pinned by a new test in
+test_zh_production_regression.py.
 """
 
 from __future__ import annotations
@@ -959,64 +978,18 @@ def test_gh_errors_gate_warns_on_populated_object() -> None:
 # when successCount is positive. A partial-failure payload (successCount=1
 # with a populated failedIssues / githubErrors) used to print "Set type" as
 # if the change had landed.
-_SET_TYPE_PARTIAL_FAILURE_SNIPPET = r"""
-set -euo pipefail
-response="$1"
-success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
-failed_count=$(echo "$response" | jq -r '(.data.changeIssueTypeOfIssues.failedIssues // []) | length')
-gh_errors=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.githubErrors // {}')
-gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
-
-if [[ "$success_count" -lt 1 ]]; then
-    echo "FAIL_COUNT_ZERO"
-    exit 1
-fi
-if [[ "$failed_count" -gt 0 ]] || [[ "$gh_errors_len" -gt 0 ]]; then
-    echo "FAIL_PARTIAL"
-    exit 1
-fi
-echo "OK"
-"""
-
-
-def _set_type_partial(response: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", "-c", _SET_TYPE_PARTIAL_FAILURE_SNIPPET, "_", response],
-        capture_output=True, text=True, check=False,
-    )
-
-
-def test_set_type_partial_failure_with_failed_issues_is_error() -> None:
-    """successCount=1 with a populated failedIssues entry is the precise
-    shape the pre-v1.9.1 gate ignored (G8 partial failure).
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
-            '"failedIssues":[{"number":42}],"githubErrors":[]}}}')
-    r = _set_type_partial(resp)
-    assert r.returncode == 1
-    assert r.stdout.strip() == "FAIL_PARTIAL"
-
-
-def test_set_type_partial_failure_with_github_errors_is_error() -> None:
-    """successCount=1 with populated githubErrors is also a partial
-    failure.
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
-            '"failedIssues":[],"githubErrors":[{"code":"X"}]}}}')
-    r = _set_type_partial(resp)
-    assert r.returncode == 1
-    assert r.stdout.strip() == "FAIL_PARTIAL"
-
-
-def test_set_type_clean_success_still_succeeds() -> None:
-    """successCount=1 with empty failedIssues + empty githubErrors is a
-    real success (regression guard for the partial-failure tightening).
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
-            '"failedIssues":[],"githubErrors":[]}}}')
-    r = _set_type_partial(resp)
-    assert r.returncode == 0
-    assert r.stdout.strip() == "OK"
+# v1.9.2 round-7 finding #15: DELETED stale snippet
+# `_SET_TYPE_PARTIAL_FAILURE_SNIPPET` and its three tests
+# (test_set_type_partial_failure_with_failed_issues_is_error,
+#  test_set_type_partial_failure_with_github_errors_is_error,
+#  test_set_type_clean_success_still_succeeds).
+# Same drift problem as the _SET_TYPE_PARTIAL_MSG_SNIPPET deletion
+# above: the snippets asserted `returncode == 1` against their own
+# embedded gate, but round-6 #4 moved production to `exit 2`. The
+# round-6 `_SET_TYPE_EXIT_2_SNIPPET` (still in this file, further
+# down) plus the new
+# tests/test_zh_production_regression.py::test_structural_guarantee_set_type_exits_2_not_1_on_partial
+# pin the contract against PRODUCTION cmd_set_type from v1.9.2 on.
 
 
 # v1.9.1 item #4: zh_fetch_issue_types must filter isEnabled=false rows so
@@ -1586,60 +1559,19 @@ def test_create_json_priority_requested_but_not_confirmed() -> None:
     assert obj["priority_requested"] == "High"
 
 
-# Round-2 finding #5: cmd_set_type partial-applied wording. The branch
-# fires only when success_count >= 1, so the type DID land on ZenHub.
-# Word the message as "Partially applied" / "Verify", not "Failed".
-_SET_TYPE_PARTIAL_MSG_SNIPPET = r"""
-set -euo pipefail
-response="$1"; issue_num="$2"
-success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
-failed_count=$(echo "$response" | jq -r '(.data.changeIssueTypeOfIssues.failedIssues // []) | length')
-gh_errors=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.githubErrors // {}')
-gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
-
-if [[ "$success_count" -lt 1 ]]; then
-    echo "Failed to set type of #${issue_num}"
-    exit 1
-fi
-if [[ "$failed_count" -gt 0 ]] || [[ "$gh_errors_len" -gt 0 ]]; then
-    echo "Partially applied: type change on #${issue_num} landed on ZenHub (successCount=${success_count}), but the mutation reported follow-on errors. Verify with 'zh issue ${issue_num}' before retrying."
-    exit 1
-fi
-echo "Set type of #${issue_num}"
-"""
-
-
-def _set_type_msg(response, issue_num):
-    return subprocess.run(
-        ["bash", "-c", _SET_TYPE_PARTIAL_MSG_SNIPPET, "_", response, issue_num],
-        capture_output=True, text=True, check=False,
-    )
-
-
-def test_set_type_partial_message_uses_partially_applied_wording() -> None:
-    """`successCount=1 + githubErrors populated` is partial-applied, not
-    a total failure. The message must say so, so the operator does not
-    retry a change that already landed.
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
-            '"failedIssues":[],"githubErrors":[{"code":"X"}]}}}')
-    r = _set_type_msg(resp, "42")
-    assert r.returncode == 1
-    assert "Partially applied" in r.stdout
-    assert "Verify with" in r.stdout
-    assert "Failed to set type" not in r.stdout
-
-
-def test_set_type_zero_count_still_says_failed() -> None:
-    """successCount=0 IS a real failure; the "Failed" wording is correct
-    there. Symmetric regression guard so a future sweep does not
-    over-soften both branches.
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":0,'
-            '"failedIssues":[{"number":42}],"githubErrors":[]}}}')
-    r = _set_type_msg(resp, "42")
-    assert r.returncode == 1
-    assert "Failed to set type" in r.stdout
+# v1.9.2 round-7 finding #15: DELETED stale snippet
+# `_SET_TYPE_PARTIAL_MSG_SNIPPET` and its two tests
+# (test_set_type_partial_message_uses_partially_applied_wording,
+# test_set_type_zero_count_still_says_failed). The snippet asserted
+# `returncode == 1` against its own embedded copy of cmd_set_type's
+# partial branch, but round-6 #4 changed production to exit 2. The
+# snippet kept passing against itself, creating a contradictory spec
+# alongside the round-6 _SET_TYPE_EXIT_2_SNIPPET that pins the new
+# behavior. Both message-wording assertions (Partially applied /
+# Verify with / Failed to set type) and the exit-code contract are
+# now exercised against PRODUCTION cmd_set_type by
+# tests/test_zh_production_regression.py
+# (test_structural_guarantee_set_type_exits_2_not_1_on_partial).
 
 
 # ===========================================================================
