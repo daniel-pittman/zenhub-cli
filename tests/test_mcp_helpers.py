@@ -1302,3 +1302,165 @@ def test_planning_create_similarity_failure_does_not_block(monkeypatch):
     assert out["number"] == 99
     assert out["duplicate_check"]["matches"] == []
     assert "could not derive repo" in out["duplicate_check"]["stderr"]
+
+
+# ---------------------------------------------------------------------------
+# v1.9.1 round-6 fixes: MCP-side surface (PR #25 round-5 findings #4 and #6).
+# ---------------------------------------------------------------------------
+
+
+def test_set_issue_type_exposes_partial_applied_on_exit_2(monkeypatch):
+    """Round-6 finding #4: when `zh type` exits 2 (the divergence-only
+    partial convention added in this round), the MCP wrapper must
+    surface `partial_applied: True` so an agent does not retry a
+    change that already landed. `ok` flips to True under this
+    condition because the type DID land.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": False,
+            "exit_code": 2,
+            "stdout_plain": "",
+            "stderr": "WARN: Partially applied: type change on #42 landed...",
+        },
+    )
+    out = mcp_server.set_issue_type(42, "Epic")
+    assert out["ok"] is True
+    assert out["partial_applied"] is True
+    assert "Partially applied" in out["stderr"]
+
+
+def test_set_issue_type_clean_success_partial_false(monkeypatch):
+    """Regression guard: a clean success (exit 0) keeps
+    partial_applied=False. The flag is only set on the divergence
+    code, not on every success.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": "OK: Set type of #42 to Epic",
+            "stderr": "",
+        },
+    )
+    out = mcp_server.set_issue_type(42, "Epic")
+    assert out["ok"] is True
+    assert out["partial_applied"] is False
+
+
+def test_set_issue_type_real_failure_partial_false(monkeypatch):
+    """A real failure (exit 1, e.g. unknown type) keeps
+    partial_applied=False so an agent CAN safely retry with a
+    corrected input. `ok` stays False because nothing landed.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": False,
+            "exit_code": 1,
+            "stdout_plain": "",
+            "stderr": "Issue type 'BadType' not found",
+        },
+    )
+    out = mcp_server.set_issue_type(42, "BadType")
+    assert out["ok"] is False
+    assert out["partial_applied"] is False
+
+
+def test_create_issue_threads_priority_to_args(monkeypatch):
+    """Round-6 finding #6: `create_issue` now accepts a `priority`
+    arg and forwards it to `zh create` as `--priority <name>`,
+    mirroring the bash flag added in v1.9.1 item #8.
+    """
+    captured = {}
+
+    def fake_run_zh(args, cwd=None):
+        captured["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": (
+                '{"number": 99, "url": "u", "title": "T",'
+                ' "type": "Bug", "pipeline": "Backlog",'
+                ' "estimate": null, "parent": null,'
+                ' "priority": "High", "priority_requested": "High"}'
+            ),
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "skip"),
+    )
+
+    out = mcp_server.create_issue(
+        "T", "body", type="Bug", priority="High",
+        skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert "--priority" in captured["args"]
+    pri_idx = captured["args"].index("--priority")
+    assert captured["args"][pri_idx + 1] == "High"
+
+
+def test_create_issue_shape_includes_priority_and_estimate(monkeypatch):
+    """Round-6 finding #6 (shape parity): create_issue's response
+    now carries `priority`, `priority_requested`, and `estimate`
+    (the keys that already exist on _planning_create's response).
+    MCP clients reading either entry point see the same key set.
+    """
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": (
+                '{"number": 99, "url": "u", "title": "T",'
+                ' "type": "Bug", "pipeline": "Backlog",'
+                ' "estimate": 5, "parent": null,'
+                ' "priority": "High", "priority_requested": "High"}'
+            ),
+            "stderr": "",
+        },
+    )
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "skip"),
+    )
+
+    out = mcp_server.create_issue(
+        "T", "body", type="Bug", priority="High",
+        skip_duplicate_check=True,
+    )
+    assert out["estimate"] == 5
+    assert out["priority"] == "High"
+    assert out["priority_requested"] == "High"
+
+
+def test_create_issue_priority_omitted_when_not_passed(monkeypatch):
+    """A create_issue call without `priority` must NOT add
+    `--priority` to the argv (no stray empty-value pass-through).
+    """
+    captured = {}
+
+    def fake_run_zh(args, cwd=None):
+        captured["args"] = list(args)
+        return {
+            "ok": True,
+            "exit_code": 0,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        }
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: (None, "skip"),
+    )
+    mcp_server.create_issue(
+        "T", "body", skip_duplicate_check=True,
+    )
+    assert "--priority" not in captured["args"]

@@ -2397,13 +2397,30 @@ cmd_create() {
     # `--type=` no longer silently creates an untyped issue (the
     # nastiest variant).
     while [[ $# -gt 0 ]]; do
+        # Round-6 finding #8: a literal title starting with `--`
+        # (e.g. `zh create "--rotate=enabled fails on retry" -t Bug`)
+        # used to be silently split by the unconditional normalizer
+        # and lose the user's text. Two-stage disambiguation: only
+        # normalize when (a) the title has already been captured (any
+        # later `--foo=bar` is unambiguously a flag), OR (b) the
+        # `--foo` prefix matches a flag name this verb actually
+        # accepts. Anything else is treated as a positional and falls
+        # through to `*)` where it becomes the title.
         if [[ "$1" == --*=* ]]; then
             local _norm_flag="${1%%=*}"
             local _norm_val="${1#*=}"
-            if [[ -z "$_norm_val" ]]; then
-                error "Option ${_norm_flag} requires a value (received empty string from '${1}')"
+            local _is_known_flag="false"
+            case "$_norm_flag" in
+                --type|--parent|--priority|--label|--labels|--assign|--assignee|--pipeline|--estimate|--body|--file|--body-file|--description|--json|--quiet|--stdin)
+                    _is_known_flag="true"
+                    ;;
+            esac
+            if [[ -n "$title" || "$_is_known_flag" == "true" ]]; then
+                if [[ -z "$_norm_val" ]]; then
+                    error "Option ${_norm_flag} requires a value (received empty string from '${1}')"
+                fi
+                set -- "$_norm_flag" "$_norm_val" "${@:2}"
             fi
-            set -- "$_norm_flag" "$_norm_val" "${@:2}"
         fi
         case "$1" in
             -t|--type)
@@ -2698,16 +2715,25 @@ Examples:
         sub_vars=$(jq -n --arg pid "$parent_id" --arg cid "$new_issue_id" \
             '{input: {parentId: $pid, childIssueIds: [$cid]}}')
 
-        local sub_response sub_ok
-        sub_response=$(zh_graphql "$sub_mutation" "$sub_vars")
-        sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
+        # Round-6 finding #5: fail-soft envelope. The prior bare
+        # assignment `sub_response=$(zh_graphql ...)` died under set -e
+        # when zh_graphql `error`s and exits 1 on a .errors response,
+        # killing the script BEFORE the --json emit, even though the
+        # issue was already created. Capture failures so the parent-
+        # wire becomes a recoverable warn that points at the manual
+        # re-wire verb.
+        local sub_response="" sub_ok=0
+        sub_response=$(zh_graphql "$sub_mutation" "$sub_vars" 2>/dev/null) || sub_response=""
+        if [[ -n "$sub_response" ]]; then
+            sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
+        fi
         if [[ "$sub_ok" -ge 1 ]]; then
             parent_wired="$parent_stripped"
             if [[ "$human" == "true" ]]; then
                 echo -e "  Parent: ${GREEN}#${parent_stripped}${NC}"
             fi
         else
-            warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped}"
+            warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped}. Re-wire with 'zh subissue add ${parent_stripped} ${new_issue_num}'."
         fi
     fi
 
@@ -2720,6 +2746,15 @@ Examples:
     # set -e, leaving stdout empty even though the issue WAS created.
     # A retry would then produce a duplicate. Wrap each call so any
     # failure falls through to a warn, and the JSON still emits.
+    # Round-6 finding #1: the prior `if zh_graphql ...; then ... else`
+    # form CANNOT intercept `error → exit 1` from a .errors response,
+    # because the `error` call inside zh_graphql calls `exit 1` in the
+    # current shell. Only running zh_graphql inside a $(...)
+    # command-substitution puts it in a subshell whose `exit` is
+    # contained, and the outer `|| <fallback>` then captures the
+    # non-zero status. This mirrors the WORKING pattern the priority
+    # block already uses below.
+    local estimate_applied="false"
     if [[ -n "$estimate" ]]; then
         local est_mutation='
         mutation($input: SetEstimateInput!) {
@@ -2732,7 +2767,10 @@ Examples:
         est_vars=$(jq -n --arg issue_id "$new_issue_id" --argjson value "$estimate" \
             '{input: {issueId: $issue_id, value: $value}}')
 
-        if zh_graphql "$est_mutation" "$est_vars" > /dev/null 2>&1; then
+        local est_result=""
+        est_result=$(zh_graphql "$est_mutation" "$est_vars" 2>/dev/null) || est_result=""
+        if [[ -n "$est_result" ]]; then
+            estimate_applied="true"
             if [[ "$human" == "true" ]]; then
                 echo -e "  Estimate: ${GREEN}${estimate}${NC} points"
             fi
@@ -2785,7 +2823,15 @@ Examples:
             move_vars=$(jq -n --arg issue_id "$new_issue_id" --arg pipeline_id "$pipeline_id" \
                 '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: 0}}')
 
-            if zh_graphql "$move_mutation" "$move_vars" > /dev/null 2>&1; then
+            # Round-6 finding #2: same `$(...)` capture pattern as the
+            # estimate envelope. The prior `if zh_graphql ...; then ...
+            # else` form would not have caught `error → exit 1` from
+            # zh_graphql, so the round-5 #1 priority_id cleanup in the
+            # else branch was unreachable. Now both the success arm and
+            # the priority-cleanup branch run as intended.
+            local move_result=""
+            move_result=$(zh_graphql "$move_mutation" "$move_vars" 2>/dev/null) || move_result=""
+            if [[ -n "$move_result" ]]; then
                 pipeline_set="$pipeline"
                 if [[ "$human" == "true" ]]; then
                     echo -e "  Pipeline: ${GREEN}${pipeline}${NC}"
@@ -2830,6 +2876,18 @@ Examples:
     # passed, the create mutation drops the new issue in a default
     # pipeline (New Issues / Triage); look up its pipelineIssue id from
     # the issue and set priority on that.
+    #
+    # Round-6 finding #7: when --priority is requested but no --pipeline
+    # was supplied at all (so we never tried to move), the priority
+    # will still bind to whatever default pipelineIssue the workspace
+    # produces. That's USABLE (the priority does land), but a future
+    # `zh move` materialises a new pipelineIssue in the target and the
+    # priority does NOT carry over. Warn the operator about the
+    # implicit lifetime so they can plan around it.
+    if [[ -n "$priority_id" ]] && [[ -z "$pipeline" ]]; then
+        warn "--priority '${priority_name}' will bind to the workspace's default pipelineIssue (e.g. Triage) and will be lost if you later 'zh move' this issue. Pass --pipeline at create time or re-apply with 'zh priority #${new_issue_num} \"${priority_name}\"' after moving."
+    fi
+
     local priority_set=""
     if [[ -n "$priority_id" ]]; then
         local pi_lookup_query='
@@ -2897,13 +2955,26 @@ Examples:
     #     "X"  -> "X"    : applied
     #     "X"  -> null   : requested but not confirmed (retry)
     if [[ "$json_out" == "true" ]]; then
+        # Round-6 finding #10: distinguish "estimate not requested"
+        # from "estimate requested but the setEstimate mutation
+        # didn't confirm". Mirrors the priority_requested / priority
+        # split. Three resulting states for a consumer reading
+        # `.estimate_requested` and `.estimate`:
+        #     null   -> null  : not requested
+        #     N      -> N     : applied
+        #     N      -> null  : requested but not confirmed (retry)
+        local _est_applied_for_json=""
+        if [[ "$estimate_applied" == "true" ]]; then
+            _est_applied_for_json="$estimate"
+        fi
         jq -n \
             --argjson number "$new_issue_num" \
             --arg url "$new_issue_url" \
             --arg title "$title" \
             --arg type "${new_type_name:-}" \
             --arg pipeline "${pipeline_set:-}" \
-            --arg estimate "${estimate:-}" \
+            --arg estimate "${_est_applied_for_json:-}" \
+            --arg estimate_requested "${estimate:-}" \
             --arg parent "${parent_wired:-}" \
             --arg priority "${priority_set:-}" \
             --arg priority_requested "${priority_name:-}" \
@@ -2911,6 +2982,7 @@ Examples:
               type: (if $type == "" then null else $type end),
               pipeline: (if $pipeline == "" then null else $pipeline end),
               estimate: (if $estimate == "" then null else ($estimate | tonumber) end),
+              estimate_requested: (if $estimate_requested == "" then null else ($estimate_requested | tonumber) end),
               parent: (if $parent == "" then null else ($parent | tonumber) end),
               priority: (if $priority == "" then null else $priority end),
               priority_requested: (if $priority_requested == "" then null else $priority_requested end)}'
@@ -3486,7 +3558,16 @@ Examples:
         # mislead the operator into retrying a change that already
         # applied; phrase it as a partial-applied warning that points
         # them at zh issue for verification.
-        error "Partially applied: type change on #${issue_num} landed on ZenHub (successCount=${success_count}), but the mutation reported follow-on errors (failedIssues=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.failedIssues // []'), githubErrors=${gh_errors}). Verify with 'zh issue ${issue_num}' before retrying."
+        #
+        # Round-6 finding #4: switch from `error` (echo + exit 1) to
+        # `warn` + `exit 2` to match the documented exit-code
+        # convention (exit 2 = divergence-only partial, scripted
+        # callers re-verify before retry). Mirrors cmd_subissue_add
+        # and cmd_sprint_remove. The MCP set_issue_type wrapper reads
+        # the exit code to set partial_applied=True so an agent does
+        # not retry a change that landed.
+        warn "Partially applied: type change on #${issue_num} landed on ZenHub (successCount=${success_count}), but the mutation reported follow-on errors (failedIssues=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.failedIssues // []'), githubErrors=${gh_errors}). Verify with 'zh issue ${issue_num}' before retrying."
+        exit 2
     fi
 
     echo ""
@@ -3733,41 +3814,81 @@ zh_hierarchy_warn_for_noun() {
     local verb="$2"
     shift 2 || true
 
-    # Round-3 finding #6: track flag arity so a numeric flag VALUE is
-    # not mistaken for an issue-number positional. cmd_update_issue
-    # accepts free-form -t/-d/-b values that may be all digits (e.g.
-    # `zh epic update -t 42 100` renames issue #100 to "42"), and the
-    # pre-fix scanner would warn about issue #42 instead.
-    local prev=""
+    # Round-3 finding #6 / round-6 finding #9: pick the issue-number
+    # positional out of a possibly flag-laden argv. Earlier rounds used
+    # a fixed flag-arity skip list which silently bypassed new flags
+    # added to any verb routed through this helper. Switch to a
+    # two-pass strategy keyed off `-*` tokens, which future-proofs
+    # against new flags (e.g. a future `-c|--comment` on cmd_close /
+    # cmd_reopen) without an explicit update here:
+    #   pass 1 (trailing): scan everything after the LAST `-*` for
+    #     the first numeric token. Covers the canonical
+    #     `verb -t "Foo" 42` form.
+    #   pass 2 (leading):  if no numeric was found in pass 1, scan
+    #     everything before the FIRST `-*`. Covers the canonical
+    #     `verb 42 -t "Foo"` form. Run only as a fallback so a
+    #     numeric flag value (`-t 42 100`) is never picked.
+    local first_flag_pos=-1
+    local last_flag_pos=-1
+    local idx=-1
     local arg stripped
     for arg in "$@"; do
-        case "$prev" in
-            -t|--title|-d|--description|-b|--body|-e|--estimate|-l|--label|--labels|-a|--assign|--assignee|-p|--pipeline|--priority|--parent)
-                # Current arg is a value bound to the prior flag; skip.
-                prev="$arg"
-                continue
-                ;;
-        esac
-        prev="$arg"
-        stripped="${arg#\#}"
-        if [[ "$stripped" =~ ^[0-9]+$ ]]; then
-            load_config
-            # Round-3 finding #1: extend the fail-soft envelope to the
-            # OUTER round-trips. get_repo_info and get_repo_id both call
-            # zh_graphql, which `error`s and exits 1 on `.errors`. The
-            # round-2 envelope only protected the inner call inside
-            # zh_hierarchy_warn_type_mismatch; a transient ZenHub
-            # outage on these outer lookups still killed cmd_close /
-            # cmd_reopen / cmd_update_issue. Wrap them the same way.
-            local owner_repo="" repo_id=""
-            owner_repo=$(get_repo_info 2>/dev/null) || return 0
-            if [[ -z "$owner_repo" ]]; then return 0; fi
-            repo_id=$(get_repo_id "$owner_repo" 2>/dev/null) || return 0
-            if [[ -z "$repo_id" ]]; then return 0; fi
-            zh_hierarchy_warn_type_mismatch "$expected_type" "$stripped" "$repo_id" "$verb"
-            return 0
+        idx=$((idx + 1))
+        if [[ "$arg" == -* ]]; then
+            if [[ "$first_flag_pos" -eq -1 ]]; then
+                first_flag_pos=$idx
+            fi
+            last_flag_pos=$idx
         fi
     done
+
+    # Pass 1: trailing positionals (everything after the last `-*`).
+    local found_num=""
+    idx=-1
+    for arg in "$@"; do
+        idx=$((idx + 1))
+        if [[ "$idx" -le "$last_flag_pos" ]]; then continue; fi
+        stripped="${arg#\#}"
+        if [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            found_num="$stripped"
+            break
+        fi
+    done
+
+    # Pass 2 (fallback): leading positionals (everything before the
+    # first `-*`). Covers `zh epic close 42 -t "Foo"` style invocations
+    # where the issue number precedes all flags.
+    if [[ -z "$found_num" ]] && [[ "$first_flag_pos" -gt 0 ]]; then
+        idx=-1
+        for arg in "$@"; do
+            idx=$((idx + 1))
+            if [[ "$idx" -ge "$first_flag_pos" ]]; then break; fi
+            stripped="${arg#\#}"
+            if [[ "$stripped" =~ ^[0-9]+$ ]]; then
+                found_num="$stripped"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$found_num" ]]; then
+        return 0
+    fi
+
+    load_config
+    # Round-3 finding #1: extend the fail-soft envelope to the
+    # OUTER round-trips. get_repo_info and get_repo_id both call
+    # zh_graphql, which `error`s and exits 1 on `.errors`. The
+    # round-2 envelope only protected the inner call inside
+    # zh_hierarchy_warn_type_mismatch; a transient ZenHub
+    # outage on these outer lookups still killed cmd_close /
+    # cmd_reopen / cmd_update_issue. Wrap them the same way.
+    local owner_repo="" repo_id=""
+    owner_repo=$(get_repo_info 2>/dev/null) || return 0
+    if [[ -z "$owner_repo" ]]; then return 0; fi
+    repo_id=$(get_repo_id "$owner_repo" 2>/dev/null) || return 0
+    if [[ -z "$repo_id" ]]; then return 0; fi
+    zh_hierarchy_warn_type_mismatch "$expected_type" "$found_num" "$repo_id" "$verb"
     return 0
 }
 
@@ -3848,7 +3969,23 @@ zh_hierarchy_warn_type_mismatch() {
             redirect="zh ${actual_display} ${verb} ${issue_num}"
             ;;
         *)
-            redirect="zh issue ${issue_num}"
+            # Round-6 finding #11: pick the top-level verb that
+            # matches the user's intent. `close` and `reopen` exist as
+            # generic top-level verbs and would actually do what the
+            # user asked for a Bug / Feature / Task. For show / update
+            # / unknown verbs there's no top-level destructive analog,
+            # so fall back to the generic `zh issue` view.
+            case "$verb" in
+                close)
+                    redirect="zh close ${issue_num}"
+                    ;;
+                reopen)
+                    redirect="zh reopen ${issue_num}"
+                    ;;
+                *)
+                    redirect="zh issue ${issue_num}"
+                    ;;
+            esac
             ;;
     esac
     # Round-4 finding #5: the "data still rendered" wording is only
@@ -4109,7 +4246,21 @@ cmd_update_issue() {
     local title_set="false"
     local body_set="false"
 
+    # Round-6 finding #3: accept `--title=Foo` and `--description=Bar`
+    # GNU-style. Same normalization (and empty-value rejection) as
+    # cmd_create and cmd_hierarchy_create. Without this, the equals
+    # form falls into `*)` and gets captured as the issue number,
+    # which then fails the numeric validation with the misleading
+    # "Invalid issue number: --title=Foo".
     while [[ $# -gt 0 ]]; do
+        if [[ "$1" == --*=* ]]; then
+            local _unorm_flag="${1%%=*}"
+            local _unorm_val="${1#*=}"
+            if [[ -z "$_unorm_val" ]]; then
+                error "Option ${_unorm_flag} requires a value (received empty string from '${1}')"
+            fi
+            set -- "$_unorm_flag" "$_unorm_val" "${@:2}"
+        fi
         case "$1" in
             -t|--title)
                 if [[ $# -lt 2 ]]; then error "Option ${1} requires a value"; fi

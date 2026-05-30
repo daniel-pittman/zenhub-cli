@@ -1538,16 +1538,17 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
 @mcp.tool()
 def create_issue(title: str, body: str, type: str = "Task",
                  pipeline: str = "Product Backlog",
-                 labels: str = "", parent: int = 0, repo_path: str = "",
+                 labels: str = "", parent: int = 0,
+                 priority: str = "", repo_path: str = "",
                  confirm_create: bool = False,
                  skip_duplicate_check: bool = False) -> dict:
     """Create a new ZenHub issue.
 
     Runs a pre-flight similarity check against existing open issues
-    (via the sentence-embedding index — see `zh_similar`). When a
+    (via the sentence-embedding index, see `zh_similar`). When a
     near-duplicate is detected (cosine similarity above the hard
     threshold), the create is BLOCKED and the candidate matches are
-    returned — pass `confirm_create=True` to override and create
+    returned. Pass `confirm_create=True` to override and create
     anyway. Soft matches are surfaced as a warning but don't block.
 
     v1.9.0: `type` is resolved via assignableIssueTypes, so any
@@ -1567,6 +1568,13 @@ def create_issue(title: str, body: str, type: str = "Task",
             wired as a sub-issue of that parent (ZenHub-native
             addSubIssues, so it shows up under epic_show / subissue
             reads).
+        priority: Optional priority name (resolved case-insensitively
+            against the workspace's configured priorities; discover
+            names with list_priorities). Round-6 finding #6: same
+            surface the bash `--priority` flag exposes. When set, the
+            response carries `priority_requested` mirroring the input
+            and `priority` reflecting the post-create mutation
+            confirmation. Compare the two to detect partial apply.
         repo_path: Optional absolute path of a git checkout to run zh from.
         confirm_create: pass True to bypass the duplicate-check block.
             Use ONLY after reviewing the returned matches and confirming
@@ -1581,7 +1589,8 @@ def create_issue(title: str, body: str, type: str = "Task",
             candidate matches and recommendation), and a clear message
             explaining how to override.
         On success: dict with ok=True, number (new issue number), url,
-            type, pipeline, parent, raw, stderr, duplicate_check
+            type, pipeline, parent, estimate, priority,
+            priority_requested, raw, stderr, duplicate_check
             (informational; may include soft matches).
     """
     if not title.strip():
@@ -1636,8 +1645,14 @@ def create_issue(title: str, body: str, type: str = "Task",
         args.extend(["-l", labels])
     if parent and parent > 0:
         args.extend(["--parent", str(parent)])
+    if priority:
+        args.extend(["--priority", priority])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
 
+    # Round-6 finding #6: shape parity with _planning_create. The bash
+    # --json emit carries priority / priority_requested / estimate;
+    # propagate them all so MCP clients reading either create surface
+    # see the same key set.
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     out = {
         "ok": r["ok"] and created is not None,
@@ -1646,6 +1661,11 @@ def create_issue(title: str, body: str, type: str = "Task",
         "type": created.get("type") if created else None,
         "pipeline": created.get("pipeline") if created else None,
         "parent": created.get("parent") if created else None,
+        "estimate": created.get("estimate") if created else None,
+        "priority": created.get("priority") if created else None,
+        "priority_requested": (
+            created.get("priority_requested") if created else None
+        ),
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
     }
@@ -1913,8 +1933,18 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
         return {"ok": False, "stderr": "issue_type must be non-empty"}
     r = _run_zh(["type", str(number), issue_type],
                 cwd=_resolve_cwd(repo_path))
+    # Round-6 finding #4: surface the exit-code convention. The bash
+    # cmd_set_type uses exit 2 for the divergence-only partial case
+    # (ZenHub side accepted the type change but the mutation also
+    # reported a GitHub-side error or a populated failedIssues). For
+    # MCP callers the distinction matters: a true failure (exit 1) is
+    # safe to retry, but a partial apply (exit 2) means the change
+    # already landed and a retry would be wasted (or hit a no-op
+    # error). Expose `partial_applied: True` so an agent can branch.
+    partial_applied = r.get("exit_code") == 2
     return {
-        "ok": r["ok"],
+        "ok": r["ok"] or partial_applied,
+        "partial_applied": partial_applied,
         "number": number,
         "issue_type": issue_type,
         "raw": r["stdout_plain"],

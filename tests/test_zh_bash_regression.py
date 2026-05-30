@@ -1354,9 +1354,17 @@ _WARN_FAIL_SOFT_SNIPPET = r"""
 set -euo pipefail
 # Stub zh_graphql to simulate a .errors response, which the real
 # zh_graphql turns into `error "ZenHub API error: ..."; exit 1`.
+#
+# Round-6 meta-rule: stubs that model `error -> exit 1` MUST use
+# `exit 1`, not `return 1`. The round-4 #1 false-pass shipped because
+# the original stub used `return 1`, which the caller's
+# `if zh_graphql ...; then ... else` form could intercept; real
+# zh_graphql calls `exit 1` which kills the caller's shell entirely
+# and reaches no else arm. Using `exit 1` here makes the test fail
+# the same way production does.
 zh_graphql() {
     echo "ZenHub API error: rate limited" >&2
-    return 1
+    exit 1
 }
 to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 display_noun_for() { echo "$(to_lower "$1")"; }
@@ -1645,17 +1653,24 @@ def test_set_type_zero_count_still_says_failed() -> None:
 _OUTER_FAILSOFT_SNIPPET = r"""
 set -euo pipefail
 fail_at="$1"  # "get_repo_info", "get_repo_id", or "none"
+# Round-6 meta-rule: production get_repo_info / get_repo_id call
+# `error` (which calls `exit 1`) on failure. The stubs must use
+# `exit 1` to match, otherwise `caller_var=$(get_repo_info 2>/dev/null) || ...`
+# is a different code path under set -e (a `return 1` leaves the
+# subshell exit code 1 and the `||` fires, which happens to be the
+# behavior we want, but only by coincidence in this particular wrap
+# pattern). Aligning to `exit 1` removes the coincidence.
 get_repo_info() {
     if [[ "$fail_at" == "get_repo_info" ]]; then
         echo "ZenHub API error" >&2
-        return 1
+        exit 1
     fi
     echo "owner/repo"
 }
 get_repo_id() {
     if [[ "$fail_at" == "get_repo_id" ]]; then
         echo "ZenHub API error" >&2
-        return 1
+        exit 1
     fi
     echo "repo-id-abc"
 }
@@ -1924,14 +1939,31 @@ estimate="3"
 zh_graphql() {
     if [[ "$fail" == "yes" ]]; then
         echo "ZenHub API error: rate limited" >&2
-        return 1
+        # Round-6 meta-rule: production zh_graphql calls `error` ->
+        # `exit 1` on `.errors`, NOT `return 1`. The original round-4
+        # #1 stub used `return 1`, which let the test's
+        # `if zh_graphql ...; then ... else ... fi` form intercept the
+        # failure and pass green. Production with `exit 1` does NOT
+        # work in that form: `exit 1` runs in the current shell unless
+        # zh_graphql is called inside `$(...)`. The if/then/else fix
+        # shipped and ran in production for the full v1.9.1 cycle
+        # before round-6 review caught it. Using `exit 1` here pins
+        # the production behavior exactly.
+        exit 1
     fi
     echo "{}"
 }
 warn() { echo "WARN: $1" >&2; }
 
-# Mirror cmd_create's round-4 #1 envelope for the estimate mutation.
-if zh_graphql "mutation" "vars" > /dev/null 2>&1; then
+# Round-6 finding #1: mirror cmd_create's WORKING envelope: capture
+# zh_graphql output into a variable, then branch on whether the
+# variable is non-empty. The `if zh_graphql ...; then ... else` form
+# the round-4 fix used would NOT have intercepted exit 1, so it would
+# have aborted the script before the JSON emit (the exact failure
+# mode the fix was supposed to prevent).
+est_result=""
+est_result=$(zh_graphql "mutation" "vars" 2>/dev/null) || est_result=""
+if [[ -n "$est_result" ]]; then
     echo "ESTIMATE_OK"
 else
     warn "Created #${new_issue_num} but the estimate mutation failed. Retry with 'zh estimate #${new_issue_num} ${estimate}'."
@@ -2280,3 +2312,711 @@ def test_hierarchy_create_accepts_non_empty_value() -> None:
     assert out.startswith("OK:")
     assert "-b" in out
     assert "Body" in out
+
+
+# ===========================================================================
+# v1.9.1 round-6 fixes (PR #25 round-5 review findings 1-12).
+#
+# Meta-rule for these tests: stubs that model `error -> exit 1` use
+# `exit 1`, NOT `return 1`. Round-4 #1's false-pass shipped because the
+# original stub used `return 1`, which is interceptable by
+# `if zh_graphql ...; then ... else ... fi`; production's `exit 1`
+# inside zh_graphql is NOT interceptable in that form. The HIGH #1, #2
+# fixes in this round REPLACE the if/then/else pattern with a
+# `result=$(zh_graphql ...) || result=""; if [[ -n "$result" ]] ...`
+# capture, which intercepts exit 1 only because $(...) runs in a
+# subshell. Every new stub below uses `exit 1` so a future refactor
+# that re-introduces the broken pattern fails the test.
+# ===========================================================================
+
+
+# Round-6 finding #1: cmd_create estimate envelope. The if/then/else
+# form would not have caught exit 1, so production used to abort
+# before the JSON emit. Pin the WORKING capture+branch shape against
+# an exit-1 stub.
+_EST_ENVELOPE_FIXED_SNIPPET = r"""
+set -euo pipefail
+fail="$1"  # "yes" / "no"
+new_issue_num="100"
+estimate="3"
+
+zh_graphql() {
+    if [[ "$fail" == "yes" ]]; then
+        echo "ZenHub API error: rate limited" >&2
+        exit 1
+    fi
+    echo "{}"
+}
+warn() { echo "WARN: $1" >&2; }
+
+# Production round-6 #1 shape: capture into a var so $(...) contains
+# the exit.
+est_result=""
+est_result=$(zh_graphql "mutation" "vars" 2>/dev/null) || est_result=""
+if [[ -n "$est_result" ]]; then
+    echo "ESTIMATE_APPLIED"
+else
+    warn "Created #${new_issue_num} but the estimate mutation failed. Retry with 'zh estimate #${new_issue_num} ${estimate}'."
+fi
+echo "JSON_EMIT_REACHED"
+"""
+
+
+def _est_envelope_fixed(fail: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _EST_ENVELOPE_FIXED_SNIPPET, "_", fail],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_est_envelope_fixed_reaches_json_emit_on_failure() -> None:
+    """The capture-then-branch shape MUST reach the JSON emit even
+    when zh_graphql does the real `exit 1` (not the false-pass
+    `return 1`). Pins the round-6 #1 fix.
+    """
+    r = _est_envelope_fixed("yes")
+    assert r.returncode == 0
+    assert "JSON_EMIT_REACHED" in r.stdout
+    assert "ESTIMATE_APPLIED" not in r.stdout
+    assert "WARN:" in r.stderr
+
+
+def test_est_envelope_fixed_clean_path() -> None:
+    """Sanity: when zh_graphql returns non-empty, the success arm
+    fires and JSON emit runs.
+    """
+    r = _est_envelope_fixed("no")
+    assert r.returncode == 0
+    assert "ESTIMATE_APPLIED" in r.stdout
+    assert "JSON_EMIT_REACHED" in r.stdout
+
+
+# Round-6 finding #1 (counterproof): the BROKEN if/then/else form
+# does NOT reach the JSON emit when zh_graphql exits 1. This pins
+# the false-pass that the round-4 fix shipped, so a future refactor
+# regressing to the broken pattern fails the test.
+_EST_ENVELOPE_BROKEN_SNIPPET = r"""
+set -euo pipefail
+zh_graphql() {
+    echo "ZenHub API error" >&2
+    exit 1
+}
+warn() { echo "WARN: $1" >&2; }
+
+# The BROKEN round-4 shape we replaced. Production's `exit 1` from
+# zh_graphql kills the current shell BEFORE the else arm can run.
+if zh_graphql "mutation" "vars" > /dev/null 2>&1; then
+    echo "OK_REACHED"
+else
+    warn "would have warned"
+fi
+echo "JSON_EMIT_REACHED"
+"""
+
+
+def test_est_envelope_broken_pattern_aborts_before_json() -> None:
+    """Counterproof: the OLD `if zh_graphql ...; then ... else ... fi`
+    form does NOT reach the JSON emit when zh_graphql calls exit 1.
+    This is the bug the round-6 #1 fix corrects.
+    """
+    r = subprocess.run(
+        ["bash", "-c", _EST_ENVELOPE_BROKEN_SNIPPET],
+        capture_output=True, text=True, check=False,
+    )
+    # The exit code propagates out from the killed shell.
+    assert r.returncode == 1
+    assert "JSON_EMIT_REACHED" not in r.stdout
+    # The else arm was unreachable.
+    assert "would have warned" not in r.stderr
+
+
+# Round-6 finding #2: same fix applied to the moveIssue envelope.
+# Plus the round-5 #1 priority_id cleanup that lives in the else
+# arm (which was previously unreachable for the same exit-1 reason).
+_MOVE_ENVELOPE_FIXED_SNIPPET = r"""
+set -euo pipefail
+fail="$1"  # "yes" / "no"
+priority_id="prio-high-id"
+priority_name="High"
+new_issue_num="100"
+pipeline="In Progress"
+mutation="placeholder"
+vars="placeholder"
+
+zh_graphql() {
+    if [[ "$fail" == "yes" ]]; then
+        echo "ZenHub API error" >&2
+        exit 1
+    fi
+    echo "{}"
+}
+warn() { echo "WARN: $1" >&2; }
+
+move_result=""
+move_result=$(zh_graphql "$mutation" "$vars" 2>/dev/null) || move_result=""
+if [[ -n "$move_result" ]]; then
+    pipeline_set="$pipeline"
+    echo "MOVED:${pipeline_set}"
+else
+    warn "Created #${new_issue_num} but the move-to-'${pipeline}' mutation failed."
+    if [[ -n "$priority_id" ]]; then
+        warn "Skipping --priority '${priority_name}' because the move failed."
+        priority_id=""
+    fi
+fi
+
+if [[ -n "$priority_id" ]]; then
+    echo "PRIORITY_WILL_APPLY:${priority_id}"
+else
+    echo "PRIORITY_CLEARED"
+fi
+echo "JSON_EMIT_REACHED"
+"""
+
+
+def _move_envelope_fixed(fail: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _MOVE_ENVELOPE_FIXED_SNIPPET, "_", fail],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_move_envelope_clears_priority_on_failure() -> None:
+    """Round-6 #2: with the capture+branch shape, the move-failure
+    else arm IS reachable when zh_graphql does the real exit 1, so
+    the priority_id cleanup the round-5 #1 commit added actually
+    runs. JSON emit follows.
+    """
+    r = _move_envelope_fixed("yes")
+    assert r.returncode == 0
+    assert "JSON_EMIT_REACHED" in r.stdout
+    assert "PRIORITY_CLEARED" in r.stdout
+    assert "PRIORITY_WILL_APPLY" not in r.stdout
+    assert "Skipping --priority" in r.stderr
+
+
+def test_move_envelope_preserves_priority_on_success() -> None:
+    """Regression guard: when moveIssue succeeds, priority_id stays
+    set so the priority block applies it to the correctly-placed
+    pipelineIssue.
+    """
+    r = _move_envelope_fixed("no")
+    assert r.returncode == 0
+    assert "MOVED:In Progress" in r.stdout
+    assert "PRIORITY_WILL_APPLY:prio-high-id" in r.stdout
+    assert "Skipping --priority" not in r.stderr
+
+
+# Round-6 finding #3: cmd_update_issue must accept `--title=Foo`
+# (the GNU equals form). Mirrors cmd_create's normalizer + empty-
+# value rejection.
+_UPDATE_NORMALIZER_SNIPPET = r"""
+set -euo pipefail
+error() { echo "ERROR: $1" >&2; exit 1; }
+issue_num=""
+title=""
+body=""
+title_set="false"
+body_set="false"
+
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        _unorm_flag="${1%%=*}"
+        _unorm_val="${1#*=}"
+        if [[ -z "$_unorm_val" ]]; then
+            error "Option ${_unorm_flag} requires a value (received empty string from '${1}')"
+        fi
+        set -- "$_unorm_flag" "$_unorm_val" "${@:2}"
+    fi
+    case "$1" in
+        -t|--title)
+            if [[ $# -lt 2 ]]; then error "Option ${1} requires a value"; fi
+            title="$2"; title_set="true"; shift 2 ;;
+        -d|--description|-b|--body)
+            if [[ $# -lt 2 ]]; then error "Option ${1} requires a value"; fi
+            body="$2"; body_set="true"; shift 2 ;;
+        *)
+            if [[ -z "$issue_num" ]]; then issue_num="$1"; fi
+            shift ;;
+    esac
+done
+
+echo "ISSUE:${issue_num}"
+echo "TITLE:${title}"
+echo "BODY:${body}"
+"""
+
+
+def _update_normalize(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _UPDATE_NORMALIZER_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_update_normalizer_handles_equals_title() -> None:
+    """`zh epic update --title="Foo" 42` (flag-first with equals) used
+    to die with "Invalid issue number: --title=Foo" because the case
+    arm didn't match the equals form and the *) arm captured it as
+    the issue number. Now normalizes correctly.
+    """
+    r = _update_normalize("--title=Foo", "42")
+    assert r.returncode == 0
+    assert "ISSUE:42" in r.stdout
+    assert "TITLE:Foo" in r.stdout
+
+
+def test_update_normalizer_handles_equals_description() -> None:
+    """Same fix covers --description= and --body= forms."""
+    r = _update_normalize("--description=New body", "100")
+    assert r.returncode == 0
+    assert "ISSUE:100" in r.stdout
+    assert "BODY:New body" in r.stdout
+
+
+def test_update_normalizer_rejects_empty_equals() -> None:
+    """Empty-value form (e.g. unset shell variable) hard-errors
+    instead of silently updating with an empty title.
+    """
+    r = _update_normalize("--title=", "42")
+    assert r.returncode == 1
+    assert "requires a value" in r.stderr
+
+
+def test_update_normalizer_space_form_still_works() -> None:
+    """Regression guard: classic `-t Foo 42` still parses."""
+    r = _update_normalize("-t", "Foo", "42")
+    assert r.returncode == 0
+    assert "ISSUE:42" in r.stdout
+    assert "TITLE:Foo" in r.stdout
+
+
+# Round-6 finding #4: cmd_set_type partial branch must `warn` + `exit 2`
+# (the divergence-only partial convention), not `error` + `exit 1`.
+_SET_TYPE_EXIT_2_SNIPPET = r"""
+set -euo pipefail
+response="$1"
+issue_num="42"
+warn() { echo "WARN: $1" >&2; }
+error() { echo "ERROR: $1" >&2; exit 1; }
+
+success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
+failed_count=$(echo "$response" | jq -r '(.data.changeIssueTypeOfIssues.failedIssues // []) | length')
+gh_errors=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.githubErrors // {}')
+gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
+
+if [[ "$success_count" -lt 1 ]]; then
+    error "Failed to set type"
+fi
+if [[ "$failed_count" -gt 0 ]] || [[ "$gh_errors_len" -gt 0 ]]; then
+    warn "Partially applied"
+    exit 2
+fi
+echo "CLEAN_SUCCESS"
+"""
+
+
+def _set_type_exit_code(response: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _SET_TYPE_EXIT_2_SNIPPET, "_", response],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_set_type_partial_exits_2_not_1() -> None:
+    """The partial-applied branch must use the divergence convention
+    (exit 2 = re-verify, change already landed) so MCP wrappers can
+    distinguish from real failures (exit 1 = safe to retry). Round-6
+    #4.
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
+            '"failedIssues":[],"githubErrors":[{"code":"X"}]}}}')
+    r = _set_type_exit_code(resp)
+    assert r.returncode == 2, (
+        "Partial-applied must exit 2 (divergence), not 1 (real failure)."
+    )
+    assert "WARN: Partially applied" in r.stderr
+    assert "ERROR" not in r.stderr
+
+
+def test_set_type_zero_count_exits_1() -> None:
+    """Real failure (successCount=0) still exits 1, the hard-failure
+    code.
+    """
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":0,'
+            '"failedIssues":[{"number":42}],"githubErrors":[]}}}')
+    r = _set_type_exit_code(resp)
+    assert r.returncode == 1
+    assert "ERROR: Failed to set type" in r.stderr
+
+
+def test_set_type_clean_success_exits_0() -> None:
+    """Clean success path is unchanged: exit 0."""
+    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
+            '"failedIssues":[],"githubErrors":[]}}}')
+    r = _set_type_exit_code(resp)
+    assert r.returncode == 0
+    assert "CLEAN_SUCCESS" in r.stdout
+
+
+# Round-6 finding #5: cmd_create parent-wire addSubIssues envelope.
+# Must capture the exit-1 from zh_graphql so the script does not die
+# before the --json emit.
+_PARENT_WIRE_ENVELOPE_SNIPPET = r"""
+set -euo pipefail
+fail="$1"
+parent_stripped="42"
+new_issue_num="100"
+mutation="placeholder"
+vars="placeholder"
+
+zh_graphql() {
+    if [[ "$fail" == "yes" ]]; then
+        echo "ZenHub API error" >&2
+        exit 1
+    fi
+    echo '{"data":{"addSubIssues":{"successCount":1}}}'
+}
+warn() { echo "WARN: $1" >&2; }
+
+sub_response=""
+sub_ok=0
+sub_response=$(zh_graphql "$mutation" "$vars" 2>/dev/null) || sub_response=""
+if [[ -n "$sub_response" ]]; then
+    sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
+fi
+if [[ "$sub_ok" -ge 1 ]]; then
+    echo "WIRED:#${parent_stripped}"
+else
+    warn "Created #${new_issue_num} but could not attach it to parent #${parent_stripped}. Re-wire with 'zh subissue add ${parent_stripped} ${new_issue_num}'."
+fi
+echo "JSON_EMIT_REACHED"
+"""
+
+
+def _parent_wire(fail: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _PARENT_WIRE_ENVELOPE_SNIPPET, "_", fail],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_parent_wire_failure_reaches_json_emit() -> None:
+    """Round-6 #5: parent-wire mutation failure must NOT abort the
+    script before the JSON emit. The capture+branch shape handles
+    exit 1; the warn directs the user at the manual re-wire verb.
+    """
+    r = _parent_wire("yes")
+    assert r.returncode == 0
+    assert "JSON_EMIT_REACHED" in r.stdout
+    assert "WIRED:" not in r.stdout
+    assert "zh subissue add 42 100" in r.stderr
+
+
+def test_parent_wire_success_path() -> None:
+    """Regression: clean success still emits the wired line."""
+    r = _parent_wire("no")
+    assert r.returncode == 0
+    assert "WIRED:#42" in r.stdout
+    assert "JSON_EMIT_REACHED" in r.stdout
+
+
+# Round-6 finding #8: cmd_create normalizer must NOT mangle a
+# positional title starting with `--`. Disambiguation via known-flag
+# list.
+_CREATE_NORMALIZER_DISAMBIG_SNIPPET = r"""
+set -euo pipefail
+title=""
+priority_name=""
+issue_type=""
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --*=* ]]; then
+        _norm_flag="${1%%=*}"
+        _norm_val="${1#*=}"
+        _is_known_flag="false"
+        case "$_norm_flag" in
+            --type|--parent|--priority|--label|--labels|--assign|--assignee|--pipeline|--estimate|--body|--file|--body-file|--description|--json|--quiet|--stdin)
+                _is_known_flag="true"
+                ;;
+        esac
+        if [[ -n "$title" || "$_is_known_flag" == "true" ]]; then
+            set -- "$_norm_flag" "$_norm_val" "${@:2}"
+        fi
+    fi
+    case "$1" in
+        -t|--type) issue_type="$2"; shift 2 ;;
+        --priority) priority_name="$2"; shift 2 ;;
+        *) if [[ -z "$title" ]]; then title="$1"; fi; shift ;;
+    esac
+done
+echo "TITLE:${title}"
+echo "TYPE:${issue_type}"
+echo "PRIORITY:${priority_name}"
+"""
+
+
+def _create_normalize(*argv: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", "-c", _CREATE_NORMALIZER_DISAMBIG_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_normalizer_preserves_title_starting_with_double_dash_unknown() -> None:
+    """`zh create "--rotate=enabled fails on retry" -t Bug` must keep
+    the title intact. `--rotate` is not in the known-flag list, so
+    the normalizer leaves the token alone and the `*)` arm captures
+    it as the title.
+    """
+    r = _create_normalize("--rotate=enabled fails on retry", "-t", "Bug")
+    assert r.returncode == 0
+    assert "TITLE:--rotate=enabled fails on retry" in r.stdout
+    assert "TYPE:Bug" in r.stdout
+
+
+def test_normalizer_still_handles_known_flag_first() -> None:
+    """`--priority=High` IS a known flag, so the flag-first form
+    `--priority=High "Foo"` still normalizes correctly. Regression
+    guard: the round-6 #8 disambiguation must not break this case.
+    """
+    r = _create_normalize("--priority=High", "Foo")
+    assert r.returncode == 0
+    assert "TITLE:Foo" in r.stdout
+    assert "PRIORITY:High" in r.stdout
+
+
+def test_normalizer_handles_known_flag_after_title() -> None:
+    """Title-first then flag: `"Title" --priority=High` always
+    normalizes (title is set, so the second branch of the gate
+    fires).
+    """
+    r = _create_normalize("Title", "--priority=High")
+    assert r.returncode == 0
+    assert "TITLE:Title" in r.stdout
+    assert "PRIORITY:High" in r.stdout
+
+
+def test_normalizer_preserves_unknown_flag_after_title() -> None:
+    """After title is set, ANY `--foo=bar` is treated as a flag. An
+    unknown one (`--rotate=enabled`) gets normalized into two args
+    and falls through cleanly. Regression guard: the disambiguation
+    only protects the FIRST positional.
+    """
+    r = _create_normalize("Title", "--rotate=enabled")
+    assert r.returncode == 0
+    assert "TITLE:Title" in r.stdout
+
+
+# Round-6 finding #9: zh_hierarchy_warn_for_noun scans only the
+# trailing positionals first, then falls back to the leading
+# positionals. Future-proofs against new flags without an explicit
+# skip-list update.
+_TRAILING_SCAN_SNIPPET = r"""
+set -euo pipefail
+shift  # drop expected_type
+shift  # drop verb
+
+first_flag_pos=-1
+last_flag_pos=-1
+idx=-1
+for arg in "$@"; do
+    idx=$((idx + 1))
+    if [[ "$arg" == -* ]]; then
+        if [[ "$first_flag_pos" -eq -1 ]]; then
+            first_flag_pos=$idx
+        fi
+        last_flag_pos=$idx
+    fi
+done
+
+found_num=""
+idx=-1
+for arg in "$@"; do
+    idx=$((idx + 1))
+    if [[ "$idx" -le "$last_flag_pos" ]]; then continue; fi
+    stripped="${arg#\#}"
+    if [[ "$stripped" =~ ^[0-9]+$ ]]; then
+        found_num="$stripped"
+        break
+    fi
+done
+
+if [[ -z "$found_num" ]] && [[ "$first_flag_pos" -gt 0 ]]; then
+    idx=-1
+    for arg in "$@"; do
+        idx=$((idx + 1))
+        if [[ "$idx" -ge "$first_flag_pos" ]]; then break; fi
+        stripped="${arg#\#}"
+        if [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            found_num="$stripped"
+            break
+        fi
+    done
+fi
+
+if [[ -z "$found_num" ]]; then
+    echo "NOT_FOUND"
+else
+    echo "FOUND:${found_num}"
+fi
+"""
+
+
+def _trailing_scan(*argv):
+    return subprocess.run(
+        ["bash", "-c", _TRAILING_SCAN_SNIPPET, "_", *argv],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_trailing_scan_no_flags_finds_positional() -> None:
+    """`zh epic close 42` -> no flags, leading scan finds 42."""
+    r = _trailing_scan("Epic", "close", "42")
+    assert r.stdout.strip() == "FOUND:42"
+
+
+def test_trailing_scan_flag_first_finds_trailing() -> None:
+    """`zh epic update -t Foo 100` -> last flag `-t`, trailing has
+    Foo and 100, first numeric is 100.
+    """
+    r = _trailing_scan("Epic", "update", "-t", "Foo", "100")
+    assert r.stdout.strip() == "FOUND:100"
+
+
+def test_trailing_scan_positional_first_falls_back_to_leading() -> None:
+    """`zh epic close 42 -c "comment"` (future verb) -> last flag
+    `-c`, trailing has `comment` only (no numeric). Falls back to
+    leading scan and finds 42.
+    """
+    r = _trailing_scan("Epic", "close", "42", "-c", "comment")
+    assert r.stdout.strip() == "FOUND:42"
+
+
+def test_trailing_scan_skips_numeric_flag_value() -> None:
+    """`zh epic update -t 42 100` -> last flag `-t`, trailing has
+    `42, 100` (42 IS the flag value). Trailing pass picks 42 (a
+    known false positive: the warn would point at #42 instead of
+    #100), but this is documented as acceptable noise in the
+    advisory warn vs. the maintenance cost of an explicit arity
+    list. The redirect text is the only impact; the verb still
+    runs against #100 (cmd_update_issue does its own arg parsing).
+    """
+    r = _trailing_scan("Epic", "update", "-t", "42", "100")
+    # The trailing pass picks the first numeric, which is `42` (the
+    # flag value). This is the trade-off the trailing-only model
+    # accepts. Pinned here so the behavior is explicit.
+    assert r.stdout.strip() == "FOUND:42"
+
+
+def test_trailing_scan_returns_not_found_with_no_numeric() -> None:
+    """`zh epic update -t Foo` -> only the flag and its non-numeric
+    value. No issue number, helper stays silent.
+    """
+    r = _trailing_scan("Epic", "update", "-t", "Foo")
+    assert r.stdout.strip() == "NOT_FOUND"
+
+
+# Round-6 finding #10: --json estimate gets a `_requested` companion
+# so consumers can tell intent from confirmation apart. Same shape
+# as priority / priority_requested.
+_ESTIMATE_REQUESTED_SNIPPET = r"""
+estimate="$1"           # request (empty = not requested)
+estimate_applied="$2"   # "true" / "false"
+
+_est_applied_for_json=""
+if [[ "$estimate_applied" == "true" ]]; then
+    _est_applied_for_json="$estimate"
+fi
+
+jq -n \
+    --arg estimate "${_est_applied_for_json}" \
+    --arg estimate_requested "${estimate}" \
+    '{estimate: (if $estimate == "" then null else ($estimate | tonumber) end),
+      estimate_requested: (if $estimate_requested == "" then null else ($estimate_requested | tonumber) end)}'
+"""
+
+
+def _estimate_requested_json(
+    estimate: str, estimate_applied: str,
+) -> dict:
+    r = subprocess.run(
+        ["bash", "-c", _ESTIMATE_REQUESTED_SNIPPET, "_",
+         estimate, estimate_applied],
+        capture_output=True, text=True, check=False,
+    )
+    import json as _json
+    return _json.loads(r.stdout)
+
+
+def test_estimate_requested_not_passed_is_both_null() -> None:
+    """No --estimate -> both fields null. Consumer branches:
+    null -> null = not requested.
+    """
+    obj = _estimate_requested_json("", "false")
+    assert obj["estimate"] is None
+    assert obj["estimate_requested"] is None
+
+
+def test_estimate_requested_applied_carries_value() -> None:
+    """--estimate 5 applied successfully -> both fields = 5."""
+    obj = _estimate_requested_json("5", "true")
+    assert obj["estimate"] == 5
+    assert obj["estimate_requested"] == 5
+
+
+def test_estimate_requested_but_not_confirmed() -> None:
+    """--estimate 5 requested, mutation didn't confirm -> estimate
+    null, estimate_requested 5. Consumer detects partial apply.
+    """
+    obj = _estimate_requested_json("5", "false")
+    assert obj["estimate"] is None
+    assert obj["estimate_requested"] == 5
+
+
+# Round-6 finding #11: type-mismatch redirect for non-planning types
+# uses the right top-level verb. close/reopen exist; show/update fall
+# back to `zh issue`.
+_NONPLANNING_REDIRECT_SNIPPET = r"""
+set -euo pipefail
+verb="$1"
+issue_num="42"
+case "$verb" in
+    close) redirect="zh close ${issue_num}" ;;
+    reopen) redirect="zh reopen ${issue_num}" ;;
+    *) redirect="zh issue ${issue_num}" ;;
+esac
+echo "$redirect"
+"""
+
+
+def _nonplanning_redirect(verb: str) -> str:
+    r = subprocess.run(
+        ["bash", "-c", _NONPLANNING_REDIRECT_SNIPPET, "_", verb],
+        capture_output=True, text=True, check=False,
+    )
+    return r.stdout.strip()
+
+
+def test_nonplanning_redirect_close_uses_top_level_close() -> None:
+    """`zh epic close 42` against a Bug now redirects to
+    `zh close 42`, which is a real verb that does what the user
+    asked. Pre-fix it pointed at `zh issue 42` (read-only).
+    """
+    assert _nonplanning_redirect("close") == "zh close 42"
+
+
+def test_nonplanning_redirect_reopen_uses_top_level_reopen() -> None:
+    """Symmetric for reopen."""
+    assert _nonplanning_redirect("reopen") == "zh reopen 42"
+
+
+def test_nonplanning_redirect_show_uses_zh_issue() -> None:
+    """show has no destructive analog; route to zh issue."""
+    assert _nonplanning_redirect("show") == "zh issue 42"
+
+
+def test_nonplanning_redirect_update_uses_zh_issue() -> None:
+    """update similarly: there's no `zh update` top-level verb that
+    parallels close / reopen. zh issue is the safe read-only landing.
+    """
+    assert _nonplanning_redirect("update") == "zh issue 42"
