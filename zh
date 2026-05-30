@@ -134,33 +134,49 @@ zh_cause_hint() {
         # empties, join with "; ". Uses pre-computed sentinel
         # strings instead of inline $'\033' interpolation so the
         # bash 3.2 / 4.x regex parser doesn't choke.
-        local _esc _csi_re _osc_bel_re _osc_st_re
+        local _esc _csi_re _osc_bel_re
         _esc=$'\033'
         # CSI: ESC [ <params/intermediates> <final-byte>
         _csi_re="${_esc}\[[0-9;]*[a-zA-Z]"
         # OSC, BEL-terminated:    ESC ] <text> BEL
         _osc_bel_re="${_esc}\][^"$'\007\033'"]*"$'\007'
-        # v1.9.3 pattern-sweep: also handle ESC-backslash (ST) terminators.
-        # The coreutils sed branch above already strips both BEL and ST
-        # via the `(\007|\033\\\\)` alternation; the pure-bash fallback
-        # was BEL-only, so a terminal emitting ST-terminated OSC sequences
-        # on a busybox / alpine host had its diagnostic stuck in the
-        # error file. ESC and ESC-backslash both excluded from the OSC
-        # body class so a nested ESC closes the run; the dedicated ST
-        # regex then matches the final ESC \ pair.
-        _osc_st_re="${_esc}\][^"$'\033'"]*${_esc}\\\\"
+        # v1.9.3 pattern-sweep finding #7: handle ESC-backslash (ST)
+        # terminators too. The coreutils sed branch above strips both
+        # BEL and ST via `(\007|\033\\\\)`; the pure-bash branch was
+        # BEL-only.
+        #
+        # We deliberately don't run a parallel regex for ST. The naive
+        # approach is `_osc_st_re="${_esc}\][^${_esc}]*${_esc}\\\\"` and
+        # then `${_line//${BASH_REMATCH[0]}/}` to substitute, but bash's
+        # pattern-substitution operator treats the search string as a
+        # glob pattern, where a trailing backslash (the ST terminator's
+        # second byte) swallows the closing `/` of the substitution.
+        # The substitution silently no-ops, the regex re-matches the
+        # same span, and the loop spins forever.
+        #
+        # Instead, normalize ESC-backslash to BEL via a literal-scalar
+        # `${var/from/to}` substitution (no glob involved, no infinite
+        # loop), then let the existing BEL OSC regex catch every OSC.
+        # The normalization is harmless when no OSC is present — a bare
+        # ESC `\` outside an OSC is not a thing terminals emit. ESC
+        # alone is excluded from the OSC body class so the BEL regex
+        # still terminates at the right byte.
+        local _esc_backslash _bel
+        _esc_backslash="${_esc}\\"
+        _bel=$'\007'
         local _line _out=""
         while IFS= read -r _line || [[ -n "$_line" ]]; do
+            # Normalize OSC ST → OSC BEL FIRST (literal-scalar substitution,
+            # no glob interpretation — safe even when the line contains
+            # backslashes).
+            _line="${_line//${_esc_backslash}/${_bel}}"
             # Strip every CSI sequence on this line.
             while [[ "$_line" =~ $_csi_re ]]; do
                 _line="${_line//${BASH_REMATCH[0]}/}"
             done
-            # Strip every BEL-terminated OSC sequence on this line.
+            # Strip every BEL-terminated OSC sequence (now covers
+            # ST-terminated too, thanks to the normalization above).
             while [[ "$_line" =~ $_osc_bel_re ]]; do
-                _line="${_line//${BASH_REMATCH[0]}/}"
-            done
-            # Strip every ST-terminated OSC sequence on this line.
-            while [[ "$_line" =~ $_osc_st_re ]]; do
                 _line="${_line//${BASH_REMATCH[0]}/}"
             done
             # Skip empty / whitespace-only lines.
