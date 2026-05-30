@@ -927,16 +927,33 @@ def _safe_int(value, default: int = 0) -> int:
     partial_applied derivation site degrades to `default` (0)
     instead of raising MCP InternalError, which preserves the rest
     of the response envelope for the agent.
+
+    v1.9.3 pattern-sweep finding #13: the bool branch's asymmetry
+    (`int(True) == 1` would otherwise apply) is INTENTIONAL.
+    Documented semantic: a bool here represents "a serialization
+    layer flipped a numeric exit_code into True/False" and cannot
+    be trusted to honestly report the underlying integer. The
+    alternative (return 1 for True) would silently encode
+    "partial-applied" for a value that may simply be the JSON
+    boolean `True`, leading every partial_applied derivation site
+    downstream to claim a partial that the subprocess never
+    signaled. Returning `default` (0) means such corrupt input is
+    treated as "no signal — pretend clean success," which is the
+    safer default because:
+      1. Partial-applied is a strong claim that triggers
+         re-verification work; falsely asserting it wastes the
+         agent's time and pollutes logs.
+      2. The corrupt-bool case has never been observed in
+         production; this branch is purely defense-in-depth.
+      3. If the bug ever DOES surface, masking it as `default`
+         leaves a louder signal (the partial path was never
+         taken) than a silent partial-applied=True would.
+    Callers must not rely on `_safe_int(True) == 1`.
     """
     if value is None:
         return default
     if isinstance(value, bool):
-        # `bool` is a subclass of `int` in Python; treat False/True
-        # as `default` so a serialization layer that flips numeric 0
-        # to False doesn't accidentally become exit_code=0 (clean
-        # success) or exit_code=1 (False is 0, True is 1 — the latter
-        # would imply hard-failure for a partial signal we cannot
-        # trust to be honest).
+        # See module-level docstring for the asymmetric-bool rationale.
         return default
     try:
         return int(value)
@@ -1208,7 +1225,7 @@ def board(repo_path: str = "") -> dict:
         "ok": r["ok"],
         "pipelines": _parse_board(r["stdout_plain"]) if r["ok"] else {},
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1231,7 +1248,7 @@ def pipeline(name: str, repo_path: str = "") -> dict:
         "pipeline": name,
         "issues": _parse_pipeline_listing(r["stdout_plain"]) if r["ok"] else [],
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1261,7 +1278,7 @@ def pipelines(repo_path: str = "") -> dict:
         "ok": r["ok"],
         "pipelines": names,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1281,7 +1298,7 @@ def issue(number: int, repo_path: str = "") -> dict:
         "ok": r["ok"],
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1308,7 +1325,7 @@ def mine(user: str = "", repo_path: str = "") -> dict:
         "ok": r["ok"],
         "issues": _parse_mine_listing(r["stdout_plain"]) if r["ok"] else [],
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1358,7 +1375,7 @@ def epic_show(epic_number: int, repo_path: str = "") -> dict:
         "ok": r["ok"],
         "epic_number": epic_number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1376,7 +1393,7 @@ def list_users(repo_path: str = "") -> dict:
     return {
         "ok": r["ok"],
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1394,7 +1411,7 @@ def list_labels(repo_path: str = "") -> dict:
     return {
         "ok": r["ok"],
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1418,7 +1435,7 @@ def list_types(repo_path: str = "") -> dict:
     return {
         "ok": r["ok"],
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1660,10 +1677,22 @@ def create_issue(title: str, body: str, type: str = "Task",
         "priority_requested": None,
         "raw": "",
     }
+    # v1.9.3 pattern-sweep finding #5: shape-drift parity. The blocked
+    # / success / soft-warn paths all include `duplicate_check`; the
+    # validation early-returns omitted it, so a strict client reading
+    # `out["duplicate_check"]` on every response KeyErrored on
+    # title-empty / body-empty input. Add a `recommendation="skipped"`
+    # placeholder for back-compat parity with the round-4 #9 fix in the
+    # main path.
+    _validation_dup_placeholder = {"recommendation": "skipped", "matches": []}
     if not title.strip():
-        return {**_empty_create_shape, "stderr": "title must be non-empty"}
+        return {**_empty_create_shape,
+                "stderr": "title must be non-empty",
+                "duplicate_check": _validation_dup_placeholder}
     if not body.strip():
-        return {**_empty_create_shape, "stderr": "body must be non-empty"}
+        return {**_empty_create_shape,
+                "stderr": "body must be non-empty",
+                "duplicate_check": _validation_dup_placeholder}
 
     # Pre-flight similarity check
     dup_info = None
@@ -1755,7 +1784,7 @@ def create_issue(title: str, body: str, type: str = "Task",
             created.get("priority_requested") if created else None
         ),
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
     # v1.9.2 round-4 (PR #27) finding #9: always set duplicate_check
     # so clients reading it per the docstring contract don't KeyError
@@ -1782,17 +1811,24 @@ def close_issue(number: int, comment: str = "", repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, raw, stderr.
+        dict with: ok, partial_applied, number, raw, stderr.
     """
     args = ["close", str(number)]
     if comment:
         args.append(comment)
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: include `partial_applied` for uniform-key
+    # parity with set_issue_type and the planning-children wrappers.
+    # cmd_close uses `gh` and has no exit-2 partial today, so the field
+    # is always False here — but agents that uniformly read
+    # out["partial_applied"] on every write tool should not KeyError on
+    # a close. Mirrors the round-3 #8 add for _planning_close.
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1805,14 +1841,16 @@ def reopen_issue(number: int, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, raw, stderr.
+        dict with: ok, partial_applied, number, raw, stderr.
     """
     r = _run_zh(["reopen", str(number)], cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1826,15 +1864,17 @@ def move_issue(number: int, pipeline: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, target_pipeline, raw, stderr.
+        dict with: ok, partial_applied, number, target_pipeline, raw, stderr.
     """
     r = _run_zh(["move", str(number), pipeline], cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "target_pipeline": pipeline,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1848,16 +1888,18 @@ def reorder_issue(number: int, position: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, position, raw, stderr.
+        dict with: ok, partial_applied, number, position, raw, stderr.
     """
     r = _run_zh(["reorder", str(number), position],
                 cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "position": position,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1871,7 +1913,7 @@ def comment(number: int, message: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, raw, stderr.
+        dict with: ok, partial_applied, number, raw, stderr.
     """
     if not message.strip():
         # v1.9.2 round-3 (PR #27) finding #1: validation early-return
@@ -1882,15 +1924,20 @@ def comment(number: int, message: str, repo_path: str = "") -> dict:
         # _planning_create (round-2 #3), _planning_update (round-7
         # #11), and set_issue_type (round-7 #8). `comment()` was the
         # surviving sibling.
-        return {"ok": False, "number": number, "raw": "",
+        # v1.9.3 pattern-sweep: include partial_applied for uniform-key
+        # parity with the success path.
+        return {"ok": False, "partial_applied": False,
+                "number": number, "raw": "",
                 "stderr": "message must be non-empty"}
     r = _run_zh(["comment", str(number), "-m", message],
                 cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1904,15 +1951,17 @@ def assign(number: int, user: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, user, raw, stderr.
+        dict with: ok, partial_applied, number, user, raw, stderr.
     """
     r = _run_zh(["assign", str(number), user], cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "user": user,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1926,17 +1975,19 @@ def unassign(number: int, user: str = "", repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, raw, stderr.
+        dict with: ok, partial_applied, number, raw, stderr.
     """
     args = ["unassign", str(number)]
     if user:
         args.append(user)
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1950,16 +2001,18 @@ def set_estimate(number: int, points: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, points, raw, stderr.
+        dict with: ok, partial_applied, number, points, raw, stderr.
     """
     r = _run_zh(["estimate", str(number), points],
                 cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "points": points,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -1981,16 +2034,18 @@ def set_priority(number: int, level: str, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, number, level, raw, stderr.
+        dict with: ok, partial_applied, number, level, raw, stderr.
     """
     r = _run_zh(["priority", str(number), level],
                 cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "level": level,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2011,7 +2066,7 @@ def list_priorities(repo_path: str = "") -> dict:
     return {
         "ok": r["ok"],
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2078,7 +2133,7 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
         "number": number,
         "issue_type": issue_type,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2096,16 +2151,18 @@ def block_issue(blocked: int, blocking: int, repo_path: str = "") -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, blocked, blocking, raw, stderr.
+        dict with: ok, partial_applied, blocked, blocking, raw, stderr.
     """
     r = _run_zh(["block", str(blocked), str(blocking)],
                 cwd=_resolve_cwd(repo_path))
+    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "blocked": blocked,
         "blocking": blocking,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2152,6 +2209,10 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         # Missing keys (estimate_requested, priority,
         # priority_requested, raw) were the same drift class as
         # the round-2 #2 fix for create_issue.
+        # v1.9.3 pattern-sweep finding #5: include `duplicate_check`
+        # placeholder. The blocked and success paths emit it
+        # (round-4 #9 main-path fix); the validation early-return is
+        # the sibling site that was missed.
         return {
             "ok": False,
             "number": None,
@@ -2165,6 +2226,7 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             "priority_requested": None,
             "raw": "",
             "stderr": "title must be non-empty",
+            "duplicate_check": {"recommendation": "skipped", "matches": []},
         }
 
     # v1.9.1 item #5: pre-flight similarity check, identical machinery
@@ -2288,7 +2350,7 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             created.get("priority_requested") if created else None
         ),
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
     # v1.9.2 round-4 (PR #27) finding #9: always set the key. When the
     # pre-flight ran, `dup_info` carries the recommendation + matches.
@@ -2323,7 +2385,7 @@ def _planning_list(noun: str, repo_path: str) -> dict:
         "ok": r["ok"],
         "items": items,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2333,7 +2395,7 @@ def _planning_show(noun: str, number: int, repo_path: str) -> dict:
         "ok": r["ok"],
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2369,8 +2431,43 @@ def _planning_update(noun: str, number: int, title: str, description: str,
         "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
+
+
+_OUTCOME_SENTINEL_RE = re.compile(r"__ZH_OUTCOME__:([a-z]+)")
+
+
+def _stderr_plain(r: dict) -> str:
+    """Return ANSI-stripped stderr from a `_run_zh` result.
+
+    v1.9.3 pattern-sweep: MCP wrappers should never surface raw `stderr`
+    with embedded ANSI escapes; `_run_zh` already computes
+    `stderr_plain`. This indirection lets stubbed test results (which
+    may carry only `stderr`) fall back to the raw value rather than
+    KeyError, so the swap stays back-compat for unit tests that
+    pre-date the field.
+    """
+    if "stderr_plain" in r and r["stderr_plain"] is not None:
+        return r["stderr_plain"]
+    return r.get("stderr", "") or ""
+
+
+def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
+    """Extract the bash-emitted outcome sentinel from stderr.
+
+    v1.9.3 pattern-sweep: `cmd_subissue_add` and `cmd_subissue_remove`
+    print `__ZH_OUTCOME__:<outcome>` to stderr exactly once before exiting,
+    where <outcome> is one of `ok`, `noop`, `partial`, `fail`. The Python
+    wrappers read this to disambiguate the noop case from full-success
+    (both exit 0 under the round-4 #5 idempotent-success contract) so
+    `added` / `removed` no longer claim children landed when none did.
+    Returns the outcome string when found, or None if absent.
+    """
+    if not stderr_plain:
+        return None
+    m = _OUTCOME_SENTINEL_RE.search(stderr_plain)
+    return m.group(1) if m else None
 
 
 def _planning_add_children(noun: str, parent: int, children: list[int],
@@ -2378,9 +2475,12 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     if not children:
         # v1.9.2 round-1 (PR #27) finding #9: include `raw` for shape
         # parity with the success / partial paths.
+        # v1.9.3 pattern-sweep: include `outcome` for shape parity with
+        # the success / partial / noop paths below.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
+                "stderr_plain": "issue_numbers must be non-empty",
                 "parent": parent, "added": [], "added_requested": [],
-                "partial_applied": False, "raw": ""}
+                "partial_applied": False, "outcome": "fail", "raw": ""}
     args = [noun, "add", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: cmd_subissue_add exits 2 on a
@@ -2397,49 +2497,79 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     #     On partial: empty (the bash wrapper can't enumerate
     #     per-issue; the agent must consult subissue_list).
     #     On hard failure: empty.
+    #     v1.9.3 pattern-sweep: on noop (every child already attached,
+    #     exit 0): empty. The pre-fix `children if r["ok"] else []`
+    #     overstated `added` on noop because exit 0 + r["ok"]=True
+    #     made the wrapper claim the children landed when actually the
+    #     API reported successCount=0 / failedIssues=[]. The bash side
+    #     now emits `__ZH_OUTCOME__:noop` on stderr; we read it and
+    #     refuse to credit children that didn't move.
     #   - `added_requested`: the input list, ALWAYS. Mirrors the
     #     estimate_requested / priority_requested pattern from
     #     create_issue: agents that want to know what was attempted
     #     read this field; agents that want what's confirmed read
-    #     `added`. Past-tense `added` no longer overstates on partial.
+    #     `added`. Past-tense `added` no longer overstates on partial
+    #     or noop.
     # On partial, `ok=True or partial_applied=True` (mirrors
     # set_issue_type). An agent's correct idiom is:
     #     if r["partial_applied"]: re-verify via subissue_list
+    #     elif r["outcome"] == "noop": already-attached, treat as ok
     #     elif r["ok"]: log(f"Added {len(r['added'])} children")
     #     else: log(f"Failed (requested: {r['added_requested']})")
     partial_applied = _safe_int(r.get("exit_code")) == 2
+    outcome = _parse_outcome_sentinel(_stderr_plain(r))
+    if outcome is None:
+        # Defensive default: an older zh without the sentinel falls back
+        # to the round-4 #5 contract. Production zh always emits the
+        # sentinel; this is for the during-rollout window.
+        outcome = "partial" if partial_applied else ("ok" if r["ok"] else "fail")
+    # v1.9.3 pattern-sweep finding #1: noop must NOT overstate `added`.
+    is_landed = outcome == "ok"
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
+        "outcome": outcome,
         "parent": parent,
-        "added": children if r["ok"] else [],
+        "added": children if is_landed else [],
         "added_requested": children,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        # v1.9.3 pattern-sweep: ANSI-clean stderr. The pre-fix surfaced
+        # the raw `stderr` field; MCP clients then had to strip escape
+        # codes themselves to render the message. `stderr_plain` is
+        # already computed in `_run_zh`.
+        "stderr": _stderr_plain(r),
     }
 
 
 def _planning_remove_children(noun: str, parent: int, children: list[int],
                               repo_path: str) -> dict:
     if not children:
+        # v1.9.3 pattern-sweep: include `outcome` for shape parity.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
+                "stderr_plain": "issue_numbers must be non-empty",
                 "parent": parent, "removed": [], "removed_requested": [],
-                "partial_applied": False, "raw": ""}
+                "partial_applied": False, "outcome": "fail", "raw": ""}
     args = [noun, "remove", str(parent)] + [str(n) for n in children]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: same partial signal as the add path.
     # v1.9.2 round-2 (PR #27) finding #5: same removed/removed_requested
     # split — on partial, `removed` is empty (verify via
     # subissue_list), `removed_requested` is the input list always.
+    # v1.9.3 pattern-sweep finding #1: noop must NOT overstate `removed`.
     partial_applied = _safe_int(r.get("exit_code")) == 2
+    outcome = _parse_outcome_sentinel(_stderr_plain(r))
+    if outcome is None:
+        outcome = "partial" if partial_applied else ("ok" if r["ok"] else "fail")
+    is_landed = outcome == "ok"
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
+        "outcome": outcome,
         "parent": parent,
-        "removed": children if r["ok"] else [],
+        "removed": children if is_landed else [],
         "removed_requested": children,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2460,7 +2590,7 @@ def _planning_close(noun: str, number: int, comment: str,
         "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -2473,7 +2603,7 @@ def _planning_reopen(noun: str, number: int, repo_path: str) -> dict:
         "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
-        "stderr": r["stderr"],
+        "stderr": _stderr_plain(r),
     }
 
 
@@ -3099,8 +3229,11 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
 
     `outcome="noop"` is the (success=0, failed=0) case — the API neither
     added nor rejected anything, typically because every requested child
-    was already linked to this parent. `ok` is false so an LLM caller
-    cannot confuse it with a successful add.
+    was already linked to this parent. The bash CLI exits 0 here (round-4
+    #5 idempotent-success), and `ok=True` reflects "desired state already
+    holds." Branch on `outcome` to distinguish fresh adds from
+    already-linked: agents that care about side effects (e.g. announcing
+    "linked N children") should check `outcome == "ok"`, not just `ok`.
 
     Args:
         parent_number: Issue number of the parent.
@@ -3264,9 +3397,11 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     consolidated mismatch report rather than bailing at the first error.
 
     `outcome="noop"` (success=0, failed=0 from the API after pre-flight
-    validation passed) is reported with `ok=False` — that combination is
-    an API-side oddity (e.g. a race where someone else unlinked between
-    pre-flight and mutation) and shouldn't look like success.
+    validation passed) is reported with `ok=True` to match the round-4 #5
+    idempotent-success contract: the desired post-state ("not linked")
+    already holds. The combination is an API-side oddity (e.g. a race
+    where someone else unlinked between pre-flight and mutation), so
+    callers that care should branch on `outcome` and re-list the parent.
 
     Args:
         parent_number: Issue number of the parent.
@@ -3417,8 +3552,12 @@ def subissue_reorder(child_number: int, position: str,
         dict with:
             ok: bool — true iff outcome == "ok"
             child_number: int
+            parent: int | None — same value as parent_number; v1.9.3
+                pattern-sweep added the alias for cross-tool consistency
+                with subissue_add_children / subissue_remove_children
+                (round-4 #2). Use this for portable code.
             parent_number: int | None — resolved from the child's
-                parentIssue
+                parentIssue; legacy field kept for back-compat.
             position: str — normalized human form, e.g. "top",
                 "after #101"
             outcome: "ok" | "noop" | "fail"
@@ -3427,7 +3566,8 @@ def subissue_reorder(child_number: int, position: str,
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
         return {**err, "child_number": child_number,
-                "parent_number": None, "position": position,
+                "parent": None, "parent_number": None,
+                "position": position,
                 "outcome": "fail"}
     from zh_graphql_ops import reorder_sub_issue  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
@@ -3437,18 +3577,27 @@ def subissue_reorder(child_number: int, position: str,
             sibling_number=sibling_number,
         )
     except ZhApiError as e:
+        # v1.9.3 pattern-sweep finding #12: emit the `parent` alias for
+        # cross-tool consistency with subissue_add_children /
+        # subissue_remove_children (round-4 #2). Same value as
+        # parent_number; the alias lets agents that pass results
+        # between subissue_* tools key off a uniform "parent" field
+        # rather than swapping field names per call site.
         return {
             "ok": False,
             "child_number": child_number,
+            "parent": None,
             "parent_number": None,
             "position": position,
             "outcome": "fail",
             "stderr": str(e),
         }
+    _parent_resolved = result.get("parent_number")
     return {
         "ok": result.get("ok", False),
         "child_number": child_number,
-        "parent_number": result.get("parent_number"),
+        "parent": _parent_resolved,
+        "parent_number": _parent_resolved,
         "position": result.get("position", position),
         "outcome": result.get("outcome", "fail"),
         "stderr": result.get("error") or "",

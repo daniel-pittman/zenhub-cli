@@ -986,10 +986,24 @@ def test_gh_errors_gate_warns_on_populated_object() -> None:
 # Same drift problem as the _SET_TYPE_PARTIAL_MSG_SNIPPET deletion
 # above: the snippets asserted `returncode == 1` against their own
 # embedded gate, but round-6 #4 moved production to `exit 2`. The
-# round-6 `_SET_TYPE_EXIT_2_SNIPPET` (still in this file, further
-# down) plus the new
-# tests/test_zh_production_regression.py::test_structural_guarantee_set_type_exits_2_not_1_on_partial
-# pin the contract against PRODUCTION cmd_set_type from v1.9.2 on.
+# replacement coverage is in tests/test_zh_production_regression.py,
+# against PRODUCTION cmd_set_type rather than a parallel snippet:
+#
+# v1.9.3 pattern-sweep finding #15: corrected the replacement-test
+# references. The original deletion comment named ONLY
+# `test_structural_guarantee_set_type_exits_2_not_1_on_partial`, which
+# only covers the partial branch. The full branch coverage now lives
+# across:
+#   * Partial via failedIssues (exit 2):
+#       test_structural_guarantee_set_type_exits_2_not_1_on_partial
+#   * Partial via githubErrors (exit 2):
+#       test_round2_f7_set_type_partial_via_github_errors_only_exits_2
+#   * Hard failure (exit 1):
+#       test_round2_f7_set_type_success_count_zero_exits_1
+#   * Clean success (exit 0):
+#       test_round3_f6_set_type_clean_success_exits_0
+# All of these are production-sourced and supersede the deleted
+# snippet-only coverage.
 
 
 # v1.9.1 item #4: zh_fetch_issue_types must filter isEnabled=false rows so
@@ -1566,12 +1580,19 @@ def test_create_json_priority_requested_but_not_confirmed() -> None:
 # `returncode == 1` against its own embedded copy of cmd_set_type's
 # partial branch, but round-6 #4 changed production to exit 2. The
 # snippet kept passing against itself, creating a contradictory spec
-# alongside the round-6 _SET_TYPE_EXIT_2_SNIPPET that pins the new
-# behavior. Both message-wording assertions (Partially applied /
-# Verify with / Failed to set type) and the exit-code contract are
-# now exercised against PRODUCTION cmd_set_type by
-# tests/test_zh_production_regression.py
-# (test_structural_guarantee_set_type_exits_2_not_1_on_partial).
+# alongside the (now-also-deleted, v1.9.3 #11) _SET_TYPE_EXIT_2_SNIPPET.
+# Both message-wording assertions (Partially applied / Verify with /
+# Failed to set type) and the exit-code contract are now exercised
+# against PRODUCTION cmd_set_type in
+# tests/test_zh_production_regression.py.
+#
+# v1.9.3 pattern-sweep finding #15: corrected the replacement-test
+# references. Partial-branch wording is pinned by
+# test_structural_guarantee_set_type_exits_2_not_1_on_partial and
+# test_round2_f7_set_type_partial_via_github_errors_only_exits_2;
+# clean-success wording by test_round3_f6_set_type_clean_success_exits_0;
+# hard-failure wording by test_round2_f7_set_type_success_count_zero_exits_1.
+# All are production-sourced.
 
 
 # ===========================================================================
@@ -2523,72 +2544,32 @@ def test_update_normalizer_space_form_still_works() -> None:
     assert "TITLE:Foo" in r.stdout
 
 
-# Round-6 finding #4: cmd_set_type partial branch must `warn` + `exit 2`
-# (the divergence-only partial convention), not `error` + `exit 1`.
-_SET_TYPE_EXIT_2_SNIPPET = r"""
-set -euo pipefail
-response="$1"
-issue_num="42"
-warn() { echo "WARN: $1" >&2; }
-error() { echo "ERROR: $1" >&2; exit 1; }
-
-success_count=$(echo "$response" | jq -r '.data.changeIssueTypeOfIssues.successCount // 0')
-failed_count=$(echo "$response" | jq -r '(.data.changeIssueTypeOfIssues.failedIssues // []) | length')
-gh_errors=$(echo "$response" | jq -c '.data.changeIssueTypeOfIssues.githubErrors // {}')
-gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
-
-if [[ "$success_count" -lt 1 ]]; then
-    error "Failed to set type"
-fi
-if [[ "$failed_count" -gt 0 ]] || [[ "$gh_errors_len" -gt 0 ]]; then
-    warn "Partially applied"
-    exit 2
-fi
-echo "CLEAN_SUCCESS"
-"""
-
-
-def _set_type_exit_code(response: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", "-c", _SET_TYPE_EXIT_2_SNIPPET, "_", response],
-        capture_output=True, text=True, check=False,
-    )
-
-
-def test_set_type_partial_exits_2_not_1() -> None:
-    """The partial-applied branch must use the divergence convention
-    (exit 2 = re-verify, change already landed) so MCP wrappers can
-    distinguish from real failures (exit 1 = safe to retry). Round-6
-    #4.
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
-            '"failedIssues":[],"githubErrors":[{"code":"X"}]}}}')
-    r = _set_type_exit_code(resp)
-    assert r.returncode == 2, (
-        "Partial-applied must exit 2 (divergence), not 1 (real failure)."
-    )
-    assert "WARN: Partially applied" in r.stderr
-    assert "ERROR" not in r.stderr
-
-
-def test_set_type_zero_count_exits_1() -> None:
-    """Real failure (successCount=0) still exits 1, the hard-failure
-    code.
-    """
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":0,'
-            '"failedIssues":[{"number":42}],"githubErrors":[]}}}')
-    r = _set_type_exit_code(resp)
-    assert r.returncode == 1
-    assert "ERROR: Failed to set type" in r.stderr
-
-
-def test_set_type_clean_success_exits_0() -> None:
-    """Clean success path is unchanged: exit 0."""
-    resp = ('{"data":{"changeIssueTypeOfIssues":{"successCount":1,'
-            '"failedIssues":[],"githubErrors":[]}}}')
-    r = _set_type_exit_code(resp)
-    assert r.returncode == 0
-    assert "CLEAN_SUCCESS" in r.stdout
+# v1.9.3 pattern-sweep finding #11: DELETED legacy `_SET_TYPE_EXIT_2_SNIPPET`
+# and its three companion tests
+# (test_set_type_partial_exits_2_not_1,
+#  test_set_type_zero_count_exits_1,
+#  test_set_type_clean_success_exits_0).
+#
+# The snippet was a parallel re-implementation of the cmd_set_type gate
+# that ran against its own embedded copy of the production logic — a
+# class of test that pins the snippet's behavior, not the real CLI's,
+# and silently drifts when production changes (same drift problem as
+# round-7 #15). All three branches the snippet exercised are now
+# covered against PRODUCTION cmd_set_type in
+# tests/test_zh_production_regression.py:
+#
+#   * Clean success (exit 0):
+#       test_round3_f6_set_type_clean_success_exits_0
+#   * Partial via failedIssues (exit 2):
+#       test_structural_guarantee_set_type_exits_2_not_1_on_partial
+#   * Partial via githubErrors (exit 2):
+#       test_round2_f7_set_type_partial_via_github_errors_only_exits_2
+#   * Hard failure / successCount=0 (exit 1):
+#       test_round2_f7_set_type_success_count_zero_exits_1
+#
+# The production-sourced tests use the `run_zh_with_stubs` harness and
+# stub only the GraphQL layer, leaving the gate logic to be exercised
+# from real cmd_set_type. That is the contract we ship.
 
 
 # Round-6 finding #5: cmd_create parent-wire addSubIssues envelope.
