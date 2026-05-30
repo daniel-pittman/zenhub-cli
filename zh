@@ -30,13 +30,31 @@ CONFIG_FILE="${CONFIG_DIR}/config"
 ZENHUB_API="https://api.zenhub.com/public/graphql"
 
 # Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-BOLD='\033[1m'
+#
+# v1.9.2 round-3 (PR #27) finding #9: honor the NO_COLOR informal
+# standard (https://no-color.org). When NO_COLOR is set to ANY
+# non-empty value, suppress every ANSI escape so the output is plain
+# text. Tests can set NO_COLOR=1 to skip the ANSI-strip helper, and
+# users on terminals that don't render ANSI (or who prefer plain
+# output) get a clean rendering. The variable is checked once at
+# script-load time; we don't re-evaluate per-call.
+if [[ -n "${NO_COLOR:-}" ]]; then
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    NC=''
+    BOLD=''
+else
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    NC='\033[0m' # No Color
+    BOLD='\033[1m'
+fi
 
 # =============================================================================
 # Helper Functions
@@ -71,6 +89,34 @@ info() {
 
 success() {
     printf "${GREEN}\xe2\x9c\x93${NC} %s\n" "$1"
+}
+
+# v1.9.2 round-3 (PR #27) finding #5: build a single-line cause-hint
+# from a possibly-multi-line stderr capture so post-create envelope
+# warns can include the actionable detail (e.g. ZenHub's
+# "Error: ZenHub API error:\n  Hint: regenerate at https://...")
+# rather than only the header line. Collapses internal newlines to
+# "; ", strips ANSI escapes, drops empty lines, caps at 240 chars
+# with a trailing "..." marker if truncated. Reads from a file path
+# (which may be /dev/null per the round-1 #2 fail-soft fallback);
+# returns empty when the file is missing / empty / /dev/null.
+zh_cause_hint() {
+    local _f="$1"
+    if [[ -z "$_f" || "$_f" == "/dev/null" || ! -s "$_f" ]]; then
+        printf '%s' ""
+        return 0
+    fi
+    # Strip ANSI, drop empties, join with "; ", cap at 240 chars.
+    local _raw
+    _raw=$(LC_ALL=C sed -E $'s/\033\\[[0-9;]*[a-zA-Z]//g' "$_f" 2>/dev/null \
+        | awk 'NF>0' \
+        | paste -sd';' - \
+        | tr -s ';' \
+        | sed -e 's/;/; /g' 2>/dev/null || true)
+    if [[ ${#_raw} -gt 240 ]]; then
+        _raw="${_raw:0:237}..."
+    fi
+    printf '%s' "$_raw"
 }
 
 # Lowercase a string portably. bash 3.2 (macOS default, and a CI matrix
@@ -2775,7 +2821,7 @@ Examples:
         local _sub_err_file
         _sub_err_file=$(mktemp -t zh_subwire.XXXXXX 2>/dev/null) || _sub_err_file=/dev/null
         sub_response=$(zh_graphql "$sub_mutation" "$sub_vars" 2>"$_sub_err_file") || sub_response=""
-        sub_err=$(head -n 1 "$_sub_err_file" 2>/dev/null || true)
+        sub_err=$(zh_cause_hint "$_sub_err_file")
         [[ "$_sub_err_file" != "/dev/null" ]] && rm -f "$_sub_err_file" || true
         if [[ -n "$sub_response" ]]; then
             sub_ok=$(echo "$sub_response" | jq -r '.data.addSubIssues.successCount // 0')
@@ -2830,7 +2876,7 @@ Examples:
         local _est_err_file
         _est_err_file=$(mktemp -t zh_estwire.XXXXXX 2>/dev/null) || _est_err_file=/dev/null
         est_result=$(zh_graphql "$est_mutation" "$est_vars" 2>"$_est_err_file") || est_result=""
-        est_err=$(head -n 1 "$_est_err_file" 2>/dev/null || true)
+        est_err=$(zh_cause_hint "$_est_err_file")
         [[ "$_est_err_file" != "/dev/null" ]] && rm -f "$_est_err_file" || true
         if [[ -n "$est_result" ]]; then
             estimate_applied="true"
@@ -2876,7 +2922,7 @@ Examples:
         local _pipelines_err_file
         _pipelines_err_file=$(mktemp -t zh_pipelookup.XXXXXX 2>/dev/null) || _pipelines_err_file=/dev/null
         pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars" 2>"$_pipelines_err_file") || pipelines_response=""
-        pipelines_err=$(head -n 1 "$_pipelines_err_file" 2>/dev/null || true)
+        pipelines_err=$(zh_cause_hint "$_pipelines_err_file")
         [[ "$_pipelines_err_file" != "/dev/null" ]] && rm -f "$_pipelines_err_file" || true
         local pipeline_id=""
         if [[ -n "$pipelines_response" ]]; then
@@ -2907,7 +2953,7 @@ Examples:
             local _move_err_file
             _move_err_file=$(mktemp -t zh_movewire.XXXXXX 2>/dev/null) || _move_err_file=/dev/null
             move_result=$(zh_graphql "$move_mutation" "$move_vars" 2>"$_move_err_file") || move_result=""
-            move_err=$(head -n 1 "$_move_err_file" 2>/dev/null || true)
+            move_err=$(zh_cause_hint "$_move_err_file")
             [[ "$_move_err_file" != "/dev/null" ]] && rm -f "$_move_err_file" || true
             if [[ -n "$move_result" ]]; then
                 pipeline_set="$pipeline"
@@ -3003,7 +3049,7 @@ Examples:
         local _pi_err_file
         _pi_err_file=$(mktemp -t zh_pilookup.XXXXXX 2>/dev/null) || _pi_err_file=/dev/null
         pi_lookup_response=$(zh_graphql "$pi_lookup_query" "$pi_lookup_vars" 2>"$_pi_err_file") || pi_lookup_response=""
-        pi_lookup_err=$(head -n 1 "$_pi_err_file" 2>/dev/null || true)
+        pi_lookup_err=$(zh_cause_hint "$_pi_err_file")
         [[ "$_pi_err_file" != "/dev/null" ]] && rm -f "$_pi_err_file" || true
         if [[ -n "$pi_lookup_response" ]]; then
             pipeline_issue_id=$(echo "$pi_lookup_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
@@ -3030,7 +3076,7 @@ Examples:
             local _prio_err_file
             _prio_err_file=$(mktemp -t zh_priowire.XXXXXX 2>/dev/null) || _prio_err_file=/dev/null
             prio_response=$(zh_graphql "$prio_mutation" "$prio_vars" 2>"$_prio_err_file") || prio_response=""
-            prio_err=$(head -n 1 "$_prio_err_file" 2>/dev/null || true)
+            prio_err=$(zh_cause_hint "$_prio_err_file")
             [[ "$_prio_err_file" != "/dev/null" ]] && rm -f "$_prio_err_file" || true
             if [[ -n "$prio_response" ]]; then
                 prio_applied=$(echo "$prio_response" | jq -r '.data.setPriorityOnPipelineIssues.pipelineIssues[0].priority.name // empty')
@@ -3666,7 +3712,7 @@ Examples:
     _resp_err_file=$(mktemp -t zh_settype.XXXXXX 2>/dev/null) || _resp_err_file=/dev/null
     response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_resp_err_file") || response=""
     if [[ "$_resp_err_file" != "/dev/null" ]]; then
-        response_err=$(head -n 1 "$_resp_err_file" 2>/dev/null || true)
+        response_err=$(zh_cause_hint "$_resp_err_file")
         rm -f "$_resp_err_file"
     fi
     if [[ -z "$response" ]]; then
@@ -3877,6 +3923,32 @@ cmd_hierarchy_create() {
                 # the user's intent lost. Reject up-front. Review finding
                 # round-3 #2.
                 error "-t conflicts with the noun type ${type_name}. Do not pass -t to 'zh ${display_noun} create'; use 'zh create -t <type>' for an explicit type or 'zh type <issue#> <name>' to retype after create."
+                ;;
+            -l|--label|--labels|-p|--pipeline|-a|--assign|--assignee|-e|--estimate|-b|--body|-f|--file|--body-file|--parent|--priority)
+                # v1.9.2 round-3 (PR #27) finding #3: consume value-
+                # taking flags + their value as a 2-token unit so the
+                # value never reaches `*)` and flips _h_title_seen.
+                # Pre-fix, `zh epic create -l urgent "--rotate=foo"`
+                # passed `-l` through *) (it's -* prefixed, no flip),
+                # then `urgent` (the value, NOT -* prefixed) flipped
+                # the flag, and the next iteration's `--rotate=foo`
+                # got split as a flag because the title was "seen".
+                # cmd_create then captured `--rotate` as the title
+                # and silently dropped the user's text — the exact
+                # round-7 #6 failure mode this arm closes.
+                if [[ $# -lt 2 ]]; then
+                    error "Option ${1} requires a value"
+                fi
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
+            -q|--json|--quiet|--stdin)
+                # v1.9.2 round-3 (PR #27) finding #3: similarly,
+                # explicit boolean-flag arm so the next token never
+                # gets mis-classified as the boolean's "value" and
+                # then flipped to title.
+                passthrough+=("$1")
+                shift
                 ;;
             *)
                 # v1.9.2 round-7 finding #6: track whether a title (the
@@ -5955,10 +6027,22 @@ Example: zh subissue add 42 100 101"
     else
         outcome="ok"
     fi
+    # v1.9.2 round-3 (PR #27) finding #2: align partial-applied
+    # exit-code convention with cmd_set_type and the rest of the
+    # v1.9.x cycle. outcome=partial (some succeeded, some failed)
+    # is exit 2, not exit 1. This makes the bash CLI's exit code
+    # match what `subissue_add_children` MCP returns
+    # (partial_applied=True) and what `_planning_add_children`
+    # (which keys partial_applied on exit==2) reports. The old gate
+    # collapsed any failed_count>0 to exit 1, which made the bash
+    # side treat partial-success as full failure, silently
+    # contradicting the MCP-GraphQL-direct surface.
     if [[ "$outcome" == "ok" ]]; then
         :  # exit 0 (implicit)
-    elif [[ "$failed_count" -gt 0 ]]; then
-        exit 1  # real failure
+    elif [[ "$outcome" == "partial" ]]; then
+        exit 2  # partial-applied: some succeeded, agent should not retry blindly
+    elif [[ "$outcome" == "fail" ]]; then
+        exit 1  # all-fail: safe to retry
     elif [[ "$outcome" == "noop" ]]; then
         exit 1  # zero positives = real failure (mirrors cmd_sprint_remove)
     else
@@ -6219,10 +6303,17 @@ state with 'zh subissue list ${stripped_parent}'."
     else
         outcome="ok"
     fi
+    # v1.9.2 round-3 (PR #27) finding #2: align partial exit code
+    # with cmd_subissue_add (see comment there). outcome=partial is
+    # exit 2 so MCP _planning_remove_children correctly reports
+    # partial_applied=True and matches subissue_remove_children's
+    # GraphQL-direct contract.
     if [[ "$outcome" == "ok" ]]; then
         :  # exit 0 (implicit)
-    elif [[ "$failed_count" -gt 0 ]]; then
-        exit 1  # real failure
+    elif [[ "$outcome" == "partial" ]]; then
+        exit 2  # partial-applied: some succeeded, agent should not retry blindly
+    elif [[ "$outcome" == "fail" ]]; then
+        exit 1  # all-fail: safe to retry
     elif [[ "$outcome" == "noop" ]]; then
         exit 1  # zero positives = real failure
     else

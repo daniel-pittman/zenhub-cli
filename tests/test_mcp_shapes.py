@@ -114,7 +114,7 @@ def test_sprint_remove_full_shape_includes_new_fields():
 # ---- subissue_add_children / subissue_remove_children (round-3 #4) -------
 
 SUBISSUE_MUTATION_KEYS = {
-    "ok", "parent_number", "outcome",
+    "ok", "partial_applied", "parent_number", "outcome",
     "success_count", "failed_count", "succeeded", "failed",
     "github_errors", "partial_success_warning", "stderr",
 }

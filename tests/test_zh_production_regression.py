@@ -716,8 +716,38 @@ def test_round7_f7_initiative_create_blocked_response_no_keyerror() -> None:
     )
 
 
+def _assert_blocked_response_full_shape(out: dict) -> None:
+    """Shared assertion for the planning-create blocked-response shape.
+
+    v1.9.2 round-3 (PR #27) finding #13: use identical assertions
+    across initiative / project / subtask siblings so a regression
+    setting `estimate_requested=""` (falsy but not None) is caught
+    by every test, not just the initiative variant. Same `_planning_create`
+    code path, identical contract.
+    """
+    assert out["blocked"] is True
+    # Non-stderr scalar keys: None placeholder.
+    for key in ("number", "url", "type", "pipeline", "parent",
+                "estimate", "estimate_requested",
+                "priority", "priority_requested"):
+        assert key in out, f"blocked dict missing {key!r}"
+        assert out[key] is None, (
+            f"key {key!r} should be None on blocked path, got {out[key]!r}"
+        )
+    assert "raw" in out and out["raw"] == "", (
+        f"blocked raw must be empty string, got {out.get('raw')!r}"
+    )
+    assert "stderr" in out and out["stderr"], (
+        "blocked stderr must carry the refusal message"
+    )
+
+
 def test_round7_f7_project_create_blocked_response_no_keyerror() -> None:
-    """Symmetric pin for project_create (round-7 #7)."""
+    """Symmetric pin for project_create (round-7 #7).
+
+    v1.9.2 round-3 #13: now uses the same full-shape helper as the
+    initiative test.
+    """
     from unittest.mock import patch
     import mcp_server
 
@@ -733,21 +763,15 @@ def test_round7_f7_project_create_blocked_response_no_keyerror() -> None:
             out = mcp_server.project_create(
                 title="X", description="y",
             )
-    assert out["blocked"] is True
-    # v1.9.2 round-1 (PR #27) finding #12: assert the full
-    # documented key set the create_issue docstring promises, not
-    # just the first six. A regression dropping estimate_requested
-    # / priority / priority_requested / raw / stderr from the
-    # blocked-path dict is exactly the contract-drift family F7
-    # exists to pin.
-    for key in ("number", "url", "type", "pipeline", "parent",
-                "estimate", "estimate_requested",
-                "priority", "priority_requested", "raw", "stderr"):
-        assert key in out, f"blocked dict missing {key!r}"
+    _assert_blocked_response_full_shape(out)
 
 
 def test_round7_f7_subtask_create_blocked_response_no_keyerror() -> None:
-    """Symmetric pin for subtask_create (round-7 #7)."""
+    """Symmetric pin for subtask_create (round-7 #7).
+
+    v1.9.2 round-3 #13: now uses the same full-shape helper as the
+    initiative test.
+    """
     from unittest.mock import patch
     import mcp_server
 
@@ -763,17 +787,7 @@ def test_round7_f7_subtask_create_blocked_response_no_keyerror() -> None:
             out = mcp_server.subtask_create(
                 title="X", description="y",
             )
-    assert out["blocked"] is True
-    # v1.9.2 round-1 (PR #27) finding #12: assert the full
-    # documented key set the create_issue docstring promises, not
-    # just the first six. A regression dropping estimate_requested
-    # / priority / priority_requested / raw / stderr from the
-    # blocked-path dict is exactly the contract-drift family F7
-    # exists to pin.
-    for key in ("number", "url", "type", "pipeline", "parent",
-                "estimate", "estimate_requested",
-                "priority", "priority_requested", "raw", "stderr"):
-        assert key in out, f"blocked dict missing {key!r}"
+    _assert_blocked_response_full_shape(out)
 
 
 # ---- Finding #8: set_issue_type empty issue_type omits partial_applied -----
@@ -882,6 +896,229 @@ def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
         )
     assert out["partial_applied"] is False
     assert out["ok"] is True
+
+
+def test_round3_f1_comment_empty_message_returns_full_key_set() -> None:
+    """v1.9.2 round-3 (PR #27) finding #1: `comment()` empty-message
+    validation was the last surviving 2-key early-return after the
+    PR fixed create_issue / _planning_create / _planning_update /
+    set_issue_type across rounds 1-2.
+
+    A client uniformly reading `out["number"]` per the docstring
+    should not KeyError on `comment(42, "")`.
+    """
+    import mcp_server
+
+    out = mcp_server.comment(number=42, message="")
+    assert out["ok"] is False
+    for key in ("number", "raw", "stderr"):
+        assert key in out, (
+            f"comment empty-message validation missing {key!r} "
+            f"(round-3 #1); got {sorted(out.keys())!r}"
+        )
+    assert out["number"] == 42
+    assert out["stderr"] == "message must be non-empty"
+
+
+def test_round3_f1_comment_whitespace_message_returns_full_key_set() -> None:
+    """Symmetric: whitespace-only message is treated the same."""
+    import mcp_server
+
+    out = mcp_server.comment(number=42, message="   ")
+    assert out["ok"] is False
+    for key in ("number", "raw", "stderr"):
+        assert key in out
+
+
+def test_round3_f2_subissue_add_children_partial_returns_ok_true() -> None:
+    """v1.9.2 round-3 (PR #27) finding #2: the MCP `subissue_add_children`
+    wrapper aligns its `ok` semantic with `_planning_add_children` and
+    `set_issue_type`. Both wrap the same `addSubIssues` mutation, so
+    the same partial result MUST yield the same `ok` value across
+    both surfaces — otherwise an agent that routes between them
+    sees contradictory signals and double-attaches on retry.
+
+    Contract from v1.9.2 round-3 on:
+      - outcome="ok"      → ok=True,  partial_applied=False
+      - outcome="partial" → ok=True,  partial_applied=True
+      - outcome="noop"    → ok=False, partial_applied=False
+      - outcome="fail"    → ok=False, partial_applied=False
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    fake_ctx_result = ("acme/widgets", None)
+    fake_partial = {
+        "ok": False,  # The lower-level zh_graphql_ops still uses ok=False on partial
+        "outcome": "partial",
+        "success_count": 2,
+        "failed_count": 1,
+        "succeeded": [100, 101],
+        "failed": [{"number": 999, "owner": "acme", "name": "widgets"}],
+        "unaccounted": [],
+        "failed_unknown_count": 0,
+        "github_errors": None,
+        "partial_success_warning": "1 input failed",
+        "error": None,
+    }
+
+    with patch.object(mcp_server, "_resolve_ctx",
+                      return_value=(object(), None)):
+        with patch("zh_graphql_ops.add_sub_issues",
+                   return_value=fake_partial):
+            out = mcp_server.subissue_add_children(42, [100, 101, 999])
+    assert out["outcome"] == "partial"
+    assert out["partial_applied"] is True, (
+        f"partial outcome must surface partial_applied=True; got {out!r}"
+    )
+    assert out["ok"] is True, (
+        f"partial outcome must yield ok=True for parity with "
+        f"_planning_add_children (round-3 #2); got ok={out['ok']!r}"
+    )
+
+
+def test_round3_f2_subissue_remove_children_partial_returns_ok_true() -> None:
+    """Symmetric pin for the remove side. Same contract."""
+    from unittest.mock import patch
+    import mcp_server
+
+    fake_partial = {
+        "ok": False,
+        "outcome": "partial",
+        "success_count": 2,
+        "failed_count": 1,
+        "succeeded": [100, 101],
+        "failed": [{"number": 999, "owner": "acme", "name": "widgets"}],
+        "unaccounted": [],
+        "failed_unknown_count": 0,
+        "github_errors": None,
+        "partial_success_warning": "1 input failed",
+        "error": None,
+    }
+    with patch.object(mcp_server, "_resolve_ctx",
+                      return_value=(object(), None)):
+        with patch("zh_graphql_ops.remove_sub_issues",
+                   return_value=fake_partial):
+            out = mcp_server.subissue_remove_children(42, [100, 101, 999])
+    assert out["outcome"] == "partial"
+    assert out["partial_applied"] is True
+    assert out["ok"] is True
+
+
+def test_round3_f2_subissue_add_children_fail_returns_ok_false() -> None:
+    """Negative regression guard: outcome=fail must keep ok=False."""
+    from unittest.mock import patch
+    import mcp_server
+
+    fake_fail = {
+        "ok": False,
+        "outcome": "fail",
+        "success_count": 0,
+        "failed_count": 3,
+        "succeeded": [],
+        "failed": [
+            {"number": 100, "owner": "acme", "name": "widgets"},
+            {"number": 101, "owner": "acme", "name": "widgets"},
+            {"number": 102, "owner": "acme", "name": "widgets"},
+        ],
+        "unaccounted": [],
+        "failed_unknown_count": 0,
+        "github_errors": None,
+        "partial_success_warning": None,
+        "error": None,
+    }
+    with patch.object(mcp_server, "_resolve_ctx",
+                      return_value=(object(), None)):
+        with patch("zh_graphql_ops.add_sub_issues",
+                   return_value=fake_fail):
+            out = mcp_server.subissue_add_children(42, [100, 101, 102])
+    assert out["outcome"] == "fail"
+    assert out["partial_applied"] is False
+    assert out["ok"] is False
+
+
+def test_round3_f3_hierarchy_create_short_flag_then_literal_title() -> None:
+    """v1.9.2 round-3 (PR #27) finding #3: `-l urgent` (short-form
+    value flag) before a literal `--rotate=...`-style title must NOT
+    cause _h_title_seen to flip on the value-token.
+
+    Pre-fix: `zh epic create -l urgent "--rotate=enabled smoke test"`
+    passed `urgent` through *), which flipped _h_title_seen=true and
+    caused the title's `--*=*` to be split into `--rotate` /
+    `enabled smoke test`. cmd_create then captured `--rotate` as the
+    title and silently dropped the user's text.
+    """
+    stubs = r"""
+        load_config() { :; }
+        cmd_create() {
+            local title="" labels=""
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    -t|--type) shift 2;;
+                    -b|--body) shift 2;;
+                    -l|--label|--labels) labels="$2"; shift 2;;
+                    -p|--pipeline) shift 2;;
+                    -a|--assign|--assignee) shift 2;;
+                    -e|--estimate) shift 2;;
+                    -f|--file|--body-file) shift 2;;
+                    --parent|--priority) shift 2;;
+                    --json|--stdin|-q|--quiet) shift;;
+                    *)
+                        if [[ -z "$title" ]]; then
+                            title="$1"
+                        fi
+                        shift
+                        ;;
+                esac
+            done
+            echo "TITLE:${title}" >&2
+            echo "LABELS:${labels}" >&2
+        }
+    """
+    r = run_zh_with_stubs(
+        stubs,
+        'cmd_hierarchy_create "$@"',
+        args=["Epic", "epic", "-l", "urgent",
+              "--rotate=enabled smoke test"],
+    )
+    # cmd_create should see the FULL literal `--rotate=enabled smoke test`
+    # as the title, NOT the post-mangle `--rotate`.
+    assert "TITLE:--rotate=enabled smoke test" in r.stderr, (
+        f"hierarchy_create mangled the title when short-flag value "
+        f"preceded it (round-3 #3); stderr={r.stderr!r}"
+    )
+    assert "LABELS:urgent" in r.stderr, (
+        f"hierarchy_create dropped the -l value (round-3 #3); "
+        f"stderr={r.stderr!r}"
+    )
+
+
+def test_round3_f14_planning_remove_children_clean_success_partial_false() -> None:
+    """v1.9.2 round-3 (PR #27) finding #14: symmetric clean-success
+    regression guard for the remove side. A regression hardcoding
+    partial_applied=True (or inverting the conditional) in
+    _planning_remove_children would pass the partial-path test but
+    break clean-success semantics undetected without this sibling
+    test.
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    fake_result = {
+        "ok": True,
+        "stdout_plain": "Removed 2/2",
+        "stderr": "",
+        "exit_code": 0,
+    }
+    with patch.object(mcp_server, "_run_zh", return_value=fake_result):
+        out = mcp_server.epic_remove_children(
+            epic_number=42, issue_numbers=[100, 101],
+        )
+    assert out["partial_applied"] is False
+    assert out["ok"] is True
+    assert out["removed"] == [100, 101], (
+        f"clean-success removed must echo input, got {out['removed']!r}"
+    )
 
 
 # ---- Finding #11: _planning_update validation-path missing 'raw' -----------
@@ -1143,15 +1380,22 @@ def test_round2_f2_create_issue_empty_title_returns_full_key_set() -> None:
 
 
 def test_round2_f2_create_issue_empty_body_returns_full_key_set() -> None:
-    """Symmetric pin for the empty-body validation path."""
+    """Symmetric pin for the empty-body validation path.
+
+    v1.9.2 round-3 (PR #27) finding #12: include `stderr` in the
+    asserted key set so the sibling tests use identical assertions.
+    """
     import mcp_server
 
     out = mcp_server.create_issue(title="ok", body="")
     assert out["ok"] is False
     for key in ("number", "url", "type", "pipeline", "parent",
                 "estimate", "estimate_requested",
-                "priority", "priority_requested", "raw"):
-        assert key in out
+                "priority", "priority_requested", "raw", "stderr"):
+        assert key in out, (
+            f"create_issue empty-body validation missing {key!r}; "
+            f"got {sorted(out.keys())!r}"
+        )
 
 
 # ---- Round-2 finding #3: _planning_create empty-title validation shape -----
@@ -1183,17 +1427,23 @@ def test_round2_f3_epic_create_empty_title_returns_full_key_set() -> None:
 def test_round2_f3_initiative_create_empty_title_returns_full_key_set() -> None:
     """Symmetric pin across all four planning nouns to catch
     regressions in any one of them.
+
+    v1.9.2 round-3 (PR #27) finding #12: include `stderr` in the
+    asserted key set (was omitted, drifted from the epic test's
+    asserted set) AND iterate epic_create here too so all four
+    nouns share identical assertions.
     """
     import mcp_server
 
-    for fn in (mcp_server.initiative_create,
+    for fn in (mcp_server.epic_create,
+               mcp_server.initiative_create,
                mcp_server.project_create,
                mcp_server.subtask_create):
         out = fn(title="")
         assert out["ok"] is False
         for key in ("number", "url", "type", "pipeline", "parent",
                     "estimate", "estimate_requested",
-                    "priority", "priority_requested", "raw"):
+                    "priority", "priority_requested", "raw", "stderr"):
             assert key in out, (
                 f"{fn.__name__} empty-title validation missing {key!r} "
                 f"(round-2 #3); got {sorted(out.keys())!r}"
@@ -1234,6 +1484,37 @@ def test_round2_f7_set_type_partial_via_github_errors_only_exits_2() -> None:
         f"stderr={r.stderr!r}"
     )
     assert "Partially applied" in r.stderr
+
+
+def test_round3_f6_set_type_clean_success_exits_0() -> None:
+    """Round-3 #6: production-sourced coverage for the clean-success
+    path. successCount >= 1 with empty failedIssues + empty
+    githubErrors must exit 0 with the success wording. Closes the
+    last branch the legacy `_SET_TYPE_EXIT_2_SNIPPET` covered via a
+    parallel snippet — now exercised against production cmd_set_type.
+    """
+    stubs = r"""
+        load_config() { :; }
+        get_repo_info() { printf 'acme/widgets'; }
+        get_repo_id() { printf 'repo-gid-acme-widgets'; }
+        get_workspace_id() { printf 'ws-gid-backend'; }
+        zh_fetch_issue_types() { printf '[]'; }
+        zh_issue_type_id_from() { printf 'tid-epic'; }
+        zh_issue_type_names_from() { printf 'Epic'; }
+        zh_resolve_issue_id() { printf 'issue-gid-42'; }
+        zh_graphql() {
+            printf '%s' '{"data":{"changeIssueTypeOfIssues":{"successCount":1,"failedIssues":[],"githubErrors":[]}}}'
+        }
+    """
+    r = run_zh_with_stubs(stubs, 'cmd_set_type 42 Epic')
+    assert r.returncode == 0, (
+        f"clean success MUST exit 0; got rc={r.returncode}, "
+        f"stderr={r.stderr!r}, stdout={r.stdout!r}"
+    )
+    assert "Set type of #42 to Epic" in r.stdout, (
+        f"clean success must print the 'Set type' success line; "
+        f"got stdout={r.stdout!r}"
+    )
 
 
 def test_round2_f7_set_type_success_count_zero_exits_1() -> None:

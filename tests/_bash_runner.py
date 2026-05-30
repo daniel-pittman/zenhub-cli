@@ -89,6 +89,17 @@ def run_zh_with_stubs(
     """
     # Defaults that keep load_config and the helpers from reaching out:
     # ZH_TOKEN must be set or zh_graphql refuses to run.
+    #
+    # v1.9.2 round-3 (PR #27) finding #10: HOME points at an isolated
+    # per-call tempdir instead of /tmp so a stray /tmp/.config/zh/config
+    # (from another tenant on a shared CI host, or a prior test run)
+    # cannot silently override the harness-provided ZH_TOKEN / ZH_REPO
+    # / ZH_WORKSPACE via load_config's source step. The tempdir is
+    # left in place for inspection if a test fails (Python's GC will
+    # not auto-remove it); modern CI runners wipe scratch between
+    # jobs, so this does not leak across runs.
+    import tempfile
+    _isolated_home = tempfile.mkdtemp(prefix="zh-test-home-")
     env_defaults = {
         # PATH must include common locations so jq/gh/curl resolve if
         # tests actually invoke them (they shouldn't, but the harness
@@ -97,11 +108,13 @@ def run_zh_with_stubs(
         "ZH_TOKEN": "test-token-do-not-use",
         "ZH_REPO": "acme/widgets",
         "ZH_WORKSPACE": "TestWS",
-        # Keep config-file probing disabled by pointing at /tmp where
-        # there is no zh config; load_config tolerates this.
-        "HOME": "/tmp",
-        # Force-disable color so success / warn output is plain text
-        # the tests can match.
+        # Per-call isolated HOME so load_config cannot source a
+        # stray config file written by another process / tenant.
+        "HOME": _isolated_home,
+        # Honor the NO_COLOR informal standard. As of round-3 #9,
+        # `zh` now respects this and suppresses ANSI escapes when
+        # set, so tests can match plain text without strip helpers
+        # in NEW assertions (existing helpers stay for back-compat).
         "NO_COLOR": "1",
     }
     if extra_env:
@@ -129,11 +142,22 @@ def run_zh_with_stubs(
     if args:
         cmd.extend(args)
 
+    # v1.9.2 round-3 (PR #27) finding #7: inherit the parent
+    # environment so locale (LANG / LC_*), TMPDIR, TERM, USER,
+    # PYTHONIOENCODING and similar inherited vars survive. Pre-fix,
+    # `env=env_defaults` REPLACED the parent environment entirely;
+    # on a CI runner whose default locale is C, jq could emit ASCII-
+    # escaped sequences for the ✓ glyph in `success()`, and a missing
+    # TMPDIR forced mktemp onto /tmp regardless of developer setup.
+    # Explicit overrides still win because `**env_defaults` spreads
+    # AFTER os.environ in the merge.
+    import os as _os
+    merged_env = dict(_os.environ, **env_defaults)
     return subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        env=env_defaults,
+        env=merged_env,
         input=stdin,
         cwd=cwd or str(REPO_ROOT),
         timeout=timeout,

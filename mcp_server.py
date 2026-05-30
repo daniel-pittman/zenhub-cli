@@ -1825,7 +1825,16 @@ def comment(number: int, message: str, repo_path: str = "") -> dict:
         dict with: ok, number, raw, stderr.
     """
     if not message.strip():
-        return {"ok": False, "stderr": "message must be non-empty"}
+        # v1.9.2 round-3 (PR #27) finding #1: validation early-return
+        # must match the success-path key set (number, raw, stderr)
+        # so clients reading out["number"] / out["raw"] per the
+        # docstring do not KeyError on a bad-input call. Same drift
+        # family the PR closed for create_issue (round-2 #2),
+        # _planning_create (round-2 #3), _planning_update (round-7
+        # #11), and set_issue_type (round-7 #8). `comment()` was the
+        # surviving sibling.
+        return {"ok": False, "number": number, "raw": "",
+                "stderr": "message must be non-empty"}
     r = _run_zh(["comment", str(number), "-m", message],
                 cwd=_resolve_cwd(repo_path))
     return {
@@ -2013,7 +2022,7 @@ def set_issue_type(number: int, issue_type: str, repo_path: str = "") -> dict:
     # safe to retry, but a partial apply (exit 2) means the change
     # already landed and a retry would be wasted (or hit a no-op
     # error). Expose `partial_applied: True` so an agent can branch.
-    partial_applied = r.get("exit_code") == 2
+    partial_applied = int(r.get("exit_code") or 0) == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2327,7 +2336,7 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     #     if r["partial_applied"]: re-verify via subissue_list
     #     elif r["ok"]: log(f"Added {len(r['added'])} children")
     #     else: log(f"Failed (requested: {r['added_requested']})")
-    partial_applied = r.get("exit_code") == 2
+    partial_applied = int(r.get("exit_code") or 0) == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2351,7 +2360,7 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
     # v1.9.2 round-2 (PR #27) finding #5: same removed/removed_requested
     # split — on partial, `removed` is empty (verify via
     # subissue_list), `removed_requested` is the input list always.
-    partial_applied = r.get("exit_code") == 2
+    partial_applied = int(r.get("exit_code") or 0) == 2
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2369,8 +2378,15 @@ def _planning_close(noun: str, number: int, comment: str,
     if comment:
         args.append(comment)
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # v1.9.2 round-3 (PR #27) finding #8: include `partial_applied`
+    # for shape parity with set_issue_type and the planning-children
+    # wrappers. cmd_close uses `gh` and has no exit-2 partial today,
+    # so the field is always False here — but agents that uniformly
+    # read out["partial_applied"] on every write tool should not
+    # KeyError on a close.
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
@@ -2379,8 +2395,11 @@ def _planning_close(noun: str, number: int, comment: str,
 
 def _planning_reopen(noun: str, number: int, repo_path: str) -> dict:
     r = _run_zh([noun, "reopen", str(number)], cwd=_resolve_cwd(repo_path))
+    # v1.9.2 round-3 (PR #27) finding #8: same `partial_applied`
+    # shape-parity addition. Always False; reopen has no partial path.
     return {
         "ok": r["ok"],
+        "partial_applied": False,
         "number": number,
         "raw": r["stdout_plain"],
         "stderr": r["stderr"],
@@ -2980,7 +2999,19 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
 
     Returns:
         dict with:
-            ok: bool — true iff outcome == "ok"
+            ok: bool — true iff outcome in ("ok", "partial"). v1.9.2
+                round-3 #2: aligned with _planning_add_children and
+                set_issue_type so the same `addSubIssues` mutation
+                yields the same `ok` semantic across both MCP
+                surfaces. Branch on `partial_applied` first to
+                distinguish full-success from partial-applied.
+            partial_applied: bool — true iff outcome == "partial".
+                Mirrors set_issue_type's signal: the mutation
+                accepted on the ZenHub side but some inputs were
+                not confirmed. Agents that retry on ok=False MUST
+                check partial_applied first; retrying a partial
+                produces duplicate adds for the children that DID
+                land.
             parent_number: int
             outcome: "ok" | "partial" | "fail" | "noop"
             success_count: int — API-reported successCount
@@ -3031,6 +3062,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         # rejection. Mirrors the sprint-tool fix from `bef3313`.
         return {
             "ok": False,
+            "partial_applied": False,
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3045,7 +3077,8 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
-        return {**err, "parent_number": parent_number, "outcome": "fail",
+        return {**err, "partial_applied": False,
+                "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
                 "succeeded": [], "failed": [], "unaccounted": [],
                 "failed_unknown_count": 0,
@@ -3058,6 +3091,7 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     except ZhApiError as e:
         return {
             "ok": False,
+            "partial_applied": False,
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3070,10 +3104,20 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "partial_success_warning": None,
             "stderr": str(e),
         }
+    # v1.9.2 round-3 #2: align ok semantic with _planning_add_children
+    # and set_issue_type — `ok` is True on both full success and
+    # partial-applied so the same `addSubIssues` mutation does not
+    # yield contradictory `ok` values across the two MCP surfaces
+    # wrapping it. `partial_applied` carries the distinguishing
+    # signal so an agent that retries on ok=False does not retry a
+    # partial-success and double-attach the children that landed.
+    outcome = result.get("outcome", "fail")
+    partial_applied = outcome == "partial"
     return {
-        "ok": result.get("ok", False),
+        "ok": outcome in ("ok", "partial"),
+        "partial_applied": partial_applied,
         "parent_number": parent_number,
-        "outcome": result.get("outcome", "fail"),
+        "outcome": outcome,
         "success_count": result.get("success_count", 0),
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),
@@ -3107,7 +3151,11 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
 
     Returns:
         dict with:
-            ok: bool — true iff outcome == "ok"
+            ok: bool — true iff outcome in ("ok", "partial"). v1.9.2
+                round-3 #2: aligned with subissue_add_children's
+                semantic and the planning-children wrappers.
+            partial_applied: bool — true iff outcome == "partial".
+                Branch on this BEFORE ok to detect partials.
             parent_number: int
             outcome: "ok" | "partial" | "fail" | "noop"
             success_count: int
@@ -3142,6 +3190,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         # rejection. Mirrors the sprint-tool fix from `bef3313`.
         return {
             "ok": False,
+            "partial_applied": False,
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3156,7 +3205,8 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
         }
     ctx, err = _resolve_ctx(repo_path)
     if err is not None:
-        return {**err, "parent_number": parent_number, "outcome": "fail",
+        return {**err, "partial_applied": False,
+                "parent_number": parent_number, "outcome": "fail",
                 "success_count": 0, "failed_count": 0,
                 "succeeded": [], "failed": [], "unaccounted": [],
                 "failed_unknown_count": 0,
@@ -3169,6 +3219,7 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
     except ZhApiError as e:
         return {
             "ok": False,
+            "partial_applied": False,
             "parent_number": parent_number,
             "outcome": "fail",
             "success_count": 0,
@@ -3181,10 +3232,14 @@ def subissue_remove_children(parent_number: int, child_numbers: list[int],
             "partial_success_warning": None,
             "stderr": str(e),
         }
+    # v1.9.2 round-3 #2: align ok semantic — see subissue_add_children.
+    outcome = result.get("outcome", "fail")
+    partial_applied = outcome == "partial"
     return {
-        "ok": result.get("ok", False),
+        "ok": outcome in ("ok", "partial"),
+        "partial_applied": partial_applied,
         "parent_number": parent_number,
-        "outcome": result.get("outcome", "fail"),
+        "outcome": outcome,
         "success_count": result.get("success_count", 0),
         "failed_count": result.get("failed_count", 0),
         "succeeded": result.get("succeeded", []),

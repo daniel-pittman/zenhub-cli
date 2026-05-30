@@ -1777,7 +1777,7 @@ SUBISSUE_LIST_KEYS = {
 }
 
 SUBISSUE_MUTATION_KEYS = {
-    "ok", "parent_number", "outcome",
+    "ok", "partial_applied", "parent_number", "outcome",
     "success_count", "failed_count", "succeeded", "failed",
     "github_errors", "partial_success_warning", "stderr",
 }
