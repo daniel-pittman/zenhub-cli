@@ -212,8 +212,8 @@ def run_zh_with_stubs(
                 st = _os.stat(entry)
             except OSError:
                 continue
-            # Skip every world-writable directory. v1.9.3 round-2 (PR
-            # #29) finding #4: the previous sticky-bit carve-out was
+            # Skip every world-writable directory. v1.9.4 (PR
+            # #35) finding #4: the previous sticky-bit carve-out was
             # the wrong threat model — sticky prevents non-owners from
             # DELETING files, but does NOT prevent any local user from
             # CREATING a binary in the directory. A test running on a

@@ -987,7 +987,7 @@ def test_v193_planning_add_children_ok_outcome_credits_added() -> None:
 
 
 def test_v193_planning_add_children_missing_sentinel_falls_back() -> None:
-    """v1.9.3 round-2 (PR #29) finding #1 (tightened contract): an older zh that doesn't
+    """v1.9.4 finding #1 (tightened contract): an older zh that doesn't
     emit the sentinel falls back to inferred `outcome` (preserving the
     round-7 #10 partial signal off exit_code), BUT `added` defaults to
     [] because the inference can't distinguish ok from noop (both have
@@ -1014,7 +1014,7 @@ def test_v193_planning_add_children_missing_sentinel_falls_back() -> None:
         f"no sentinel + r['ok']=True falls back to outcome=ok; "
         f"got {out['outcome']!r}"
     )
-    # v1.9.3 round-2 (PR #29) finding #1: missing sentinel → added=[] (conservative).
+    # v1.9.4 finding #1: missing sentinel → added=[] (conservative).
     # The added_requested field still carries the input for traceability.
     assert out["added"] == [], (
         f"missing sentinel must NOT credit children as landed; "
@@ -1229,7 +1229,7 @@ def test_round3_f14_planning_remove_children_clean_success_partial_false() -> No
     from unittest.mock import patch
     import mcp_server
 
-    # v1.9.3 round-2 (PR #29) finding #1: clean-success requires the `__ZH_OUTCOME__:ok`
+    # v1.9.4 finding #1: clean-success requires the `__ZH_OUTCOME__:ok`
     # sentinel in stderr_plain to credit children as landed. Without it,
     # the wrapper defaults to added/removed=[] (conservative).
     fake_result = {
@@ -1645,7 +1645,7 @@ def test_v193_zh_cause_hint_pure_bash_strips_osc_st_terminator() -> None:
         err_file = pathlib.Path(tmp_dir) / "stderr.txt"
         err_file.write_text(osc_st)
 
-        # v1.9.3 round-2 (PR #29) finding #4: stub `command -v sed` inside the same
+        # v1.9.4 finding #4: stub `command -v sed` inside the same
         # bash process to force the pure-bash branch. No PATH munging,
         # no `which` dependency, no symlink dance. The function-stub
         # approach matches the rest of the harness pattern and works
@@ -1689,7 +1689,7 @@ def test_v193_top_level_write_tools_expose_partial_applied() -> None:
     reopen_issue were the named targets; this test sweeps the full
     write-tool surface.
 
-    v1.9.3 round-2 (PR #29) findings #1 + #2: create_issue and the
+    v1.9.4 findings #1 + #2: create_issue and the
     four planning-noun creates (epic_create, project_create,
     initiative_create, subtask_create) are the most-called write
     tools in the surface and were excluded from the original sweep,
@@ -1716,7 +1716,7 @@ def test_v193_top_level_write_tools_expose_partial_applied() -> None:
         ("set_estimate", lambda: mcp_server.set_estimate(42, "3")),
         ("set_priority", lambda: mcp_server.set_priority(42, "High")),
         ("block_issue", lambda: mcp_server.block_issue(42, 43)),
-        # v1.9.3 round-2 #1 + #2: create surfaces (most-called write
+        # v1.9.4 #1 + #2: create surfaces (most-called write
         # tools in the API). Skip duplicate check to avoid hitting the
         # similarity engine in this shape-only test.
         ("create_issue", lambda: mcp_server.create_issue(
@@ -1734,14 +1734,14 @@ def test_v193_top_level_write_tools_expose_partial_applied() -> None:
         for name, call in write_calls:
             out = call()
             assert "partial_applied" in out, (
-                f"{name} must expose partial_applied (v1.9.3 round-2 #1 + sweep); "
+                f"{name} must expose partial_applied (v1.9.4 #1 + sweep); "
                 f"got {sorted(out.keys())!r}"
             )
             assert out["partial_applied"] is False
 
 
 def test_v193_create_issue_validation_returns_include_partial_applied() -> None:
-    """v1.9.3 round-2 (PR #29) finding #1: the validation early-returns
+    """v1.9.4 finding #1: the validation early-returns
     (empty title, empty body) and the blocked path must also include
     partial_applied so the contract holds across every return path of
     create_issue / _planning_create.
@@ -1762,7 +1762,7 @@ def test_v193_create_issue_validation_returns_include_partial_applied() -> None:
 
 
 def test_v193_subissue_remove_emits_noop_outcome_sentinel() -> None:
-    """v1.9.3 round-2 (PR #29) finding #3: symmetric noop test for the
+    """v1.9.4 finding #3: symmetric noop test for the
     remove side. The add side has `test_v193_subissue_add_emits_noop_outcome_sentinel`
     but the remove side previously only had the partial test (with an
     inline note that pre-validation may block the noop path).
@@ -1792,12 +1792,12 @@ def test_v193_subissue_remove_emits_noop_outcome_sentinel() -> None:
     )
     assert "__ZH_OUTCOME__:noop" in r.stderr, (
         f"cmd_subissue_remove must emit __ZH_OUTCOME__:noop on stderr "
-        f"when the API no-ops (v1.9.3 round-2 #3). got stderr={r.stderr!r}"
+        f"when the API no-ops (v1.9.4 #3). got stderr={r.stderr!r}"
     )
 
 
 def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None:
-    """v1.9.3 round-2 (PR #29) findings #1 + #7: the during-rollout
+    """v1.9.4 findings #1 + #7: the during-rollout
     fallback must NOT credit children as landed when the sentinel is
     absent. Pre-fix the fallback set `outcome="ok"` on `r["ok"]=True`,
     which is exactly the noop overstate finding #1 (this PR) closes.
@@ -1820,7 +1820,7 @@ def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None
         )
     assert out["added"] == [], (
         f"missing sentinel + exit 0 must NOT credit children as added "
-        f"(v1.9.3 round-2 #7); got added={out['added']!r}"
+        f"(v1.9.4 #7); got added={out['added']!r}"
     )
     assert out["added_requested"] == [100, 101]
     # Fallback outcome from exit-code inference is "ok" — but
@@ -1829,7 +1829,7 @@ def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None
 
 
 def test_v193_outcome_sentinel_regex_anchored_and_last_match_wins() -> None:
-    """v1.9.3 round-2 (PR #29) findings #2 + #8: the outcome-sentinel
+    """v1.9.4 findings #2 + #8: the outcome-sentinel
     regex is line-anchored and constrained to the four known
     outcomes, and `_parse_outcome_sentinel` returns the LAST match.
 
@@ -1894,7 +1894,7 @@ def test_round4_f7_planning_add_children_partial_values_pinned() -> None:
     )
 
     # Full success: exit 0 + explicit `__ZH_OUTCOME__:ok` sentinel
-    # (v1.9.3 round-2 (PR #29) finding #1: sentinel is now required to credit children
+    # (v1.9.4 finding #1: sentinel is now required to credit children
     # as landed; missing sentinel defaults to added=[]).
     with patch.object(mcp_server, "_run_zh",
                       return_value={"ok": True, "exit_code": 0,
@@ -2022,7 +2022,7 @@ def test_v193_zh_rest_token_does_not_reach_production_zh(monkeypatch) -> None:
     ZH_REST_TOKEN; this test sources production zh and probes the
     inner env directly.
 
-    v1.9.3 round-2 (PR #29) finding #5: rewritten from the original
+    v1.9.4 finding #5: rewritten from the original
     `cmd_help` exec, which is a static `cat <<'EOF'` banner that
     never touches the env. That made the test trivially pass
     regardless of harness leakage. The replacement sources zh and
