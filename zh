@@ -161,15 +161,31 @@ zh_cause_hint() {
         # ESC `\` outside an OSC is not a thing terminals emit. ESC
         # alone is excluded from the OSC body class so the BEL regex
         # still terminates at the right byte.
-        local _esc_backslash _bel
-        _esc_backslash="${_esc}\\"
+        local _bel
         _bel=$'\007'
         local _line _out=""
         while IFS= read -r _line || [[ -n "$_line" ]]; do
-            # Normalize OSC ST → OSC BEL FIRST (literal-scalar substitution,
-            # no glob interpretation — safe even when the line contains
-            # backslashes).
-            _line="${_line//${_esc_backslash}/${_bel}}"
+            # Normalize OSC ST → OSC BEL FIRST. We can't use
+            # `${_line//<ESC-backslash>/<BEL>}` because bash's pattern
+            # substitution treats the trailing backslash in the search
+            # pattern as a glob escape (the backslash needs a next
+            # char to escape; there isn't one, so the substitution
+            # silently no-ops). A character-by-character scan is slow
+            # but correct on a line; this branch only runs on tiny
+            # error files, never on the GraphQL response stream.
+            local _norm="" _len="${#_line}" _i=0 _ch _next
+            while (( _i < _len )); do
+                _ch="${_line:_i:1}"
+                _next="${_line:_i+1:1}"
+                if [[ "$_ch" == "$_esc" && "$_next" == "\\" ]]; then
+                    _norm+="$_bel"
+                    _i=$((_i + 2))
+                else
+                    _norm+="$_ch"
+                    _i=$((_i + 1))
+                fi
+            done
+            _line="$_norm"
             # Strip every CSI sequence on this line.
             while [[ "$_line" =~ $_csi_re ]]; do
                 _line="${_line//${BASH_REMATCH[0]}/}"
