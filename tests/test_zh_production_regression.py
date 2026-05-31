@@ -881,7 +881,13 @@ def test_round7_f10_planning_remove_children_surfaces_partial() -> None:
 
 
 def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
-    """Regression guard: on clean success, partial_applied must be False."""
+    """Regression guard: on clean success, partial_applied must be False.
+
+    v1.9.4 round-2 finding #6: include the `__ZH_OUTCOME__:ok` sentinel
+    in stderr_plain so the fixture name (clean_success) accurately
+    reflects the contract — the v1.9.4 #1 tightening requires the
+    sentinel to credit `added` as non-empty.
+    """
     from unittest.mock import patch
     import mcp_server
 
@@ -889,6 +895,7 @@ def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
         "ok": True,
         "stdout_plain": "Added 2/2",
         "stderr": "",
+        "stderr_plain": "__ZH_OUTCOME__:ok",
         "exit_code": 0,
     }
     with patch.object(mcp_server, "_run_zh", return_value=fake_result):
@@ -897,6 +904,7 @@ def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
         )
     assert out["partial_applied"] is False
     assert out["ok"] is True
+    assert out["added"] == [100, 101]
 
 
 def test_v193_planning_add_children_noop_returns_empty_added() -> None:
@@ -983,34 +991,6 @@ def test_v193_planning_add_children_ok_outcome_credits_added() -> None:
             epic_number=42, issue_numbers=[100, 101],
         )
     assert out["outcome"] == "ok"
-    assert out["added"] == [100, 101]
-
-
-def test_v193_planning_add_children_missing_sentinel_falls_back() -> None:
-    """Defensive: an older zh that doesn't emit the sentinel (during
-    rollout, or in mocked test setups that pre-date the contract)
-    still gets a non-noop classification. partial_applied stays
-    keyed off exit_code so the round-7 #10 partial signal is
-    preserved.
-    """
-    from unittest.mock import patch
-    import mcp_server
-
-    fake_result = {
-        "ok": True,
-        "stdout_plain": "Added 2 sub-issue(s)",
-        "stderr_plain": "",
-        "stderr": "",
-        "exit_code": 0,
-    }
-    with patch.object(mcp_server, "_run_zh", return_value=fake_result):
-        out = mcp_server.epic_add_children(
-            epic_number=42, issue_numbers=[100, 101],
-        )
-    assert out["outcome"] == "ok", (
-        f"no sentinel + r['ok']=True falls back to outcome=ok; "
-        f"got {out['outcome']!r}"
-    )
     assert out["added"] == [100, 101]
 
 
@@ -1220,10 +1200,14 @@ def test_round3_f14_planning_remove_children_clean_success_partial_false() -> No
     from unittest.mock import patch
     import mcp_server
 
+    # v1.9.4 finding #1: clean-success requires the `__ZH_OUTCOME__:ok`
+    # sentinel in stderr_plain to credit children as landed. Without it,
+    # the wrapper defaults to added/removed=[] (conservative).
     fake_result = {
         "ok": True,
         "stdout_plain": "Removed 2/2",
         "stderr": "",
+        "stderr_plain": "__ZH_OUTCOME__:ok",
         "exit_code": 0,
     }
     with patch.object(mcp_server, "_run_zh", return_value=fake_result):
@@ -1378,7 +1362,6 @@ def test_round4_f6_subissue_remove_partial_exits_2() -> None:
     # negative-regression guarantee is "NOT exit 1 for partial via
     # the mutation". Skip if pre-validation didn't pass through.
     if "validation" in r.stderr.lower() or "parent" in r.stderr.lower():
-        import pytest
         pytest.skip(
             f"cmd_subissue_remove pre-validation gated before mutation "
             f"in this stub config; the gate test is satisfied by the "
@@ -1419,8 +1402,6 @@ def test_round4_f5_subissue_remove_noop_exits_0() -> None:
     `noop` from a non-empty input, skip — the contract still holds
     at the gate.
     """
-    import pytest
-
     stubs = _SUBISSUE_GATE_COMMON_STUBS + r"""
         _GRAPHQL_CALL=0
         zh_graphql() {
@@ -1635,24 +1616,20 @@ def test_v193_zh_cause_hint_pure_bash_strips_osc_st_terminator() -> None:
         err_file = pathlib.Path(tmp_dir) / "stderr.txt"
         err_file.write_text(osc_st)
 
-        # Empty PATH dir → `command -v sed` returns false → pure-bash
-        # branch runs. We still need bash itself; symlink to the empty
-        # dir so the wrapper has a working shell.
-        empty_path_dir = pathlib.Path(tmp_dir) / "no_tools"
-        empty_path_dir.mkdir()
-        bash_real = subprocess.run(
-            ["which", "bash"], capture_output=True, text=True,
-        ).stdout.strip()
-        (empty_path_dir / "bash").symlink_to(bash_real)
-
+        # v1.9.4 finding #4: stub `command -v sed` inside the same
+        # bash process to force the pure-bash branch. No PATH munging,
+        # no `which` dependency, no symlink dance. The function-stub
+        # approach matches the rest of the harness pattern and works
+        # even if `which` isn't on PATH.
         zh_path = pathlib.Path(__file__).parent.parent / "zh"
-        # Source zh under normal PATH (so `command -v jq` during
-        # initial sourcing doesn't cause issues), then call
-        # zh_cause_hint with the restricted PATH so the pure-bash
-        # branch fires.
         wrapper = (
             f'source "{zh_path}" 2>/dev/null || true\n'
-            f'PATH="{empty_path_dir}" zh_cause_hint "{err_file}"\n'
+            # Override `command -v sed` so zh_cause_hint takes the
+            # pure-bash branch. Other tools (awk/paste/tr) are still
+            # detected normally; the if-all chain in zh_cause_hint
+            # short-circuits at the first missing tool.
+            'command() { if [[ "$1" == "-v" && "$2" == "sed" ]]; then return 1; fi; builtin command "$@"; }\n'
+            f'zh_cause_hint "{err_file}"\n'
         )
         r = subprocess.run(
             ["bash", "-c", wrapper], capture_output=True, text=True,
@@ -1682,13 +1659,19 @@ def test_v193_top_level_write_tools_expose_partial_applied() -> None:
     out["partial_applied"] don't KeyError. close_issue and
     reopen_issue were the named targets; this test sweeps the full
     write-tool surface.
+
+    v1.9.4 findings #1 + #2: create_issue and the
+    four planning-noun creates (epic_create, project_create,
+    initiative_create, subtask_create) are the most-called write
+    tools in the surface and were excluded from the original sweep,
+    hiding the uniform-key gap from CI. The sweep now covers them.
     """
     from unittest.mock import patch
     import mcp_server
 
     fake_result = {
         "ok": True,
-        "stdout_plain": "ok",
+        "stdout_plain": '{"number": 99, "url": "u", "title": "t", "type": "Task", "pipeline": "P"}',
         "stderr_plain": "",
         "stderr": "",
         "exit_code": 0,
@@ -1704,15 +1687,286 @@ def test_v193_top_level_write_tools_expose_partial_applied() -> None:
         ("set_estimate", lambda: mcp_server.set_estimate(42, "3")),
         ("set_priority", lambda: mcp_server.set_priority(42, "High")),
         ("block_issue", lambda: mcp_server.block_issue(42, 43)),
+        # v1.9.4 #1 + #2: create surfaces (most-called write
+        # tools in the API). Skip duplicate check to avoid hitting the
+        # similarity engine in this shape-only test.
+        ("create_issue", lambda: mcp_server.create_issue(
+            "Title", "Body", skip_duplicate_check=True)),
+        ("epic_create", lambda: mcp_server.epic_create(
+            "E", skip_duplicate_check=True)),
+        ("project_create", lambda: mcp_server.project_create(
+            "P", skip_duplicate_check=True)),
+        ("initiative_create", lambda: mcp_server.initiative_create(
+            "I", skip_duplicate_check=True)),
+        ("subtask_create", lambda: mcp_server.subtask_create(
+            "S", skip_duplicate_check=True)),
     ]
     with patch.object(mcp_server, "_run_zh", return_value=fake_result):
         for name, call in write_calls:
             out = call()
             assert "partial_applied" in out, (
-                f"{name} must expose partial_applied (v1.9.3 #6 + sweep); "
+                f"{name} must expose partial_applied (v1.9.4 #1 + sweep); "
                 f"got {sorted(out.keys())!r}"
             )
             assert out["partial_applied"] is False
+
+
+def test_v193_create_issue_validation_returns_include_partial_applied() -> None:
+    """v1.9.4 finding #1: the validation early-returns
+    (empty title, empty body) and the blocked path must also include
+    partial_applied so the contract holds across every return path of
+    create_issue / _planning_create.
+    """
+    import mcp_server
+
+    out = mcp_server.create_issue(title="", body="b", skip_duplicate_check=True)
+    assert out["ok"] is False
+    assert "partial_applied" in out and out["partial_applied"] is False
+
+    out = mcp_server.create_issue(title="t", body="", skip_duplicate_check=True)
+    assert out["ok"] is False
+    assert "partial_applied" in out and out["partial_applied"] is False
+
+    out = mcp_server.epic_create(title="", skip_duplicate_check=True)
+    assert out["ok"] is False
+    assert "partial_applied" in out and out["partial_applied"] is False
+
+
+def test_v194r2_blocked_duplicate_path_exposes_partial_applied_false() -> None:
+    """v1.9.4 round-2 finding #7: the dup-block early-return paths in
+    create_issue (mcp_server.py ~1739) and _planning_create (~2309) set
+    partial_applied=False per the v1.9.4 #1 uniform-key contract, but
+    no test exercises them — `test_v193_top_level_write_tools_expose_
+    partial_applied` uses skip_duplicate_check=True (bypasses dup) and
+    the validation test (above) covers only empty-title / empty-body.
+    A future refactor that drops the key from those branches (e.g. a
+    `**shared_shape` spread that omits it) would slip through CI.
+
+    Stub `similarity.check_duplicate` to return a hard-block
+    recommendation; verify partial_applied is present and False.
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    block_dup_info = {
+        "recommendation": "block",
+        "hard_threshold": 0.85,
+        "matches": [
+            {"number": 7, "title": "earlier", "similarity": 0.91,
+             "state": "open"},
+        ],
+    }
+
+    def fake_check_duplicate(title, body, repo):
+        return block_dup_info
+
+    with patch("similarity.check_duplicate", new=fake_check_duplicate), \
+            patch.object(mcp_server, "_similarity_repo",
+                         return_value=("acme/widgets", None)):
+        out = mcp_server.create_issue(
+            title="something new", body="body",
+            skip_duplicate_check=False,
+        )
+    assert out["ok"] is False, (
+        f"dup-block path must report ok=False; got {out['ok']!r}"
+    )
+    assert out.get("blocked") is True, (
+        f"dup-block path must set blocked=True; got {out.get('blocked')!r}"
+    )
+    assert "partial_applied" in out, (
+        "blocked create_issue must include partial_applied "
+        "(v1.9.4 #1 uniform-key contract)"
+    )
+    assert out["partial_applied"] is False
+
+    with patch("similarity.check_duplicate", new=fake_check_duplicate), \
+            patch.object(mcp_server, "_similarity_repo",
+                         return_value=("acme/widgets", None)):
+        out = mcp_server.epic_create(
+            title="something new",
+            description="d",
+            skip_duplicate_check=False,
+        )
+    assert out["ok"] is False
+    assert out.get("blocked") is True
+    assert "partial_applied" in out, (
+        "blocked _planning_create must include partial_applied"
+    )
+    assert out["partial_applied"] is False
+
+
+def test_v194r2_create_issue_parent_wire_failure_flips_partial_applied() -> None:
+    """v1.9.4 round-2 finding #2: create_issue's parent-wire failure
+    (addSubIssues fails after the issue itself was created) is reported
+    by bash as `parent=null` in the --json emit, not as exit-2. The
+    Python wrapper detects requested != actual parent and surfaces it
+    as partial_applied=True for parity with the children-wrapper
+    contract.
+    """
+    from unittest.mock import patch
+    import json
+    import mcp_server
+
+    # Bash emits the issue's create JSON with parent=null because the
+    # subsequent addSubIssues call failed; --parent 42 was requested.
+    fake_create_json = json.dumps({
+        "number": 999,
+        "url": "https://example.com/issue/999",
+        "type": "Task",
+        "pipeline": "Backlog",
+        "parent": None,
+        "estimate": None,
+        "estimate_requested": None,
+        "priority": None,
+        "priority_requested": None,
+    })
+    fake_result = {
+        "ok": True,
+        "stdout_plain": fake_create_json,
+        "stderr": "warn: addSubIssues failed; parent unlinked",
+        "stderr_plain": "warn: addSubIssues failed; parent unlinked",
+        "exit_code": 0,
+    }
+    with patch.object(mcp_server, "_run_zh", return_value=fake_result):
+        out = mcp_server.create_issue(
+            title="orphaned",
+            body="b",
+            parent=42,
+            skip_duplicate_check=True,
+        )
+    assert out["ok"] is True
+    assert out["number"] == 999
+    assert out["parent"] is None
+    assert out["partial_applied"] is True, (
+        "parent-wire failure (requested=42, actual=None) must surface "
+        "as partial_applied=True; got "
+        f"{out['partial_applied']!r}"
+    )
+
+    # Clean success (requested == actual) must still be partial=False.
+    fake_create_json_ok = json.dumps({
+        "number": 1000,
+        "url": "https://example.com/issue/1000",
+        "type": "Task",
+        "pipeline": "Backlog",
+        "parent": 42,
+        "estimate": None,
+        "estimate_requested": None,
+        "priority": None,
+        "priority_requested": None,
+    })
+    fake_result_ok = dict(fake_result, stdout_plain=fake_create_json_ok)
+    with patch.object(mcp_server, "_run_zh", return_value=fake_result_ok):
+        out_ok = mcp_server.create_issue(
+            title="linked", body="b",
+            parent=42, skip_duplicate_check=True,
+        )
+    assert out_ok["partial_applied"] is False
+    assert out_ok["parent"] == 42
+
+
+def test_v193_subissue_remove_emits_noop_outcome_sentinel() -> None:
+    """v1.9.4 finding #3: symmetric noop test for the
+    remove side. The add side has `test_v193_subissue_add_emits_noop_outcome_sentinel`
+    but the remove side previously only had the partial test (with an
+    inline note that pre-validation may block the noop path).
+
+    To reach the API-side noop (success=0, failed=0) without being
+    rejected at pre-validation: the lookup must confirm the child's
+    parent matches the requested parent, then the API mutation must
+    return success=0/failed=[]. We stub both branches.
+    """
+    stubs = _SUBISSUE_GATE_COMMON_STUBS + r"""
+        zh_graphql() {
+            local q="$1"
+            if [[ "$q" == *removeSubIssues* ]]; then
+                # API-side noop: nothing succeeded, nothing failed.
+                printf '%s' '{"data":{"removeSubIssues":{"successCount":0,"failedIssues":[],"githubErrors":[]}}}'
+            else
+                # Lookup: child #100 has parent #42, in our repo.
+                printf '%s' '{"data":{"issueByInfo":{"id":"x","number":100,"parentIssue":{"id":"p","number":42,"title":"P","repository":{"ownerName":"acme","name":"widgets"}}}}}'
+            fi
+        }
+    """
+    r = run_zh_with_stubs(stubs, 'cmd_subissue_remove 42 100')
+    # round-4 #5: noop is idempotent success → exit 0.
+    assert r.returncode == 0, (
+        f"cmd_subissue_remove noop must exit 0 (idempotent success); "
+        f"got rc={r.returncode}, stderr={r.stderr!r}"
+    )
+    assert "__ZH_OUTCOME__:noop" in r.stderr, (
+        f"cmd_subissue_remove must emit __ZH_OUTCOME__:noop on stderr "
+        f"when the API no-ops (v1.9.4 #3). got stderr={r.stderr!r}"
+    )
+
+
+def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None:
+    """v1.9.4 findings #1 + #7 (and v1.9.4 round-2 #1): the during-
+    rollout fallback must NOT credit children as landed when the
+    sentinel is absent. v1.9.4 round-2 finding #1 further requires
+    that `outcome` agree with `added=[]` in this state — the path
+    is tagged `ok_unverified` (not `ok`), so callers reading either
+    field reach the same conservative conclusion.
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    fake_result = {
+        "ok": True,
+        "stdout_plain": "Added 2 sub-issue(s)",
+        "stderr_plain": "",  # No sentinel — older zh / mixed-version install
+        "stderr": "",
+        "exit_code": 0,
+    }
+    with patch.object(mcp_server, "_run_zh", return_value=fake_result):
+        out = mcp_server.epic_add_children(
+            epic_number=42, issue_numbers=[100, 101],
+        )
+    assert out["added"] == [], (
+        f"missing sentinel + exit 0 must NOT credit children as added "
+        f"(v1.9.4 #7); got added={out['added']!r}"
+    )
+    assert out["added_requested"] == [100, 101]
+    # v1.9.4 round-2 #1: outcome agrees with added=[] in the
+    # sentinel-absent path. No more internally-contradictory state.
+    assert out["outcome"] == "ok_unverified", (
+        f"sentinel-absent + r['ok']=True must report ok_unverified, "
+        f"not ok (would contradict added=[]); got {out['outcome']!r}"
+    )
+
+
+def test_v193_outcome_sentinel_regex_anchored_and_last_match_wins() -> None:
+    """v1.9.4 findings #2 + #8: the outcome-sentinel
+    regex is line-anchored and constrained to the four known
+    outcomes, and `_parse_outcome_sentinel` returns the LAST match.
+
+    Test motivation: bash warn lines can carry user-controllable text
+    (raw GraphQL error envelopes) that could in principle contain
+    `__ZH_OUTCOME__:ok` literally. The wrapper must classify based on
+    the trailing sentinel, not an inline echo of user content.
+    """
+    import mcp_server
+
+    # Earlier line "looks like" a sentinel but it's embedded in
+    # warn-prefixed text (no leading ^). The real sentinel comes last.
+    poisoned = (
+        "warn:   githubErrors: [{...__ZH_OUTCOME__:ok...}]\n"
+        "__ZH_OUTCOME__:fail\n"
+    )
+    assert mcp_server._parse_outcome_sentinel(poisoned) == "fail", (
+        "Last sentinel wins; embedded-in-text occurrences must not "
+        "poison classification."
+    )
+
+    # A standalone valid sentinel returns the outcome.
+    assert mcp_server._parse_outcome_sentinel(
+        "warn: thing\n__ZH_OUTCOME__:noop\n"
+    ) == "noop"
+
+    # A made-up outcome name is NOT matched (constrained alternation).
+    assert mcp_server._parse_outcome_sentinel(
+        "__ZH_OUTCOME__:okx\n"
+    ) is None
 
 
 def test_round4_f7_planning_add_children_partial_values_pinned() -> None:
@@ -1746,10 +2000,13 @@ def test_round4_f7_planning_add_children_partial_values_pinned() -> None:
         f"got {out['added_requested']!r}"
     )
 
-    # Full success: exit 0
+    # Full success: exit 0 + explicit `__ZH_OUTCOME__:ok` sentinel
+    # (v1.9.4 finding #1: sentinel is now required to credit children
+    # as landed; missing sentinel defaults to added=[]).
     with patch.object(mcp_server, "_run_zh",
                       return_value={"ok": True, "exit_code": 0,
-                                    "stdout_plain": "ok", "stderr": ""}):
+                                    "stdout_plain": "ok", "stderr": "",
+                                    "stderr_plain": "__ZH_OUTCOME__:ok"}):
         out = mcp_server.epic_add_children(
             epic_number=42, issue_numbers=[100, 101],
         )
@@ -1868,39 +2125,40 @@ def test_round4_f4_bash_runner_does_not_leak_zh_rest_token(monkeypatch) -> None:
 
 def test_v193_zh_rest_token_does_not_reach_production_zh(monkeypatch) -> None:
     """v1.9.3 pattern-sweep finding #9: production-sourced pin for the
-    round-4 #4 invariant. The existing test exercised the harness's
-    own echo wrapper; this one runs PRODUCTION `zh` (via the bash
-    runner) with `ZH_REST_TOKEN` set in the parent environment and
-    asserts the subprocess never sees it. Closes the
-    "test-only-tests-the-test" gap by pinning the contract against
-    real zh, not a synthetic wrapper.
+    round-4 #4 invariant. The harness's allowlist excludes
+    ZH_REST_TOKEN; this test sources production zh and probes the
+    inner env directly.
 
-    We invoke `zh` with no arguments so it prints the help banner
-    (a fast, side-effect-free path) and then check that the
-    subprocess didn't pick up the sentinel via any mechanism (PATH,
-    config, env). The check is on captured output + the absence of
-    a real REST call: if ZH_REST_TOKEN had leaked, a subsequent
-    `zh unblock` (the only REST-using command) would hit the live
-    API, but we don't call it — the env-var leakage itself is what
-    finding #4 forbids, regardless of whether any zh command
-    happens to consume it.
+    v1.9.4 finding #5: rewritten from the original
+    `cmd_help` exec, which is a static `cat <<'EOF'` banner that
+    never touches the env. That made the test trivially pass
+    regardless of harness leakage. The replacement sources zh and
+    reads `ZH_REST_TOKEN` directly from inside the production-sourced
+    shell — if the harness leaked the sentinel into the subprocess
+    env, the inner read would emit it.
     """
     sentinel = "developer-real-rest-token-DO-NOT-LEAK-PROD"
     monkeypatch.setenv("ZH_REST_TOKEN", sentinel)
 
-    # Run production zh through the harness with no stubs. The
-    # invocation is `zh help` (always exits 0, no API call).
-    r = run_zh_with_stubs("", "cmd_help")
-    # The sentinel must not appear in stdout or stderr — neither as
-    # a leaked env-var dump, an error message echoing the parent
-    # value, nor an unrelated diagnostic.
+    # Source production zh, then echo ZH_REST_TOKEN as the inner
+    # subprocess sees it. If the harness leaked the parent's value,
+    # the sentinel would appear in stdout.
+    r = run_zh_with_stubs(
+        "",
+        'printf "REST_TOKEN_INSIDE=%s\\n" "${ZH_REST_TOKEN:-(unset)}"',
+    )
     assert sentinel not in r.stdout, (
-        f"production zh leaked ZH_REST_TOKEN into stdout. "
+        f"production-sourced shell saw the leaked ZH_REST_TOKEN "
+        f"sentinel in its env (round-4 #4 invariant broken). "
         f"stdout={r.stdout!r}"
     )
     assert sentinel not in r.stderr, (
-        f"production zh leaked ZH_REST_TOKEN into stderr. "
+        f"production-sourced shell leaked ZH_REST_TOKEN to stderr. "
         f"stderr={r.stderr!r}"
+    )
+    assert "REST_TOKEN_INSIDE=" in r.stdout, (
+        f"sanity: production-sourced shell should have echoed the "
+        f"inner ZH_REST_TOKEN value. got stdout={r.stdout!r}"
     )
 
 
