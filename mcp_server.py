@@ -1775,15 +1775,23 @@ def create_issue(title: str, body: str, type: str = "Task",
     # propagate them all so MCP clients reading either create surface
     # see the same key set.
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
+    # v1.9.4 round-2 finding #2: cmd_create reports parent-wire
+    # (addSubIssues) failure as `parent=null` in the JSON, not as an
+    # exit-2 partial signal. Detect the requested-vs-actual divergence
+    # and surface it as partial_applied=True so agents reading the
+    # uniform partial_applied key across write tools see the same
+    # retry-gating signal for create that they get for the children
+    # wrappers and set_issue_type.
+    parent_requested = parent if parent and parent > 0 else None
+    actual_parent = created.get("parent") if created else None
+    parent_wire_failed = (
+        r["ok"] and created is not None
+        and parent_requested is not None
+        and actual_parent != parent_requested
+    )
     out = {
         "ok": r["ok"] and created is not None,
-        # v1.9.4 finding #1: uniform-key parity with
-        # every other write wrapper. cmd_create has no exit-2 partial
-        # path today (parent-wire addSubIssues failure is reported as
-        # `parent=null`, not as a partial-applied state), so this is
-        # always False. Agents that branch on out["partial_applied"]
-        # uniformly across write tools no longer KeyError here.
-        "partial_applied": False,
+        "partial_applied": parent_wire_failed,
         "number": created.get("number") if created else None,
         "url": created.get("url") if created else None,
         "type": created.get("type") if created else None,
@@ -2460,9 +2468,10 @@ def _planning_update(noun: str, number: int, title: str, description: str,
 
 
 _OUTCOME_SENTINEL_RE = re.compile(
-    r"^__ZH_OUTCOME__:(ok|noop|partial|fail)\s*$",
+    r"^__ZH_OUTCOME__:([a-z][a-z_-]*)\s*$",
     re.MULTILINE,
 )
+_KNOWN_OUTCOMES = frozenset({"ok", "noop", "partial", "fail"})
 
 
 def _stderr_plain(r: dict) -> str:
@@ -2505,7 +2514,21 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     if not stderr_plain:
         return None
     matches = _OUTCOME_SENTINEL_RE.findall(stderr_plain)
-    return matches[-1] if matches else None
+    if not matches:
+        return None
+    last = matches[-1]
+    if last in _KNOWN_OUTCOMES:
+        return last
+    # v1.9.4 round-2 finding #4: the regex now accepts any lowercase
+    # outcome word so a bash-side addition (or a typo) is observed,
+    # not swallowed. An unknown outcome falls back to inference and
+    # logs a breadcrumb so the divergence is loud, not silent.
+    print(
+        f"_parse_outcome_sentinel: unknown outcome '{last}' "
+        f"(known: {sorted(_KNOWN_OUTCOMES)})",
+        file=sys.stderr,
+    )
+    return None
 
 
 def _planning_add_children(noun: str, parent: int, children: list[int],
@@ -2563,11 +2586,19 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     sentinel_seen = sentinel_outcome is not None
     if sentinel_seen:
         outcome = sentinel_outcome
+    elif partial_applied:
+        outcome = "partial"
+    elif r["ok"]:
+        # v1.9.4 round-2 finding #1: when bash exits cleanly but the
+        # sentinel is absent (mixed-version install: newer mcp_server.py
+        # + older zh predating the sentinel emit), callers reading
+        # `outcome` saw "ok" while `added=[]` (from the is_landed gate),
+        # i.e. two consumers reaching opposite conclusions. Tag the
+        # unverified path explicitly so `outcome` agrees with
+        # `added=[]` and operators notice the mixed-install state.
+        outcome = "ok_unverified"
     else:
-        # Defensive default: an older zh without the sentinel falls back
-        # to the round-4 #5 contract. Production zh always emits the
-        # sentinel; this is for the during-rollout window.
-        outcome = "partial" if partial_applied else ("ok" if r["ok"] else "fail")
+        outcome = "fail"
     # v1.9.3 finding #1 + v1.9.4 #7: noop must NOT overstate
     # `added`, and the inference fallback above CANNOT distinguish ok
     # from noop on its own (both have exit 0 + r["ok"]=True). Require
@@ -2614,8 +2645,16 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
     sentinel_seen = sentinel_outcome is not None
     if sentinel_seen:
         outcome = sentinel_outcome
+    elif partial_applied:
+        outcome = "partial"
+    elif r["ok"]:
+        # v1.9.4 round-2 finding #1: see _planning_add_children — tag
+        # the sentinel-absent clean-exit path "ok_unverified" so
+        # `outcome` agrees with `removed=[]` (the is_landed gate
+        # withholds the credit in this state).
+        outcome = "ok_unverified"
     else:
-        outcome = "partial" if partial_applied else ("ok" if r["ok"] else "fail")
+        outcome = "fail"
     is_landed = sentinel_seen and outcome == "ok"
     return {
         "ok": r["ok"] or partial_applied,

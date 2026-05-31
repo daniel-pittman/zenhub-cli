@@ -185,6 +185,7 @@ def run_zh_with_stubs(
     # affect rendering but carry no secrets, then layers
     # env_defaults on top so the harness's explicit overrides win.
     import os as _os
+    import sys as _sys
     _ALLOWED_INHERIT = (
         "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_TIME",
         "LC_NUMERIC", "LC_MESSAGES",
@@ -204,6 +205,7 @@ def run_zh_with_stubs(
     # where `/tmp/xxxxxx-nix-shell` style entries can land on PATH).
     parent_path = _os.environ.get("PATH", "")
     safe_path_parts = []
+    dropped_entries = []
     if parent_path:
         for entry in parent_path.split(":"):
             if not entry:
@@ -227,8 +229,23 @@ def run_zh_with_stubs(
             mode = st.st_mode
             world_writable = bool(mode & 0o002)
             if world_writable:
+                dropped_entries.append(entry)
                 continue
             safe_path_parts.append(entry)
+    # v1.9.4 round-2 finding #5: when the filter empties every parent
+    # PATH entry (Nix scratch profiles, certain bind-mounted CI
+    # scratch dirs), tests can silently fall back to the floor and
+    # later fail with `jq: command not found` without any indicator
+    # that the filter caused it. Emit a one-line breadcrumb when any
+    # entry was dropped, gated on `ZH_TEST_PATH_FILTER_VERBOSE=1` so
+    # the default test output stays quiet.
+    if dropped_entries and _os.environ.get("ZH_TEST_PATH_FILTER_VERBOSE") == "1":
+        _sys.stderr.write(
+            "_bash_runner: filtered "
+            f"{len(dropped_entries)} world-writable PATH "
+            f"{'entry' if len(dropped_entries) == 1 else 'entries'}: "
+            f"{','.join(dropped_entries)}\n"
+        )
     if safe_path_parts:
         inherited["PATH"] = ":".join(safe_path_parts)
 

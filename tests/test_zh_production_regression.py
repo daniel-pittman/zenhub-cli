@@ -881,7 +881,13 @@ def test_round7_f10_planning_remove_children_surfaces_partial() -> None:
 
 
 def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
-    """Regression guard: on clean success, partial_applied must be False."""
+    """Regression guard: on clean success, partial_applied must be False.
+
+    v1.9.4 round-2 finding #6: include the `__ZH_OUTCOME__:ok` sentinel
+    in stderr_plain so the fixture name (clean_success) accurately
+    reflects the contract — the v1.9.4 #1 tightening requires the
+    sentinel to credit `added` as non-empty.
+    """
     from unittest.mock import patch
     import mcp_server
 
@@ -889,6 +895,7 @@ def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
         "ok": True,
         "stdout_plain": "Added 2/2",
         "stderr": "",
+        "stderr_plain": "__ZH_OUTCOME__:ok",
         "exit_code": 0,
     }
     with patch.object(mcp_server, "_run_zh", return_value=fake_result):
@@ -897,6 +904,7 @@ def test_round7_f10_planning_add_children_clean_success_partial_false() -> None:
         )
     assert out["partial_applied"] is False
     assert out["ok"] is True
+    assert out["added"] == [100, 101]
 
 
 def test_v193_planning_add_children_noop_returns_empty_added() -> None:
@@ -984,43 +992,6 @@ def test_v193_planning_add_children_ok_outcome_credits_added() -> None:
         )
     assert out["outcome"] == "ok"
     assert out["added"] == [100, 101]
-
-
-def test_v193_planning_add_children_missing_sentinel_falls_back() -> None:
-    """v1.9.4 finding #1 (tightened contract): an older zh that doesn't
-    emit the sentinel falls back to inferred `outcome` (preserving the
-    round-7 #10 partial signal off exit_code), BUT `added` defaults to
-    [] because the inference can't distinguish ok from noop (both have
-    exit 0 + r['ok']=True). Conservative default avoids re-introducing
-    the noop overstate when a future bash change accidentally drops the
-    sentinel emit. Callers see outcome="ok" + added=[]; the explicit
-    sentinel signal is required to credit children as landed.
-    """
-    from unittest.mock import patch
-    import mcp_server
-
-    fake_result = {
-        "ok": True,
-        "stdout_plain": "Added 2 sub-issue(s)",
-        "stderr_plain": "",
-        "stderr": "",
-        "exit_code": 0,
-    }
-    with patch.object(mcp_server, "_run_zh", return_value=fake_result):
-        out = mcp_server.epic_add_children(
-            epic_number=42, issue_numbers=[100, 101],
-        )
-    assert out["outcome"] == "ok", (
-        f"no sentinel + r['ok']=True falls back to outcome=ok; "
-        f"got {out['outcome']!r}"
-    )
-    # v1.9.4 finding #1: missing sentinel → added=[] (conservative).
-    # The added_requested field still carries the input for traceability.
-    assert out["added"] == [], (
-        f"missing sentinel must NOT credit children as landed; "
-        f"got added={out['added']!r}"
-    )
-    assert out["added_requested"] == [100, 101]
 
 
 def test_round3_f1_comment_empty_message_returns_full_key_set() -> None:
@@ -1761,6 +1732,139 @@ def test_v193_create_issue_validation_returns_include_partial_applied() -> None:
     assert "partial_applied" in out and out["partial_applied"] is False
 
 
+def test_v194r2_blocked_duplicate_path_exposes_partial_applied_false() -> None:
+    """v1.9.4 round-2 finding #7: the dup-block early-return paths in
+    create_issue (mcp_server.py ~1739) and _planning_create (~2309) set
+    partial_applied=False per the v1.9.4 #1 uniform-key contract, but
+    no test exercises them — `test_v193_top_level_write_tools_expose_
+    partial_applied` uses skip_duplicate_check=True (bypasses dup) and
+    the validation test (above) covers only empty-title / empty-body.
+    A future refactor that drops the key from those branches (e.g. a
+    `**shared_shape` spread that omits it) would slip through CI.
+
+    Stub `similarity.check_duplicate` to return a hard-block
+    recommendation; verify partial_applied is present and False.
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    block_dup_info = {
+        "recommendation": "block",
+        "hard_threshold": 0.85,
+        "matches": [
+            {"number": 7, "title": "earlier", "similarity": 0.91,
+             "state": "open"},
+        ],
+    }
+
+    def fake_check_duplicate(title, body, repo):
+        return block_dup_info
+
+    with patch("similarity.check_duplicate", new=fake_check_duplicate), \
+            patch.object(mcp_server, "_similarity_repo",
+                         return_value=("acme/widgets", None)):
+        out = mcp_server.create_issue(
+            title="something new", body="body",
+            skip_duplicate_check=False,
+        )
+    assert out["ok"] is False, (
+        f"dup-block path must report ok=False; got {out['ok']!r}"
+    )
+    assert out.get("blocked") is True, (
+        f"dup-block path must set blocked=True; got {out.get('blocked')!r}"
+    )
+    assert "partial_applied" in out, (
+        "blocked create_issue must include partial_applied "
+        "(v1.9.4 #1 uniform-key contract)"
+    )
+    assert out["partial_applied"] is False
+
+    with patch("similarity.check_duplicate", new=fake_check_duplicate), \
+            patch.object(mcp_server, "_similarity_repo",
+                         return_value=("acme/widgets", None)):
+        out = mcp_server.epic_create(
+            title="something new",
+            description="d",
+            skip_duplicate_check=False,
+        )
+    assert out["ok"] is False
+    assert out.get("blocked") is True
+    assert "partial_applied" in out, (
+        "blocked _planning_create must include partial_applied"
+    )
+    assert out["partial_applied"] is False
+
+
+def test_v194r2_create_issue_parent_wire_failure_flips_partial_applied() -> None:
+    """v1.9.4 round-2 finding #2: create_issue's parent-wire failure
+    (addSubIssues fails after the issue itself was created) is reported
+    by bash as `parent=null` in the --json emit, not as exit-2. The
+    Python wrapper detects requested != actual parent and surfaces it
+    as partial_applied=True for parity with the children-wrapper
+    contract.
+    """
+    from unittest.mock import patch
+    import json
+    import mcp_server
+
+    # Bash emits the issue's create JSON with parent=null because the
+    # subsequent addSubIssues call failed; --parent 42 was requested.
+    fake_create_json = json.dumps({
+        "number": 999,
+        "url": "https://example.com/issue/999",
+        "type": "Task",
+        "pipeline": "Backlog",
+        "parent": None,
+        "estimate": None,
+        "estimate_requested": None,
+        "priority": None,
+        "priority_requested": None,
+    })
+    fake_result = {
+        "ok": True,
+        "stdout_plain": fake_create_json,
+        "stderr": "warn: addSubIssues failed; parent unlinked",
+        "stderr_plain": "warn: addSubIssues failed; parent unlinked",
+        "exit_code": 0,
+    }
+    with patch.object(mcp_server, "_run_zh", return_value=fake_result):
+        out = mcp_server.create_issue(
+            title="orphaned",
+            body="b",
+            parent=42,
+            skip_duplicate_check=True,
+        )
+    assert out["ok"] is True
+    assert out["number"] == 999
+    assert out["parent"] is None
+    assert out["partial_applied"] is True, (
+        "parent-wire failure (requested=42, actual=None) must surface "
+        "as partial_applied=True; got "
+        f"{out['partial_applied']!r}"
+    )
+
+    # Clean success (requested == actual) must still be partial=False.
+    fake_create_json_ok = json.dumps({
+        "number": 1000,
+        "url": "https://example.com/issue/1000",
+        "type": "Task",
+        "pipeline": "Backlog",
+        "parent": 42,
+        "estimate": None,
+        "estimate_requested": None,
+        "priority": None,
+        "priority_requested": None,
+    })
+    fake_result_ok = dict(fake_result, stdout_plain=fake_create_json_ok)
+    with patch.object(mcp_server, "_run_zh", return_value=fake_result_ok):
+        out_ok = mcp_server.create_issue(
+            title="linked", body="b",
+            parent=42, skip_duplicate_check=True,
+        )
+    assert out_ok["partial_applied"] is False
+    assert out_ok["parent"] == 42
+
+
 def test_v193_subissue_remove_emits_noop_outcome_sentinel() -> None:
     """v1.9.4 finding #3: symmetric noop test for the
     remove side. The add side has `test_v193_subissue_add_emits_noop_outcome_sentinel`
@@ -1797,12 +1901,12 @@ def test_v193_subissue_remove_emits_noop_outcome_sentinel() -> None:
 
 
 def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None:
-    """v1.9.4 findings #1 + #7: the during-rollout
-    fallback must NOT credit children as landed when the sentinel is
-    absent. Pre-fix the fallback set `outcome="ok"` on `r["ok"]=True`,
-    which is exactly the noop overstate finding #1 (this PR) closes.
-    The conservative fallback requires `sentinel_seen=True` before
-    `is_landed=True`.
+    """v1.9.4 findings #1 + #7 (and v1.9.4 round-2 #1): the during-
+    rollout fallback must NOT credit children as landed when the
+    sentinel is absent. v1.9.4 round-2 finding #1 further requires
+    that `outcome` agree with `added=[]` in this state — the path
+    is tagged `ok_unverified` (not `ok`), so callers reading either
+    field reach the same conservative conclusion.
     """
     from unittest.mock import patch
     import mcp_server
@@ -1823,9 +1927,12 @@ def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None
         f"(v1.9.4 #7); got added={out['added']!r}"
     )
     assert out["added_requested"] == [100, 101]
-    # Fallback outcome from exit-code inference is "ok" — but
-    # `is_landed` gates on `sentinel_seen` so `added` stays empty.
-    assert out["outcome"] == "ok"
+    # v1.9.4 round-2 #1: outcome agrees with added=[] in the
+    # sentinel-absent path. No more internally-contradictory state.
+    assert out["outcome"] == "ok_unverified", (
+        f"sentinel-absent + r['ok']=True must report ok_unverified, "
+        f"not ok (would contradict added=[]); got {out['outcome']!r}"
+    )
 
 
 def test_v193_outcome_sentinel_regex_anchored_and_last_match_wins() -> None:
