@@ -2471,7 +2471,16 @@ _OUTCOME_SENTINEL_RE = re.compile(
     r"^__ZH_OUTCOME__:([a-z][a-z_-]*)\s*$",
     re.MULTILINE,
 )
-_KNOWN_OUTCOMES = frozenset({"ok", "noop", "partial", "fail"})
+# Values the bash sentinel may carry. Validated in _parse_outcome_sentinel.
+_SENTINEL_OUTCOMES = frozenset({"ok", "noop", "partial", "fail"})
+# Public surface — every outcome string a caller may observe in the
+# returned dict. Wrappers SYNTHESIZE "ok_unverified" when bash exits
+# cleanly but the sentinel is absent (mixed-version install); callers
+# writing invariant checks (`assert out["outcome"] in _OUTCOMES`)
+# should use this superset, not _SENTINEL_OUTCOMES.
+_OUTCOMES = _SENTINEL_OUTCOMES | frozenset({"ok_unverified"})
+# Back-compat alias for any importer of the original name.
+_KNOWN_OUTCOMES = _OUTCOMES
 
 
 def _stderr_plain(r: dict) -> str:
@@ -2517,7 +2526,7 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     if not matches:
         return None
     last = matches[-1]
-    if last in _KNOWN_OUTCOMES:
+    if last in _SENTINEL_OUTCOMES:
         return last
     # v1.9.4 round-2 finding #4: the regex now accepts any lowercase
     # outcome word so a bash-side addition (or a typo) is observed,
@@ -2525,7 +2534,7 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     # logs a breadcrumb so the divergence is loud, not silent.
     print(
         f"_parse_outcome_sentinel: unknown outcome '{last}' "
-        f"(known: {sorted(_KNOWN_OUTCOMES)})",
+        f"(known: {sorted(_SENTINEL_OUTCOMES)})",
         file=sys.stderr,
     )
     return None
@@ -2558,17 +2567,18 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     #
     # v1.9.2 round-1 (PR #27) finding #3 + round-2 finding #5: the
     # contract is now:
-    #   - `added`: confirmed-landed list. On full success: == input.
-    #     On partial: empty (the bash wrapper can't enumerate
-    #     per-issue; the agent must consult subissue_list).
-    #     On hard failure: empty.
-    #     v1.9.3 pattern-sweep: on noop (every child already attached,
-    #     exit 0): empty. The pre-fix `children if r["ok"] else []`
-    #     overstated `added` on noop because exit 0 + r["ok"]=True
-    #     made the wrapper claim the children landed when actually the
-    #     API reported successCount=0 / failedIssues=[]. The bash side
-    #     now emits `__ZH_OUTCOME__:noop` on stderr; we read it and
-    #     refuse to credit children that didn't move.
+    #   - `added`: confirmed-landed list. Populated only when
+    #     outcome == "ok" (sentinel observed + clean exit). Empty on
+    #     partial, hard failure, noop, AND ok_unverified (v1.9.4
+    #     round-3 #1: clean exit without sentinel — older zh in a
+    #     mixed-version install). In every empty-`added` state, the
+    #     agent must consult subissue_list to verify the API result.
+    #     The pre-fix `children if r["ok"] else []` overstated `added`
+    #     on noop because exit 0 + r["ok"]=True made the wrapper claim
+    #     the children landed when actually the API reported
+    #     successCount=0 / failedIssues=[]. The bash side now emits
+    #     `__ZH_OUTCOME__:noop` on stderr; we read it and refuse to
+    #     credit children that didn't move.
     #   - `added_requested`: the input list, ALWAYS. Mirrors the
     #     estimate_requested / priority_requested pattern from
     #     create_issue: agents that want to know what was attempted
@@ -2579,6 +2589,10 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     # set_issue_type). An agent's correct idiom is:
     #     if r["partial_applied"]: re-verify via subissue_list
     #     elif r["outcome"] == "noop": already-attached, treat as ok
+    #     elif r["outcome"] == "ok_unverified":
+    #         # v1.9.4 round-3 #1: clean exit without sentinel (mixed-
+    #         # version install). `added` is intentionally empty.
+    #         re-verify via subissue_list
     #     elif r["ok"]: log(f"Added {len(r['added'])} children")
     #     else: log(f"Failed (requested: {r['added_requested']})")
     partial_applied = _safe_int(r.get("exit_code")) == 2
@@ -2811,16 +2825,31 @@ def epic_add_children(epic_number: int, issue_numbers: list[int],
                       repo_path: str = "") -> dict:
     """Attach one or more issues as sub-issues of an epic (addSubIssues).
 
-    Returns: dict with ok, partial_applied, parent, epic_number (back-compat
-    alias for parent), added, added_requested, raw, stderr.
-    v1.9.2 round-7 #10 / round-2 #5: partial_applied is True when the
-    underlying cmd_subissue_add exited 2 (some children attached, others
-    did not). `added` is the confirmed-landed list (== added_requested on
-    full success; empty on partial — the bash wrapper cannot enumerate
-    per-issue, consult subissue_list to verify). `added_requested` is
-    the input list, always. The correct branching idiom is `if
-    r["partial_applied"]: re-verify` first, then `elif r["ok"]: trust
-    r["added"]`, else hard failure.
+    Returns: dict with ok, partial_applied, outcome, parent, epic_number
+    (back-compat alias for parent), added, added_requested, raw, stderr.
+
+    `outcome` is one of:
+      - "ok"            — confirmed full success (sentinel observed)
+      - "noop"          — every child was already attached (idempotent)
+      - "partial"       — some children landed, others did not
+      - "fail"          — hard failure, nothing landed
+      - "ok_unverified" — bash exited cleanly but the sentinel was
+                          absent (older zh in a mixed-version install).
+                          `added` is empty in this state; consult
+                          subissue_list to verify the API result.
+
+    `added` is populated only when outcome == "ok" (sentinel-confirmed
+    full success). It is empty on partial, noop, fail, AND
+    ok_unverified — the bash wrapper cannot enumerate per-issue, so
+    callers consult subissue_list to verify in those states.
+    `added_requested` is the input list, always.
+
+    The correct branching idiom (v1.9.4 round-3):
+        if r["partial_applied"]: re-verify via subissue_list
+        elif r["outcome"] in ("noop", "ok_unverified"):
+            already-attached or unverified → consult subissue_list
+        elif r["ok"]: trust r["added"]
+        else: hard failure
     """
     return _with_epic_number_alias(_planning_add_children(
         "epic", epic_number, issue_numbers, repo_path,
@@ -2832,11 +2861,11 @@ def epic_remove_children(epic_number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Detach one or more sub-issues from an epic (removeSubIssues).
 
-    Returns: dict with ok, partial_applied, parent, epic_number (back-compat
-    alias for parent), removed, removed_requested, raw, stderr.
-    v1.9.2 round-7 #10 / round-2 #5: same partial_applied / requested
-    split as the add path; `removed_requested` always echoes the input,
-    `removed` is empty on partial (verify via subissue_list).
+    Returns: dict with ok, partial_applied, outcome, parent, epic_number
+    (back-compat alias for parent), removed, removed_requested, raw,
+    stderr. `outcome` and the `removed` / `removed_requested` semantics
+    mirror `epic_add_children` exactly (see that docstring for the full
+    enumeration and the canonical branching idiom).
     """
     return _with_epic_number_alias(_planning_remove_children(
         "epic", epic_number, issue_numbers, repo_path,
@@ -2938,12 +2967,12 @@ def initiative_add_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Attach issues (typically Projects/Epics) under an Initiative.
 
-    Returns: dict with ok, partial_applied, parent, added, added_requested,
-    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: partial_applied=True
-    means some children attached and some did not (cmd_subissue_add exit
-    2); `added_requested` is the input list always, `added` is empty
-    on partial (the wrapper cannot enumerate per-issue, verify via
-    subissue_list).
+    Returns: dict with ok, partial_applied, outcome, parent, added,
+    added_requested, raw, stderr. Return shape and the
+    outcome / added / added_requested semantics mirror
+    `epic_add_children` exactly; see that docstring for the full
+    enumeration of `outcome` values (ok, noop, partial, fail,
+    ok_unverified) and the canonical branching idiom.
     """
     return _planning_add_children("initiative", number, issue_numbers,
                                   repo_path)
@@ -2954,9 +2983,9 @@ def initiative_remove_children(number: int, issue_numbers: list[int],
                                repo_path: str = "") -> dict:
     """Detach sub-issues from an Initiative.
 
-    Returns: dict with ok, partial_applied, parent, removed, removed_requested,
-    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: same partial_applied /
-    requested split as the add path.
+    Returns: dict with ok, partial_applied, outcome, parent, removed,
+    removed_requested, raw, stderr. Shape and `outcome` semantics
+    mirror `epic_add_children` / `epic_remove_children`.
     """
     return _planning_remove_children("initiative", number, issue_numbers,
                                      repo_path)
@@ -3045,12 +3074,10 @@ def project_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach issues (typically Epics) under a Project.
 
-    Returns: dict with ok, partial_applied, parent, added, added_requested,
-    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: partial_applied=True
-    means some children attached and some did not (cmd_subissue_add exit
-    2); `added_requested` is the input list always, `added` is empty
-    on partial (the wrapper cannot enumerate per-issue, verify via
-    subissue_list).
+    Returns: dict with ok, partial_applied, outcome, parent, added,
+    added_requested, raw, stderr. Shape and `outcome` / added
+    semantics mirror `epic_add_children`; see that docstring for the
+    full enumeration and branching idiom.
     """
     return _planning_add_children("project", number, issue_numbers, repo_path)
 
@@ -3060,9 +3087,9 @@ def project_remove_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Detach sub-issues from a Project.
 
-    Returns: dict with ok, partial_applied, parent, removed, removed_requested,
-    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: same partial_applied /
-    requested split as the add path.
+    Returns: dict with ok, partial_applied, outcome, parent, removed,
+    removed_requested, raw, stderr. Shape and `outcome` semantics
+    mirror `epic_add_children` / `epic_remove_children`.
     """
     return _planning_remove_children("project", number, issue_numbers,
                                      repo_path)
@@ -3154,12 +3181,10 @@ def subtask_add_children(number: int, issue_numbers: list[int],
                          repo_path: str = "") -> dict:
     """Attach further sub-issues under a Sub-task.
 
-    Returns: dict with ok, partial_applied, parent, added, added_requested,
-    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: partial_applied=True
-    means some children attached and some did not (cmd_subissue_add exit
-    2); `added_requested` is the input list always, `added` is empty
-    on partial (the wrapper cannot enumerate per-issue, verify via
-    subissue_list).
+    Returns: dict with ok, partial_applied, outcome, parent, added,
+    added_requested, raw, stderr. Shape and `outcome` / added
+    semantics mirror `epic_add_children`; see that docstring for the
+    full enumeration and branching idiom.
     """
     return _planning_add_children("subtask", number, issue_numbers, repo_path)
 
@@ -3169,9 +3194,9 @@ def subtask_remove_children(number: int, issue_numbers: list[int],
                             repo_path: str = "") -> dict:
     """Detach sub-issues from a Sub-task.
 
-    Returns: dict with ok, partial_applied, parent, removed, removed_requested,
-    raw, stderr. v1.9.2 round-7 #10 / round-2 #5: same partial_applied /
-    requested split as the add path.
+    Returns: dict with ok, partial_applied, outcome, parent, removed,
+    removed_requested, raw, stderr. Shape and `outcome` semantics
+    mirror `epic_add_children` / `epic_remove_children`.
     """
     return _planning_remove_children("subtask", number, issue_numbers,
                                      repo_path)
