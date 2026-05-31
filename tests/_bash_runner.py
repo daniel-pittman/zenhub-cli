@@ -185,6 +185,7 @@ def run_zh_with_stubs(
     # affect rendering but carry no secrets, then layers
     # env_defaults on top so the harness's explicit overrides win.
     import os as _os
+    import sys as _sys
     _ALLOWED_INHERIT = (
         "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_TIME",
         "LC_NUMERIC", "LC_MESSAGES",
@@ -204,6 +205,7 @@ def run_zh_with_stubs(
     # where `/tmp/xxxxxx-nix-shell` style entries can land on PATH).
     parent_path = _os.environ.get("PATH", "")
     safe_path_parts = []
+    dropped_entries = []
     if parent_path:
         for entry in parent_path.split(":"):
             if not entry:
@@ -212,16 +214,38 @@ def run_zh_with_stubs(
                 st = _os.stat(entry)
             except OSError:
                 continue
-            # Skip world-writable directories (other-write bit set
-            # AND not sticky). The sticky-bit carve-out lets /tmp-like
-            # shared directories through if they're explicitly marked,
-            # though those should normally not be on PATH at all.
+            # Skip every world-writable directory. v1.9.4 (PR
+            # #35) finding #4: the previous sticky-bit carve-out was
+            # the wrong threat model — sticky prevents non-owners from
+            # DELETING files, but does NOT prevent any local user from
+            # CREATING a binary in the directory. A test running on a
+            # host where `/tmp` (or any sticky world-writable dir)
+            # ended up on PATH would happily resolve `jq` / `gh` to an
+            # attacker-planted binary. The hardcoded floor PATH
+            # (`/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin`) covers
+            # every legitimate case for which tools need to resolve in
+            # the test harness; no production PATH should require an
+            # exemption for a world-writable entry.
             mode = st.st_mode
             world_writable = bool(mode & 0o002)
-            sticky = bool(mode & 0o1000)
-            if world_writable and not sticky:
+            if world_writable:
+                dropped_entries.append(entry)
                 continue
             safe_path_parts.append(entry)
+    # v1.9.4 round-2 finding #5: when the filter empties every parent
+    # PATH entry (Nix scratch profiles, certain bind-mounted CI
+    # scratch dirs), tests can silently fall back to the floor and
+    # later fail with `jq: command not found` without any indicator
+    # that the filter caused it. Emit a one-line breadcrumb when any
+    # entry was dropped, gated on `ZH_TEST_PATH_FILTER_VERBOSE=1` so
+    # the default test output stays quiet.
+    if dropped_entries and _os.environ.get("ZH_TEST_PATH_FILTER_VERBOSE") == "1":
+        _sys.stderr.write(
+            "_bash_runner: filtered "
+            f"{len(dropped_entries)} world-writable PATH "
+            f"{'entry' if len(dropped_entries) == 1 else 'entries'}: "
+            f"{','.join(dropped_entries)}\n"
+        )
     if safe_path_parts:
         inherited["PATH"] = ":".join(safe_path_parts)
 
