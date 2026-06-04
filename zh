@@ -420,17 +420,47 @@ For multi-workspace repos, also see -w / --workspace and ZH_WORKSPACE."
     fi
 }
 
+# Resolve a repo's numeric GitHub ID via the gh CLI, failing closed.
+#
+# `gh api repos/<owner>/<repo> --jq '.id'` does not fail safely on its own.
+# On an HTTP error (404 for a missing or private repo, an auth failure, or a
+# misbehaving gh shim that prints an error body but exits 0) the result is
+# either a non-zero exit or a non-numeric JSON error body, e.g.
+# {"message":"Not Found",...,"status":"404"}. A bare `[[ -z "$gh_id" ]]`
+# guard misses the body case; under `set -e` the non-zero case dies silently
+# at the bare assignment. The body then flows into the GraphQL
+# `$ghIds: [Int!]!` variable and surfaces as a baffling
+# "could not coerce value {...} to Int" cascade followed by a misleading
+# "No workspace found".
+#
+# This helper checks BOTH the gh exit status and that the result is purely
+# numeric. On success it prints the id and returns 0. On failure it prints
+# the (collapsed, one-line) gh diagnostic to stderr and returns 1, so callers
+# can abort with a clean actionable message or degrade. The `|| gh_status=$?`
+# capture keeps the inner failure from tripping `set -e` before we inspect it.
+resolve_gh_repo_id() {
+    local owner_repo="$1"
+    local gh_id gh_status=0
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>&1) || gh_status=$?
+
+    if (( gh_status != 0 )) || [[ ! "$gh_id" =~ ^[0-9]+$ ]]; then
+        local detail
+        detail=$(printf '%s' "$gh_id" | tr '\n' ' ')
+        printf "  GitHub lookup for '%s' failed: %s\n" "$owner_repo" "$detail" >&2
+        return 1
+    fi
+
+    printf '%s' "$gh_id"
+}
+
 # Get ZenHub repository ID from owner/repo (uses gh CLI to get GitHub ID first)
 get_repo_id() {
     local owner_repo="$1"
 
     # First get the GitHub repo ID using gh CLI
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
-
-    if [[ -z "$gh_id" ]]; then
-        error "Could not get GitHub repo ID for: $owner_repo (is gh CLI authenticated?)"
-    fi
+    gh_id=$(resolve_gh_repo_id "$owner_repo") || \
+        error "Could not get GitHub repo ID for: $owner_repo (check the repo path and 'gh auth status')"
 
     # Now query ZenHub with the GitHub ID
     local query='
@@ -544,11 +574,8 @@ get_workspace_id() {
 
     # Get GitHub repo ID
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
-
-    if [[ -z "$gh_id" ]]; then
-        error "Could not get GitHub repo ID for: $owner_repo"
-    fi
+    gh_id=$(resolve_gh_repo_id "$owner_repo") || \
+        error "Could not get GitHub repo ID for: $owner_repo (check the repo path and 'gh auth status')"
 
     local workspace_nodes
     workspace_nodes=$(zh_workspaces_fetch_all "$gh_id")
@@ -619,12 +646,14 @@ zh_fetch_issue_types() {
     local owner_repo="$1"
     local workspace_id="$2"
 
+    # Soft path: this feeds issue-type discovery, so degrade to "[]" rather
+    # than aborting. 2>/dev/null suppresses the helper's diagnostic to keep
+    # discovery quiet (the caller surfaces its own error if types are needed).
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null || true)
-    if [[ -z "$gh_id" ]]; then
+    gh_id=$(resolve_gh_repo_id "$owner_repo" 2>/dev/null) || {
         echo "[]"
         return
-    fi
+    }
 
     local query='
     query($ghIds: [Int!]!, $workspaceId: ID!) {
@@ -965,11 +994,8 @@ cmd_workspaces() {
 
     # Get GitHub repo ID
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
-
-    if [[ -z "$gh_id" ]]; then
-        error "Could not get GitHub repo ID for: $owner_repo"
-    fi
+    gh_id=$(resolve_gh_repo_id "$owner_repo") || \
+        error "Could not get GitHub repo ID for: $owner_repo (check the repo path and 'gh auth status')"
 
     # Walk every page of workspacesConnection so the listing is complete
     # for repos connected to >50 workspaces. Same walker the resolver
@@ -3372,7 +3398,8 @@ cmd_labels() {
     info "Getting labels for ${owner_repo}..."
 
     local gh_id
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
+    gh_id=$(resolve_gh_repo_id "$owner_repo") || \
+        error "Could not get GitHub repo ID for: $owner_repo (check the repo path and 'gh auth status')"
 
     local query='
     query($ghIds: [Int!]!) {
@@ -3546,11 +3573,8 @@ NOTE: Consider requesting GraphQL support for this feature at:
 
     # Get GitHub repo ID (REST API uses GitHub IDs, not ZenHub IDs)
     local gh_repo_id
-    gh_repo_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>/dev/null)
-
-    if [[ -z "$gh_repo_id" ]]; then
-        error "Could not get GitHub repo ID for: $owner_repo"
-    fi
+    gh_repo_id=$(resolve_gh_repo_id "$owner_repo") || \
+        error "Could not get GitHub repo ID for: $owner_repo (check the repo path and 'gh auth status')"
 
     info "Removing dependency: #${blocked_num} blocked by #${blocking_num}..."
 
