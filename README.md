@@ -38,8 +38,8 @@ Before installing, ensure you have these dependencies:
 ### Verify Dependencies
 
 ```bash
-# Check all dependencies are installed
-command -v bash curl jq git gh >/dev/null && echo "All dependencies installed!" || echo "Missing dependencies"
+# Check all dependencies are installed (reports each missing tool by name)
+missing=""; for dep in bash curl jq git gh; do command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"; done; [ -z "$missing" ] && echo "All dependencies installed!" || echo "Missing dependencies:$missing"
 
 # Ensure GitHub CLI is authenticated
 gh auth status
