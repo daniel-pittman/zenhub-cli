@@ -1136,7 +1136,7 @@ def test_planning_create_blocks_on_duplicate(monkeypatch):
     import similarity as _similarity_module
     monkeypatch.setattr(
         _similarity_module, "check_duplicate",
-        lambda title, body, repo: blocked_info,
+        lambda title, body, repo, **kwargs: blocked_info,
     )
 
     called = {"ran": False}
@@ -1181,7 +1181,7 @@ def test_planning_create_confirm_create_overrides_block(monkeypatch):
     import similarity as _similarity_module
     monkeypatch.setattr(
         _similarity_module, "check_duplicate",
-        lambda title, body, repo: {
+        lambda title, body, repo, **kwargs: {
             "ok": True,
             "recommendation": "block",
             "hard_threshold": 0.7,
@@ -1268,7 +1268,7 @@ def test_planning_create_warn_recommendation_does_not_block(monkeypatch):
     import similarity as _similarity_module
     monkeypatch.setattr(
         _similarity_module, "check_duplicate",
-        lambda title, body, repo: {
+        lambda title, body, repo, **kwargs: {
             "ok": True,
             "recommendation": "warn",
             "soft_threshold": 0.5,
