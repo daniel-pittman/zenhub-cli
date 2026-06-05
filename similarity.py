@@ -520,38 +520,83 @@ def find_similar(query_text: str, repo: str, *, top_k: int = 5,
     ]
 
 
-def check_duplicate(title: str, body: str, repo: str) -> dict:
+def check_duplicate(title: str, body: str, repo: str, *,
+                    parent: Optional[int] = None,
+                    related_issues: Optional[list[int]] = None) -> dict:
     """Pre-flight duplicate check for create_issue.
 
     Returns a dict describing what to do:
         {
           "ok": True,
-          "matches": [...top candidates...],
+          "matches": [...top candidates, each with "match_kind"...],
           "any_above_hard": bool,    # at least one match >= HARD threshold
           "any_above_soft": bool,    # at least one match >= SOFT threshold
+          "downgraded_structural": bool,  # a hard match was a structural
+                                          # relative, so block became warn
           "recommendation": "create" | "warn" | "block",
         }
 
     Callers may pass `confirm_create=True` to bypass a "block"
     recommendation.
+
+    Structural-relative downgrade (issue #46): when bulk-loading a
+    deeply-structured backlog, a child's body legitimately matches the
+    parent that enumerates it (a parent epic whose body lists "Wave A,
+    Wave B, ..." scores 0.70-0.78 against the "Wave A" sub-task we are
+    about to wire under it). That is not a duplicate, it is the
+    `addSubIssues` target. `parent` (the intended parent issue number,
+    forwarded from create_issue's `--parent`) and `related_issues` (an
+    explicit set of sibling numbers the caller already knows are
+    structural relatives) name the issues whose matches must NOT hard-
+    block. Each match is tagged `match_kind`: "structural_relative" when
+    its number is in that set, else "candidate". A hard match is only a
+    `block` when it is a genuine candidate; a hard match that is purely
+    structural is downgraded to `warn` so it is still surfaced, not
+    silently created. Sibling-by-parent detection is not derivable here
+    (the embedding cache stores no parent metadata), which is why the
+    caller passes `related_issues` explicitly.
     """
+    structural: set[int] = set()
+    if parent:
+        structural.add(int(parent))
+    if related_issues:
+        structural.update(int(n) for n in related_issues)
+
     query = _embedding_text(title, body)
     matches = find_similar(
         query, repo, top_k=5, threshold=DUPLICATE_SOFT_THRESHOLD
     )
+
+    match_dicts = []
+    for m in matches:
+        d = m.to_dict()
+        d["match_kind"] = (
+            "structural_relative" if m.number in structural else "candidate"
+        )
+        match_dicts.append(d)
+
     any_hard = any(m.similarity >= DUPLICATE_HARD_THRESHOLD for m in matches)
     any_soft = any(m.similarity >= DUPLICATE_SOFT_THRESHOLD for m in matches)
-    if any_hard:
+    # A real block requires a hard match that is NOT a structural relative.
+    candidate_hard = any(
+        m.similarity >= DUPLICATE_HARD_THRESHOLD and m.number not in structural
+        for m in matches
+    )
+    downgraded_structural = any_hard and not candidate_hard
+    if candidate_hard:
         rec = "block"
     elif any_soft:
+        # Ordinary soft matches AND downgraded structural-hard matches
+        # (which are >= soft) land here: surfaced as a warning, not blocked.
         rec = "warn"
     else:
         rec = "create"
     return {
         "ok": True,
-        "matches": [m.to_dict() for m in matches],
+        "matches": match_dicts,
         "any_above_hard": any_hard,
         "any_above_soft": any_soft,
+        "downgraded_structural": downgraded_structural,
         "recommendation": rec,
         "hard_threshold": DUPLICATE_HARD_THRESHOLD,
         "soft_threshold": DUPLICATE_SOFT_THRESHOLD,

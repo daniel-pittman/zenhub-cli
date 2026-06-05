@@ -62,6 +62,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -69,6 +70,13 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+
+# Module logger (issue #39): diagnostics from the outcome-sentinel parser
+# route through the standard logging machinery instead of a raw stderr
+# write, so operators of a long-running MCP stdio server can configure
+# where MCP-internal logs go without those lines colliding with FastMCP's
+# framing-adjacent stderr output.
+log = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Self-bootstrap: build (or rebuild, if broken / stale) a durable venv under
@@ -1600,7 +1608,8 @@ def create_issue(title: str, body: str, type: str = "Task",
                  labels: str = "", parent: int = 0,
                  priority: str = "", repo_path: str = "",
                  confirm_create: bool = False,
-                 skip_duplicate_check: bool = False) -> dict:
+                 skip_duplicate_check: bool = False,
+                 related_issues: list[int] | None = None) -> dict:
     """Create a new ZenHub issue.
 
     Runs a pre-flight similarity check against existing open issues
@@ -1642,6 +1651,14 @@ def create_issue(title: str, body: str, type: str = "Task",
             (e.g. when migrating issues in bulk or when the similarity
             index is known to be unavailable). Prefer `confirm_create`
             for one-off overrides.
+        related_issues: optional list of issue numbers that are known
+            structural relatives of this new issue (e.g. sibling
+            sub-issues being created in the same bulk-load). Issue #46:
+            a hard similarity match against `parent` or any of these is
+            tagged `match_kind="structural_relative"` and downgraded from
+            block to warn, so wiring a child under a parent whose body
+            enumerates it does not hard-block. `parent` is added to this
+            set automatically; pass `related_issues` only for siblings.
 
     Returns:
         On block: dict with ok=False, blocked=True, duplicate_check (the
@@ -1714,7 +1731,15 @@ def create_issue(title: str, body: str, type: str = "Task",
             try:
                 from similarity import check_duplicate
 
-                dup_info = check_duplicate(title, body, repo)
+                # Issue #46: forward the intended parent (and any caller-
+                # declared sibling relatives) so a hard match against a
+                # structural relative is downgraded to a warning instead
+                # of hard-blocking the addSubIssues wiring.
+                dup_info = check_duplicate(
+                    title, body, repo,
+                    parent=parent if parent else None,
+                    related_issues=related_issues,
+                )
             except Exception as e:
                 # Embedding failure shouldn't block create — log only,
                 # with an actionable hint if the venv deps are corrupt.
@@ -2209,7 +2234,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
                      pipeline: str, assignee: str, estimate: str,
                      parent: int, repo_path: str,
                      confirm_create: bool = False,
-                     skip_duplicate_check: bool = False) -> dict:
+                     skip_duplicate_check: bool = False,
+                     related_issues: list[int] | None = None) -> dict:
     """Shared `zh <noun> create --json` wrapper for the planning nouns.
 
     Forwards every meaningful create-time flag the bash side exposes:
@@ -2285,7 +2311,14 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             try:
                 from similarity import check_duplicate
 
-                dup_info = check_duplicate(title, description, repo)
+                # Issue #46: same structural-relative downgrade as
+                # create_issue, so e.g. an Epic created under a Project
+                # whose body enumerates its Epics is not hard-blocked.
+                dup_info = check_duplicate(
+                    title, description, repo,
+                    parent=parent if parent else None,
+                    related_issues=related_issues,
+                )
             except Exception as e:
                 dup_info = {
                     "ok": False,
@@ -2522,7 +2555,15 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     """
     if not stderr_plain:
         return None
-    matches = _OUTCOME_SENTINEL_RE.findall(stderr_plain)
+    # v1.9.6 (issue #38): `_OUTCOME_SENTINEL_RE` uses re.MULTILINE, which
+    # only treats `\n` as a line boundary, so a sentinel delivered on a
+    # bare-`\r`-terminated line (TUI progress overwrites, some PTY
+    # captures, transports that normalize line endings differently) would
+    # not match the `\s*$` anchor: `sentinel_seen` stayed False and a
+    # successful op reported added=[] / ok_unverified. Normalize CRLF and
+    # bare CR to LF before matching so every line ending is seen.
+    normalized = stderr_plain.replace("\r\n", "\n").replace("\r", "\n")
+    matches = _OUTCOME_SENTINEL_RE.findall(normalized)
     if not matches:
         return None
     last = matches[-1]
@@ -2532,10 +2573,11 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     # outcome word so a bash-side addition (or a typo) is observed,
     # not swallowed. An unknown outcome falls back to inference and
     # logs a breadcrumb so the divergence is loud, not silent.
-    print(
-        f"_parse_outcome_sentinel: unknown outcome '{last}' "
-        f"(known: {sorted(_SENTINEL_OUTCOMES)})",
-        file=sys.stderr,
+    # v1.9.6 (issue #39): route the breadcrumb through `logging` rather
+    # than a raw stderr write so it lands on a configurable handler.
+    log.warning(
+        "_parse_outcome_sentinel: unknown outcome %r (known: %s)",
+        last, sorted(_SENTINEL_OUTCOMES),
     )
     return None
 
@@ -2619,7 +2661,14 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
     # the explicit sentinel signal to credit children as landed; absent
     # the sentinel, default `added=[]` so a future bash change that
     # accidentally drops the sentinel emit can't silently overstate.
-    is_landed = sentinel_seen and outcome == "ok"
+    # v1.9.6 (issue #37): `and not partial_applied` makes is_landed and
+    # partial_applied mutually exclusive at the Python layer. If a future
+    # bash refactor ever emitted `__ZH_OUTCOME__:ok` while exiting 2,
+    # the pre-guard code returned BOTH partial_applied=True AND
+    # added=children (a self-contradictory envelope coupled only by
+    # convention). The guard makes the partial signal win, so drift
+    # produces a debuggable result instead of contradictory state.
+    is_landed = sentinel_seen and outcome == "ok" and not partial_applied
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2669,7 +2718,10 @@ def _planning_remove_children(noun: str, parent: int, children: list[int],
         outcome = "ok_unverified"
     else:
         outcome = "fail"
-    is_landed = sentinel_seen and outcome == "ok"
+    # v1.9.6 (issue #37): same mutual-exclusion guard as the add path —
+    # a contradictory sentinel-ok + exit-2 envelope resolves to the
+    # partial signal instead of crediting `removed` AND partial_applied.
+    is_landed = sentinel_seen and outcome == "ok" and not partial_applied
     return {
         "ok": r["ok"] or partial_applied,
         "partial_applied": partial_applied,
@@ -2756,7 +2808,8 @@ def epic_create(title: str, description: str = "", labels: str = "",
                 pipeline: str = "", assignee: str = "", estimate: str = "",
                 parent: int = 0, repo_path: str = "",
                 confirm_create: bool = False,
-                skip_duplicate_check: bool = False) -> dict:
+                skip_duplicate_check: bool = False,
+                related_issues: list[int] | None = None) -> dict:
     """Create an Epic (an issue with issue-type Epic).
 
     v1.9.0: an epic is a normal issue typed Epic, with a normal issue
@@ -2798,6 +2851,7 @@ def epic_create(title: str, description: str = "", labels: str = "",
         assignee, estimate, parent, repo_path,
         confirm_create=confirm_create,
         skip_duplicate_check=skip_duplicate_check,
+        related_issues=related_issues,
     ))
 
 
@@ -2918,7 +2972,8 @@ def initiative_create(title: str, description: str = "", labels: str = "",
                       estimate: str = "", parent: int = 0,
                       repo_path: str = "",
                       confirm_create: bool = False,
-                      skip_duplicate_check: bool = False) -> dict:
+                      skip_duplicate_check: bool = False,
+                      related_issues: list[int] | None = None) -> dict:
     """Create an Initiative (issue-type Initiative, level 1).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -2936,7 +2991,8 @@ def initiative_create(title: str, description: str = "", labels: str = "",
     return _planning_create("initiative", title, description, labels,
                             pipeline, assignee, estimate, parent, repo_path,
                             confirm_create=confirm_create,
-                            skip_duplicate_check=skip_duplicate_check)
+                            skip_duplicate_check=skip_duplicate_check,
+                            related_issues=related_issues)
 
 
 @mcp.tool()
@@ -3026,7 +3082,8 @@ def project_create(title: str, description: str = "", labels: str = "",
                    estimate: str = "", parent: int = 0,
                    repo_path: str = "",
                    confirm_create: bool = False,
-                   skip_duplicate_check: bool = False) -> dict:
+                   skip_duplicate_check: bool = False,
+                   related_issues: list[int] | None = None) -> dict:
     """Create a Project (issue-type Project, level 2).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3044,7 +3101,8 @@ def project_create(title: str, description: str = "", labels: str = "",
     return _planning_create("project", title, description, labels, pipeline,
                             assignee, estimate, parent, repo_path,
                             confirm_create=confirm_create,
-                            skip_duplicate_check=skip_duplicate_check)
+                            skip_duplicate_check=skip_duplicate_check,
+                            related_issues=related_issues)
 
 
 @mcp.tool()
@@ -3130,7 +3188,8 @@ def subtask_create(title: str, description: str = "", labels: str = "",
                    estimate: str = "", parent: int = 0,
                    repo_path: str = "",
                    confirm_create: bool = False,
-                   skip_duplicate_check: bool = False) -> dict:
+                   skip_duplicate_check: bool = False,
+                   related_issues: list[int] | None = None) -> dict:
     """Create a Sub-task (issue-type Sub-task, level 5).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3148,7 +3207,8 @@ def subtask_create(title: str, description: str = "", labels: str = "",
     return _planning_create("subtask", title, description, labels, pipeline,
                             assignee, estimate, parent, repo_path,
                             confirm_create=confirm_create,
-                            skip_duplicate_check=skip_duplicate_check)
+                            skip_duplicate_check=skip_duplicate_check,
+                            related_issues=related_issues)
 
 
 @mcp.tool()

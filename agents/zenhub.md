@@ -219,6 +219,8 @@ The motivating case for this rule: a "Users randomly logged out around 5pm" tick
 
 **Override carefully in bulk operations:** if you're filing many genuinely distinct tickets in a known-clean batch (e.g. wave creation where you've already audited the backlog), `skip_duplicate_check=True` is reasonable per-call to avoid noise. Document the choice in the batch audit YAML.
 
+**Structural relatives don't block (v1.9.6):** when you create a child under a parent (`parent=N`), a hard match against that parent is expected, not a duplicate: a parent whose body enumerates its children scores high against each child you wire under it. The pre-flight now tags such a match `match_kind="structural_relative"` and downgrades it from block to warn (`duplicate_check.downgraded_structural=True`), so a child-under-parent create is no longer hard-blocked by its own parent. Prefer passing `parent=N` at create time over `confirm_create=True` for this case. When bulk-loading a structured backlog where siblings also cross-match, pass `related_issues=[...]` with the sibling numbers so those matches downgrade too. Genuine (non-structural) hard matches still block and must be surfaced as above.
+
 ---
 
 ## Project-specific conventions
