@@ -1616,20 +1616,21 @@ def test_v193_zh_cause_hint_pure_bash_strips_osc_st_terminator() -> None:
         err_file = pathlib.Path(tmp_dir) / "stderr.txt"
         err_file.write_text(osc_st)
 
-        # v1.9.4 finding #4: stub `command -v sed` inside the same
-        # bash process to force the pure-bash branch. No PATH munging,
-        # no `which` dependency, no symlink dance. The function-stub
-        # approach matches the rest of the harness pattern and works
-        # even if `which` isn't on PATH.
+        # v1.9.6 (issue #42): force the pure-bash branch by running
+        # zh_cause_hint under an EMPTY PATH, so `command -v sed` (and
+        # awk/paste/tr) all fail and the all-four gate falls through.
+        # The pre-v1.9.6 version installed a `command() {...}` function
+        # that shadowed the bash builtin for the whole subshell; a future
+        # `command -v X` call added to zh_cause_hint would have routed
+        # through the stub and behaved differently from production. zh is
+        # sourced FIRST under the normal PATH (its top-level `$(cat ...)`
+        # etc. need real tools); only the helper call runs PATH-less, and
+        # the pure-bash branch uses bash builtins exclusively, so an empty
+        # PATH is safe there. The `command` builtin stays intact.
         zh_path = pathlib.Path(__file__).parent.parent / "zh"
         wrapper = (
             f'source "{zh_path}" 2>/dev/null || true\n'
-            # Override `command -v sed` so zh_cause_hint takes the
-            # pure-bash branch. Other tools (awk/paste/tr) are still
-            # detected normally; the if-all chain in zh_cause_hint
-            # short-circuits at the first missing tool.
-            'command() { if [[ "$1" == "-v" && "$2" == "sed" ]]; then return 1; fi; builtin command "$@"; }\n'
-            f'zh_cause_hint "{err_file}"\n'
+            f'PATH= zh_cause_hint "{err_file}"\n'
         )
         r = subprocess.run(
             ["bash", "-c", wrapper], capture_output=True, text=True,
@@ -1651,6 +1652,106 @@ def test_v193_zh_cause_hint_pure_bash_strips_osc_st_terminator() -> None:
     finally:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _run_cause_hint_purebash_bytes(raw: bytes):
+    """Run zh_cause_hint's pure-bash branch over a RAW-BYTES input file.
+
+    v1.9.6 (issue #40): the 8-bit C1 normalization branches added in
+    v1.9.4 (single-byte ST 0x9C → BEL, single-byte CSI 0x9B → ESC[, and
+    the UTF-8-encoded two-byte ST 0xC2 0x9C under `local LC_ALL=C`) had no
+    test exercising the raw byte forms. We must inject the bytes via
+    `write_bytes` (a text-mode write would re-encode them) and read the
+    output as bytes so the assertions can check that no raw C1 byte
+    survives. zh is sourced under the normal PATH; the helper runs under
+    an empty PATH so it takes the pure-bash branch (issue #42 pattern).
+    """
+    import pathlib
+    import subprocess
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="zh_c1_test_")
+    try:
+        err_file = pathlib.Path(tmp_dir) / "stderr.bin"
+        err_file.write_bytes(raw)
+        zh_path = pathlib.Path(__file__).parent.parent / "zh"
+        wrapper = (
+            f'source "{zh_path}" 2>/dev/null || true\n'
+            f'PATH= zh_cause_hint "{err_file}"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", wrapper], capture_output=True, text=False,
+            timeout=15,
+        )
+    finally:
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_v196_c1_single_byte_st_0x9c_normalized() -> None:
+    """Issue #40: an OSC closed by the single-byte 8-bit ST (0x9C) must
+    be stripped. The byte folds to BEL so the BEL OSC regex catches it.
+    """
+    # ESC ] 0;test-title <0x9C> diagnostic message
+    raw = b"\x1b]0;test-title\x9cdiagnostic message"
+    r = _run_cause_hint_purebash_bytes(raw)
+    assert b"diagnostic message" in r.stdout, (
+        f"post-OSC text must survive; got stdout={r.stdout!r}"
+    )
+    assert b"\x9c" not in r.stdout, (
+        f"raw 8-bit ST byte must be normalized away; got stdout={r.stdout!r}"
+    )
+    assert b"\x1b" not in r.stdout, (
+        f"OSC escape must be stripped; got stdout={r.stdout!r}"
+    )
+    assert b"test-title" not in r.stdout, (
+        f"OSC body must be stripped; got stdout={r.stdout!r}"
+    )
+
+
+def test_v196_c1_single_byte_csi_0x9b_normalized() -> None:
+    """Issue #40: a CSI introduced by the single-byte 8-bit CSI (0x9B)
+    must be stripped. The byte expands to ESC[ so the CSI regex catches it.
+    """
+    # before <0x9B>31m after  (8-bit CSI introduces a colour SGR sequence)
+    raw = b"before\x9b31mafter"
+    r = _run_cause_hint_purebash_bytes(raw)
+    assert b"before" in r.stdout and b"after" in r.stdout, (
+        f"text around the CSI must survive; got stdout={r.stdout!r}"
+    )
+    assert b"\x9b" not in r.stdout, (
+        f"raw 8-bit CSI byte must be normalized away; got stdout={r.stdout!r}"
+    )
+    assert b"\x1b" not in r.stdout, (
+        f"expanded CSI escape must be stripped; got stdout={r.stdout!r}"
+    )
+    assert b"31m" not in r.stdout, (
+        f"CSI parameter/final bytes must be stripped; got stdout={r.stdout!r}"
+    )
+
+
+def test_v196_c1_utf8_two_byte_st_normalized() -> None:
+    """Issue #40: the UTF-8-encoded two-byte ST (0xC2 0x9C) must be
+    handled under `local LC_ALL=C` byte comparison: the leading 0xC2
+    falls through to the OSC body, the trailing 0x9C folds to BEL and
+    terminates the OSC. No raw C1 byte survives.
+    """
+    # ESC ] 0;test-title <0xC2 0x9C> diagnostic message
+    raw = b"\x1b]0;test-title\xc2\x9cdiagnostic message"
+    r = _run_cause_hint_purebash_bytes(raw)
+    assert b"diagnostic message" in r.stdout, (
+        f"post-OSC text must survive; got stdout={r.stdout!r}"
+    )
+    assert b"\x9c" not in r.stdout, (
+        f"trailing UTF-8 ST byte must be normalized away; "
+        f"got stdout={r.stdout!r}"
+    )
+    assert b"\x1b" not in r.stdout, (
+        f"OSC escape must be stripped; got stdout={r.stdout!r}"
+    )
+    assert b"test-title" not in r.stdout, (
+        f"OSC body must be stripped; got stdout={r.stdout!r}"
+    )
 
 
 def test_v193_top_level_write_tools_expose_partial_applied() -> None:
@@ -1716,20 +1817,61 @@ def test_v193_create_issue_validation_returns_include_partial_applied() -> None:
     (empty title, empty body) and the blocked path must also include
     partial_applied so the contract holds across every return path of
     create_issue / _planning_create.
+
+    v1.9.6 (issue #45): pin EVERY key the `_empty_create_shape` contract
+    promises, plus their validation-failure defaults, not just
+    `partial_applied`. The v1.9.2 round-7 #8/#11 KeyError class came from
+    a strict downstream client reading a documented key the early-return
+    had dropped; pinning only one key would let a future "prune the shape
+    to keys current tests touch" refactor reintroduce that class without
+    CI noticing. The stronger key + default form also catches a
+    "key present but default changed" regression.
     """
     import mcp_server
 
-    out = mcp_server.create_issue(title="", body="b", skip_duplicate_check=True)
-    assert out["ok"] is False
-    assert "partial_applied" in out and out["partial_applied"] is False
+    # The full shape every create early-return must emit (mcp_server.py
+    # `_empty_create_shape` + the stderr / duplicate_check the return adds).
+    expected_keys = {
+        "ok", "partial_applied", "number", "url", "type", "pipeline",
+        "parent", "estimate", "estimate_requested", "priority",
+        "priority_requested", "raw", "stderr", "duplicate_check",
+    }
 
-    out = mcp_server.create_issue(title="t", body="", skip_duplicate_check=True)
-    assert out["ok"] is False
-    assert "partial_applied" in out and out["partial_applied"] is False
+    def _assert_validation_shape(out: dict, *, expect_stderr_contains: str):
+        assert set(out.keys()) >= expected_keys, (
+            f"validation-failure shape dropped keys "
+            f"{expected_keys - set(out.keys())!r}; got {sorted(out.keys())!r}"
+        )
+        # Pin defaults, not just presence — "key present but default
+        # changed" is the actual regression class (issue #45).
+        assert out["ok"] is False
+        assert out["partial_applied"] is False
+        assert out["number"] is None
+        assert out["url"] is None
+        assert out["type"] is None
+        assert out["pipeline"] is None
+        assert out["parent"] is None
+        assert out["estimate"] is None
+        assert out["estimate_requested"] is None
+        assert out["priority"] is None
+        assert out["priority_requested"] is None
+        assert out["raw"] == ""
+        assert out["duplicate_check"] == {"recommendation": "skipped",
+                                          "matches": []}
+        assert expect_stderr_contains in out["stderr"]
 
-    out = mcp_server.epic_create(title="", skip_duplicate_check=True)
-    assert out["ok"] is False
-    assert "partial_applied" in out and out["partial_applied"] is False
+    _assert_validation_shape(
+        mcp_server.create_issue(title="", body="b", skip_duplicate_check=True),
+        expect_stderr_contains="title must be non-empty",
+    )
+    _assert_validation_shape(
+        mcp_server.create_issue(title="t", body="", skip_duplicate_check=True),
+        expect_stderr_contains="body must be non-empty",
+    )
+    _assert_validation_shape(
+        mcp_server.epic_create(title="", skip_duplicate_check=True),
+        expect_stderr_contains="title must be non-empty",
+    )
 
 
 def test_v194r2_blocked_duplicate_path_exposes_partial_applied_false() -> None:
@@ -1757,7 +1899,7 @@ def test_v194r2_blocked_duplicate_path_exposes_partial_applied_false() -> None:
         ],
     }
 
-    def fake_check_duplicate(title, body, repo):
+    def fake_check_duplicate(title, body, repo, **kwargs):
         return block_dup_info
 
     with patch("similarity.check_duplicate", new=fake_check_duplicate), \
@@ -1898,6 +2040,27 @@ def test_v193_subissue_remove_emits_noop_outcome_sentinel() -> None:
         f"cmd_subissue_remove must emit __ZH_OUTCOME__:noop on stderr "
         f"when the API no-ops (v1.9.4 #3). got stderr={r.stderr!r}"
     )
+
+    # v1.9.6 (issue #41): pin the cascade ORDER, not just the N=1 path.
+    # The outcome cascade is `... elif success==0: noop  elif divergence:
+    # partial ...`. With successCount=0 and 2 inputs, divergence is true
+    # (success_count 0 != inferred_removed_count 2), so BOTH the noop and
+    # the divergence-partial arms are live simultaneously. The result must
+    # be `noop` (idempotent success, exit 0), proving the noop arm
+    # precedes the divergence-partial arm. A refactor that swapped the two
+    # arms would flip this to `partial` (exit 2) and get caught here.
+    r2 = run_zh_with_stubs(stubs, 'cmd_subissue_remove 42 100 101')
+    assert r2.returncode == 0, (
+        f"N=2 strict-noop (successCount=0, failed=[]) must exit 0, not 2: "
+        f"the noop arm must win over the divergence-partial arm. "
+        f"got rc={r2.returncode}, stderr={r2.stderr!r}"
+    )
+    assert "__ZH_OUTCOME__:noop" in r2.stderr, (
+        f"N=2 strict-noop must emit __ZH_OUTCOME__:noop, not :partial — "
+        f"pins noop-before-divergence cascade order (issue #41). "
+        f"got stderr={r2.stderr!r}"
+    )
+    assert "__ZH_OUTCOME__:partial" not in r2.stderr
 
 
 def test_v193_planning_add_children_missing_sentinel_keeps_added_empty() -> None:
@@ -2136,15 +2299,33 @@ def test_v193_zh_rest_token_does_not_reach_production_zh(monkeypatch) -> None:
     reads `ZH_REST_TOKEN` directly from inside the production-sourced
     shell — if the harness leaked the sentinel into the subprocess
     env, the inner read would emit it.
+
+    v1.9.6 (issue #43): the inner read alone runs only `printf` (a bash
+    builtin), so it never exercised `load_config` — the path a real
+    leak would travel (env passthrough during config sourcing). Drive a
+    real `cmd_*` (`cmd_workspaces`) that calls `load_config` end-to-end
+    FIRST, then read the var. The full config-sourcing surface is now
+    under test, not just the harness env.
     """
     sentinel = "developer-real-rest-token-DO-NOT-LEAK-PROD"
     monkeypatch.setenv("ZH_REST_TOKEN", sentinel)
 
-    # Source production zh, then echo ZH_REST_TOKEN as the inner
-    # subprocess sees it. If the harness leaked the parent's value,
-    # the sentinel would appear in stdout.
+    # Stub the network-facing helpers so cmd_workspaces reaches and runs
+    # load_config without touching gh / the ZenHub API. resolve_gh_repo_id
+    # returns a numeric id; zh_graphql returns one workspace node.
+    stubs = r"""
+        get_repo_info() { printf 'acme/widgets'; }
+        resolve_gh_repo_id() { printf '12345'; }
+        zh_graphql() {
+            printf '%s' '{"data":{"repositoriesByGhId":[{"workspacesConnection":{"nodes":[{"id":"w","name":"TestWS"}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}]}}'
+        }
+    """
+    # Run cmd_workspaces (exercises load_config), then echo ZH_REST_TOKEN
+    # as the production-sourced shell sees it after config sourcing. If a
+    # leak reached the var via load_config, the sentinel would appear.
     r = run_zh_with_stubs(
-        "",
+        stubs,
+        'cmd_workspaces >/dev/null 2>&1; '
         'printf "REST_TOKEN_INSIDE=%s\\n" "${ZH_REST_TOKEN:-(unset)}"',
     )
     assert sentinel not in r.stdout, (
@@ -2593,3 +2774,104 @@ def test_round2_f7_set_type_success_count_zero_exits_1() -> None:
 # re-implementation. The legacy snippet and its companion tests are
 # left in place for now (they still pass against their own embedded
 # code) but the canonical coverage is here.
+
+
+# ===========================================================================
+# v1.9.6 tech-debt closeout: sentinel hardening (#37, #38, #39).
+# ===========================================================================
+
+
+def test_v196_parse_sentinel_handles_bare_cr_line_ending() -> None:
+    """Issue #38: `_OUTCOME_SENTINEL_RE` uses re.MULTILINE, which only
+    treats `\\n` as a line boundary. A sentinel delivered on a bare-`\\r`
+    (or CRLF) terminated line must still be parsed; otherwise a
+    successful op silently reports ok_unverified / added=[]. The parser
+    normalizes CRLF and bare CR to LF before matching.
+    """
+    import mcp_server
+
+    assert mcp_server._parse_outcome_sentinel("__ZH_OUTCOME__:noop\r") == "noop"
+    assert mcp_server._parse_outcome_sentinel(
+        "progress\r__ZH_OUTCOME__:ok\r") == "ok"
+    assert mcp_server._parse_outcome_sentinel(
+        "line\r\n__ZH_OUTCOME__:partial\r\n") == "partial"
+    # last-match-wins still holds across mixed line endings
+    assert mcp_server._parse_outcome_sentinel(
+        "__ZH_OUTCOME__:ok\r__ZH_OUTCOME__:fail\r") == "fail"
+
+
+def test_v196_parse_sentinel_unknown_outcome_logs_via_logging(caplog) -> None:
+    """Issue #39: an unknown outcome word is routed through `logging`
+    (a configurable handler), not a raw stderr write that collides with
+    FastMCP's framing-adjacent stderr. The parser still returns None so
+    the caller falls back to inference.
+    """
+    import logging
+    import mcp_server
+
+    with caplog.at_level(logging.WARNING, logger="mcp_server"):
+        result = mcp_server._parse_outcome_sentinel("__ZH_OUTCOME__:bogus\n")
+
+    assert result is None
+    assert any(
+        rec.levelno == logging.WARNING and "bogus" in rec.getMessage()
+        for rec in caplog.records
+    ), f"expected a logged WARNING naming the unknown outcome; got {caplog.records!r}"
+
+
+def test_v196_planning_add_children_guards_contradictory_ok_plus_exit2() -> None:
+    """Issue #37: if the bash side ever emits `__ZH_OUTCOME__:ok` while
+    exiting 2 (a convention break a future refactor could introduce), the
+    wrapper must NOT return the self-contradictory envelope of
+    partial_applied=True AND added=children. The `and not partial_applied`
+    guard makes the partial signal win: added stays empty.
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    contradictory = {
+        "ok": True,
+        "stdout_plain": "Added 2 sub-issue(s)",
+        # sentinel says ok, but the process exited 2 (partial)
+        "stderr_plain": "__ZH_OUTCOME__:ok",
+        "stderr": "__ZH_OUTCOME__:ok",
+        "exit_code": 2,
+    }
+    with patch.object(mcp_server, "_run_zh", return_value=contradictory):
+        out = mcp_server.epic_add_children(
+            epic_number=42, issue_numbers=[100, 101],
+        )
+    assert out["partial_applied"] is True, (
+        f"exit 2 must surface partial_applied=True; got {out['partial_applied']!r}"
+    )
+    assert out["added"] == [], (
+        f"contradictory ok+exit2 must NOT credit children as added "
+        f"(issue #37 guard); got added={out['added']!r}"
+    )
+    assert out["added_requested"] == [100, 101]
+
+
+def test_v196_planning_remove_children_guards_contradictory_ok_plus_exit2() -> None:
+    """Issue #37: symmetric guard on the remove path — `removed` stays
+    empty when a sentinel-ok envelope arrives with exit 2.
+    """
+    from unittest.mock import patch
+    import mcp_server
+
+    contradictory = {
+        "ok": True,
+        "stdout_plain": "Removed 2 sub-issue(s)",
+        "stderr_plain": "__ZH_OUTCOME__:ok",
+        "stderr": "__ZH_OUTCOME__:ok",
+        "exit_code": 2,
+    }
+    with patch.object(mcp_server, "_run_zh", return_value=contradictory):
+        out = mcp_server.epic_remove_children(
+            epic_number=42, issue_numbers=[100, 101],
+        )
+    assert out["partial_applied"] is True
+    assert out["removed"] == [], (
+        f"contradictory ok+exit2 must NOT credit children as removed "
+        f"(issue #37 guard); got removed={out['removed']!r}"
+    )
+    assert out["removed_requested"] == [100, 101]
