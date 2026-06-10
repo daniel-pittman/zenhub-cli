@@ -2389,10 +2389,25 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         args.extend(["--parent", str(parent)])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
+    # v1.9.8 (#54): mirror create_issue's parent-wire-failure detection.
+    # cmd_create reports an addSubIssues failure as parent=null in the JSON
+    # (the issue was created but never wired under its parent). Detect the
+    # requested-vs-actual divergence and surface it as partial_applied=True
+    # so the planning-noun creates honor the same uniform partial_applied
+    # contract as create_issue / the children wrappers — and so the
+    # structured-plan bulk-load guard (agents/zenhub.md) that skips
+    # orphaned creates works through epic_create / project_create / etc.,
+    # not just create_issue.
+    parent_requested = parent if parent and parent > 0 else None
+    actual_parent = created.get("parent") if created else None
+    parent_wire_failed = (
+        r["ok"] and created is not None
+        and parent_requested is not None
+        and actual_parent != parent_requested
+    )
     out = {
         "ok": r["ok"] and created is not None,
-        # v1.9.4 finding #1: uniform-key parity.
-        "partial_applied": False,
+        "partial_applied": parent_wire_failed,
         "number": created.get("number") if created else None,
         "url": created.get("url") if created else None,
         "type": created.get("type") if created else None,

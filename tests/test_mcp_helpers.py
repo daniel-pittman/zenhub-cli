@@ -1472,6 +1472,80 @@ def test_planning_create_forwards_related_issues(monkeypatch, noun_create):
 
 
 # ---------------------------------------------------------------------------
+# v1.9.8 (#54): _planning_create must detect parent-wire (addSubIssues)
+# failure and report partial_applied=True, mirroring create_issue, so the
+# planning-noun creates honor the uniform partial_applied contract and the
+# bulk-load orphan guard works through them too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("noun_create", [
+    "epic_create", "initiative_create", "project_create", "subtask_create",
+])
+def test_planning_create_parent_wire_failure_sets_partial_applied(
+        monkeypatch, noun_create):
+    """Create succeeded (number returned) but the issue is NOT under the
+    requested parent (addSubIssues failed -> parent=null): partial_applied
+    must be True so a caller treats it as a wire-failure, not a clean
+    success."""
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            # number present, but parent came back null despite --parent 4
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": null}',
+            "stderr": "",
+        },
+    )
+    out = getattr(mcp_server, noun_create)(
+        title="T", parent=4, skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert out["number"] == 99
+    assert out["partial_applied"] is True, (
+        f"{noun_create}: parent-wire failure (requested 4, got null) must "
+        f"set partial_applied=True; got {out!r}"
+    )
+
+
+@pytest.mark.parametrize("noun_create", [
+    "epic_create", "initiative_create", "project_create", "subtask_create",
+])
+def test_planning_create_parent_wired_ok_is_not_partial(monkeypatch, noun_create):
+    """When the issue lands under the requested parent, partial_applied is
+    False (no false positive on the happy path)."""
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": 4}',
+            "stderr": "",
+        },
+    )
+    out = getattr(mcp_server, noun_create)(
+        title="T", parent=4, skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert out["partial_applied"] is False
+
+
+def test_planning_create_no_parent_requested_is_not_partial(monkeypatch):
+    """No parent requested -> a null returned parent is expected, not a
+    wire failure."""
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": null}',
+            "stderr": "",
+        },
+    )
+    out = mcp_server.epic_create(title="T", skip_duplicate_check=True)
+    assert out["ok"] is True
+    assert out["partial_applied"] is False
+
+
+# ---------------------------------------------------------------------------
 # v1.9.1 round-6 fixes: MCP-side surface (PR #25 round-5 findings #4 and #6).
 # ---------------------------------------------------------------------------
 
