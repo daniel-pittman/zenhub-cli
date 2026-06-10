@@ -344,32 +344,53 @@ When you file a structured plan (a YAML ticket plan with Planning IDs like `E1-T
 Pattern: keep a Planning-ID → issue-number map as you file, resolve each ticket's `depends_on` through it, and pass the resolved numbers as `related_issues`.
 
 ```python
-# plan: list of {planning_id, title, body, parent_planning_id, depends_on:[...]}
+# plan: list of {planning_id, title, body, type, labels, pipeline, estimate,
+#                priority, parent_planning_id, depends_on:[...]}
 id_to_num = {}                      # Planning ID -> real issue number (success only)
 for t in plan:                     # plan MUST be sorted depends_on-first
-    # `or 0` / `if id_to_num.get(d)`: a ticket that failed to file is NOT in
-    # the map, so a dependent never resolves it to None. Passing None as
-    # parent silently orphans the child; passing [None] as related_issues
-    # raises inside check_duplicate and silently disables the dup guard.
-    parent = id_to_num.get(t.get("parent_planning_id")) or 0
-    relatives = [id_to_num[d] for d in t.get("depends_on", []) if id_to_num.get(d)]
-    out = create_issue(title=t["title"], body=t["body"],
-                       parent=parent, related_issues=relatives)
-    if not out["ok"]:              # blocked (genuine dup) or failed
-        # Review out["duplicate_check"], then decide: retry with
-        # confirm_create=True, or stop the load. Do NOT record a number —
-        # leaving this planning_id unmapped keeps its dependents honest
-        # (they resolve it to nothing rather than to None).
-        handle_failed_create(t, out)   # surface + confirm_create / abort
+    # Skip a ticket whose declared parent didn't file: a missing parent means
+    # the child would be created orphaned at the top level (parent=0 and
+    # parent=None behave identically in create_issue, so defaulting wouldn't
+    # save the hierarchy — only skipping does).
+    parent_pid = t.get("parent_planning_id")
+    if parent_pid and parent_pid not in id_to_num:
+        handle_unfiled_parent(t)       # surface + decide: file flat, or stop
+        continue
+    parent = id_to_num.get(parent_pid, 0)
+    # `(... or [])` guards the YAML `depends_on:` (empty value) shape, which
+    # PyYAML parses as None; `id_to_num.get(d)` drops deps that didn't file
+    # (forward-only) so no None reaches related_issues.
+    relatives = [id_to_num[d] for d in (t.get("depends_on") or []) if id_to_num.get(d)]
+    out = create_issue(
+        title=t["title"], body=t["body"],
+        type=t.get("type", "Task"), labels=t.get("labels", ""),
+        pipeline=t.get("pipeline", "Product Backlog"),
+        estimate=t.get("estimate", ""), priority=t.get("priority", ""),
+        parent=parent, related_issues=relatives,
+    )
+    # A clean success is ok=True AND partial_applied=False. partial_applied
+    # means the issue was created but its parent-wire (addSubIssues) failed,
+    # so it landed orphaned with number=N: recording N would feed a broken
+    # middle link to dependents. Treat it like a failure.
+    if not out["ok"] or out.get("partial_applied"):
+        # Review out["duplicate_check"]["matches"]. Two legitimate paths:
+        #   genuinely distinct  -> re-call with confirm_create=True; map the
+        #                          number only if that retry returns clean
+        #   genuine duplicate / wire-failure -> stop the load (or skip and
+        #                          record nothing) so a human can fix the plan
+        handle_failed_create(t, out)
         continue
     id_to_num[t["planning_id"]] = out["number"]
 ```
 
-Three constraints:
+Constraints:
 
 - **Forward-only.** `related_issues` can only reference tickets already filed earlier in the same load (the issue number must exist). A `depends_on` pointing at a not-yet-filed ticket resolves to nothing and won't downgrade.
 - **Sort dependencies first.** Topologically order the plan by `depends_on` (dependencies before dependents) so the map is populated before any dependent references it. For an unavoidable back-edge (a true dependency cycle, or a forward reference you can't reorder away), fall back to `confirm_create=True` on that one create after reviewing the surfaced match.
-- **Only map successful creates.** A blocked or failed create returns `number=None`. Never store that: a `None` in the map propagates as `parent=None` (silently orphans the dependent) or `related_issues=[None, ...]` (raises in `check_duplicate`, whose swallowed error then disables the dup guard for that create). Skip the planning ID on failure so dependents resolve it to nothing, and decide explicitly whether to override or stop.
+- **Only map clean successes.** A blocked / failed create returns `number=None`, and a parent-wire failure returns `ok=True, partial_applied=True` with the issue orphaned. Record a number only when `ok` is True AND `partial_applied` is falsy. A stored `None` or an orphaned number feeds a broken link to every dependent; leaving the planning ID unmapped keeps dependents honest (they resolve it to nothing rather than to a bad number).
+- **Forward the plan's metadata.** `create_issue` defaults to `type="Task"` and `pipeline="Product Backlog"`; if your plan carries types (Epic / Feature / Bug), labels, estimates, or priorities, pass them through, or every ticket files as a default Task in the backlog, silently (each create still returns `ok=True`).
+
+> Note: the example uses `create_issue`, which detects parent-wire failure (`partial_applied`). The planning-noun creates (`epic_create`, etc.) do not surface that signal yet, so if you adapt the loop to them, the `partial_applied` guard above is a no-op until that gap is closed.
 
 `depends_on` is not a blanket duplicate-exemption: the downgrade is to **warn, not skip**, so a dependency pair that is also an accidental true duplicate still surfaces in `duplicate_check.matches`. Read those matches even on a warn.
 

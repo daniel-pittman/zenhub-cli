@@ -1429,13 +1429,18 @@ def test_create_issue_parent_zero_forwards_none(monkeypatch):
     assert captured[0].get("related_issues") is None
 
 
-def test_planning_create_forwards_related_issues(monkeypatch):
-    """The planning-noun creates (via _planning_create / epic_create) must
-    forward `parent` and `related_issues` to check_duplicate too.
+@pytest.mark.parametrize("noun_create", [
+    "epic_create", "initiative_create", "project_create", "subtask_create",
+])
+def test_planning_create_forwards_related_issues(monkeypatch, noun_create):
+    """Each planning-noun create must forward `parent` and `related_issues`
+    to check_duplicate.
 
-    epic_create is sufficient to cover all four planning nouns: they share
-    the single _planning_create -> check_duplicate seam, so initiative_create
-    / project_create / subtask_create exercise the identical forwarding path.
+    v1.9.7 (#53 review #5): the `related_issues=related_issues` forwarding
+    lives in each of the four wrappers (epic/initiative/project/subtask),
+    NOT in the shared _planning_create body. A dropped kwarg in one wrapper
+    would slip through if only epic_create were tested, so parametrize over
+    all four.
     """
     monkeypatch.setattr(
         mcp_server, "_similarity_repo",
@@ -1451,13 +1456,17 @@ def test_planning_create_forwards_related_issues(monkeypatch):
         },
     )
 
-    out = mcp_server.epic_create(
-        title="Pydantic response epic", description="depends on projections",
+    out = getattr(mcp_server, noun_create)(
+        title="Pydantic response item", description="depends on projections",
         parent=4, related_issues=[7],
     )
 
-    assert captured[0].get("parent") == 4
-    assert captured[0].get("related_issues") == [7]
+    assert captured[0].get("parent") == 4, (
+        f"{noun_create} must forward parent; got {captured[0]!r}"
+    )
+    assert captured[0].get("related_issues") == [7], (
+        f"{noun_create} must forward related_issues; got {captured[0]!r}"
+    )
     assert out["ok"] is True
     assert out["duplicate_check"]["downgraded_structural"] is True
 
