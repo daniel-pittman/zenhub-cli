@@ -1,0 +1,31 @@
+# Dependabot dependency updates.
+#
+# - github-actions: bumps the SHA-pinned actions in .github/workflows/* when a
+#   newer release ships (Dependabot rewrites both the SHA and the version
+#   comment). Grouped so a week's action bumps arrive as one PR.
+# - pip: tracks Python dependencies once a manifest exists. This repo installs
+#   its Python deps ad-hoc today (CI installs pytest + numpy; the MCP server
+#   bootstraps mcp / sentence-transformers / torch into a venv at runtime), so
+#   there is no committed requirements.txt / pyproject.toml for Dependabot to
+#   read yet. The entry is kept for fleet consistency and activates the moment
+#   a manifest lands at the repo root.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

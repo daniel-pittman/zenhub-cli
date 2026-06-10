@@ -1,4 +1,5 @@
-# Automated Claude code review on every pull request.
+# Automated Claude code review on every pull request, with a free Semgrep SAST
+# pass that runs first and feeds its findings into the review.
 #
 # This workflow uses the OAuth-bound CLAUDE_CODE_OAUTH_TOKEN (provisioned by
 # `claude /install-github-app` from a local Claude Code session) rather than a
@@ -18,13 +19,13 @@
 #     workflow run must be approved by a maintainer before any Action executes,
 #     which bounds drive-by subscription-quota burn from random PRs.
 #
-#   * Permissions are scoped to what claude-code-action needs to read the PR
-#     diff, post a review comment, and request an OIDC token; no broader
-#     scope is granted.
+#   * Permissions are scoped to what each job needs; no broader scope is
+#     granted.
 #
-#   * The direct GitHub action is pinned to a full commit SHA with a version
-#     comment. The plugin marketplace below is anthropics' own repository, so
-#     the trust posture is the same as trusting the action itself.
+#   * Every action is pinned to a full commit SHA with a version comment, and
+#     the repository enforces "Require actions to be pinned to a full-length
+#     commit SHA". The plugin marketplace below is anthropics' own repository,
+#     so the trust posture is the same as trusting the action itself.
 #
 # The CLAUDE_CODE_OAUTH_TOKEN repository secret must be provisioned by a
 # maintainer (see SECURITY.md).
@@ -48,7 +49,85 @@ on:
         type: string
 
 jobs:
+  # Free, token-free SAST (Semgrep OSS). Runs first and posts a single sticky
+  # findings comment so the Claude review job (which reads PR comments) folds
+  # the results into its review. Replaces the metered claude-security-review.yml.
+  # Runs on dependabot too: the committed-secret / CI-misconfig signal is
+  # exactly what we want on a dependency-bump PR. The comment-post step is
+  # `continue-on-error` so the read-only dependabot token does not surface the
+  # run as failed.
+  semgrep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      # SHA-pinned actions/checkout v4.2.2 (matches ci.yml).
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      # The repository enforces "Require actions to be pinned to a full-length
+      # commit SHA", which rejects actions/setup-python. pipx is preinstalled on
+      # the runner and needs no action, so install the pinned Semgrep through it.
+      - name: Install Semgrep (OSS, pinned, no token)
+        run: pipx install semgrep==1.165.0
+
+      - name: Run Semgrep
+        # Python + bash sources, committed secrets, and CI misconfig. No
+        # p/dockerfile pack: this repo has no Dockerfile. `|| true` keeps the
+        # job green so findings are advisory (the Claude review and a human
+        # decide), mirroring the comment-only behavior of the security job it
+        # replaces.
+        run: |
+          semgrep scan --json --output semgrep.json \
+            --config p/python \
+            --config p/bash \
+            --config p/secrets \
+            --config p/ci || true
+
+      - name: Post Semgrep findings as a sticky PR comment
+        # Dependabot PRs run with a read-only token, so the comment post fails
+        # there. continue-on-error keeps the job (and the run) green, so the
+        # review workflow does not surface as a failed/skipped run on dependabot.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MARKER: '### Semgrep (OSS)'
+        run: |
+          COUNT=$(jq '.results | length' semgrep.json)
+          if [ "$COUNT" -eq 0 ]; then
+            printf '%s: no findings\n\n_Clean scan. Posted before the Claude review._\n' "$MARKER" > semgrep-comment.md
+          else
+            HIGH=$(jq '[.results[]|select(.extra.severity=="ERROR")]|length' semgrep.json)
+            MED=$(jq '[.results[]|select(.extra.severity=="WARNING")]|length' semgrep.json)
+            LOW=$(jq '[.results[]|select(.extra.severity=="INFO")]|length' semgrep.json)
+            {
+              printf '%s: %s findings\n\n' "$MARKER" "$COUNT"
+              printf '<details><summary>HIGH (%s) · MEDIUM (%s) · LOW (%s)</summary>\n\n' "$HIGH" "$MED" "$LOW"
+              printf '| Sev | Rule | Location | Message |\n|---|---|---|---|\n'
+              jq -r '.results[] | "| \(.extra.severity|if .=="ERROR" then "HIGH" elif .=="WARNING" then "MEDIUM" else "LOW" end) | \(.check_id|split(".")|last) | \(.path):\(.start.line) | \(.extra.message|gsub("[\n|]";" ")|.[0:120]) |"' semgrep.json
+              printf '\n</details>\n\n_Posted before the Claude review so findings are folded into the review._\n'
+            } > semgrep-comment.md
+          fi
+          # Sticky: delete any prior Semgrep comment so the thread keeps one.
+          gh api "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" \
+          | while read -r id; do
+              gh api -X DELETE "repos/$REPO/issues/comments/$id" || true
+            done
+          gh pr comment "$PR" --body-file semgrep-comment.md
+
   claude-review:
+    # Dependabot PRs get a read-only token and no Actions secrets, so the
+    # OAuth-bound review action errors on them. Skip the review there; the
+    # semgrep job above still runs and posts its findings.
+    if: ${{ github.actor != 'dependabot[bot]' }}
+    needs: semgrep   # guarantees the Semgrep comment is posted before the review
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -80,4 +159,11 @@ jobs:
           track_progress: true
           allowed_bots: 'claude[bot]'
           claude_args: '--model opus'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number || github.event.inputs.pr_number }} --comment'
+          prompt: >-
+            /code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number || github.event.inputs.pr_number }} --comment
+            Additionally: if this PR changes application or library source code in a way
+            that warrants tests (new or changed behavior, bug fixes, new branches or edge
+            cases) and does NOT add or update corresponding tests, flag it as a HIGH-severity
+            review finding naming the untested change. Exempt docs-only, README, comments,
+            formatting, and pure-configuration changes (CI YAML, lockfile bumps, asset-only,
+            version bumps) from this requirement.
