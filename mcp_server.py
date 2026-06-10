@@ -1664,10 +1664,13 @@ def create_issue(title: str, body: str, type: str = "Task",
         On block: dict with ok=False, blocked=True, duplicate_check (the
             candidate matches and recommendation), and a clear message
             explaining how to override.
-        On success: dict with ok=True, number (new issue number), url,
-            type, pipeline, parent, estimate, estimate_requested,
-            priority, priority_requested, raw, stderr, duplicate_check
-            (informational; may include soft matches). v1.9.2 round-7
+        On success: dict with ok=True, partial_applied, number (new issue
+            number), url, type, pipeline, parent, estimate,
+            estimate_requested, priority, priority_requested, raw, stderr,
+            duplicate_check (informational; may include soft matches).
+            partial_applied is True when the issue was created but never
+            wired under the requested parent (addSubIssues failed) — a
+            parent-wire failure, not a clean success. v1.9.2 round-7
             finding #3: `estimate_requested` mirrors the priority
             request/applied split. Compare it against `estimate`:
             null/null = not requested, N/N = applied, N/null =
@@ -2862,10 +2865,13 @@ def epic_create(title: str, description: str = "", labels: str = "",
             pass this for known siblings / dependencies in a bulk-load.
 
     Returns:
-        dict with: ok, number, epic_number (back-compat alias for number),
-        url, type, pipeline, parent, estimate, estimate_requested,
-        priority, priority_requested, raw, stderr, duplicate_check
-        (when the pre-flight ran). v1.9.2 round-2 #4: the three-state
+        dict with: ok, partial_applied, number, epic_number (back-compat
+        alias for number), url, type, pipeline, parent, estimate,
+        estimate_requested, priority, priority_requested, raw, stderr,
+        duplicate_check (when the pre-flight ran). v1.9.8: partial_applied
+        is True when the epic was created but never wired under the
+        requested parent (addSubIssues failed) — a parent-wire failure,
+        not a clean success. v1.9.2 round-2 #4: the three-state
         estimate / priority splits documented for create_issue apply
         here too (compare *_requested against *). On block: ok=False,
         blocked=True, all key placeholders None / "" with
@@ -3008,9 +3014,12 @@ def initiative_create(title: str, description: str = "", labels: str = "",
     hard match against one downgrades from block to warn (issue #46);
     `parent` is added to that set automatically.
 
-    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    estimate_requested, priority, priority_requested, raw, stderr,
-    duplicate_check (when the pre-flight ran). v1.9.2 round-2 #4:
+    Returns: dict with ok, partial_applied, number, url, type, pipeline,
+    parent, estimate, estimate_requested, priority, priority_requested,
+    raw, stderr, duplicate_check (when the pre-flight ran). v1.9.8:
+    partial_applied is True when the issue was created but never wired
+    under the requested parent (addSubIssues failed) — treat it as a
+    parent-wire failure, not a clean success. v1.9.2 round-2 #4:
     the three-state estimate / priority splits documented for
     create_issue apply here too — compare estimate vs
     estimate_requested (null/null = not requested, N/N = applied,
@@ -3121,9 +3130,12 @@ def project_create(title: str, description: str = "", labels: str = "",
     hard match against one downgrades from block to warn (issue #46);
     `parent` is added to that set automatically.
 
-    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    estimate_requested, priority, priority_requested, raw, stderr,
-    duplicate_check (when the pre-flight ran). v1.9.2 round-2 #4:
+    Returns: dict with ok, partial_applied, number, url, type, pipeline,
+    parent, estimate, estimate_requested, priority, priority_requested,
+    raw, stderr, duplicate_check (when the pre-flight ran). v1.9.8:
+    partial_applied is True when the issue was created but never wired
+    under the requested parent (addSubIssues failed) — treat it as a
+    parent-wire failure, not a clean success. v1.9.2 round-2 #4:
     the three-state estimate / priority splits documented for
     create_issue apply here too — compare estimate vs
     estimate_requested (null/null = not requested, N/N = applied,
@@ -3230,9 +3242,12 @@ def subtask_create(title: str, description: str = "", labels: str = "",
     hard match against one downgrades from block to warn (issue #46);
     `parent` is added to that set automatically.
 
-    Returns: dict with ok, number, url, type, pipeline, parent, estimate,
-    estimate_requested, priority, priority_requested, raw, stderr,
-    duplicate_check (when the pre-flight ran). v1.9.2 round-2 #4:
+    Returns: dict with ok, partial_applied, number, url, type, pipeline,
+    parent, estimate, estimate_requested, priority, priority_requested,
+    raw, stderr, duplicate_check (when the pre-flight ran). v1.9.8:
+    partial_applied is True when the issue was created but never wired
+    under the requested parent (addSubIssues failed) — treat it as a
+    parent-wire failure, not a clean success. v1.9.2 round-2 #4:
     the three-state estimate / priority splits documented for
     create_issue apply here too — compare estimate vs
     estimate_requested (null/null = not requested, N/N = applied,
