@@ -2254,6 +2254,11 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         repo_path: optional absolute path of a git checkout.
         confirm_create: pass True to bypass a duplicate-check block.
         skip_duplicate_check: pass True to skip the pre-flight entirely.
+        related_issues: optional issue numbers to treat as structural
+            relatives (siblings or dependencies) so a hard similarity
+            match against one downgrades from block to warn instead of
+            hard-blocking (issue #46). `parent` is added automatically;
+            pass this for known siblings / dependencies in a bulk-load.
     """
     if not title.strip():
         # v1.9.2 round-2 (PR #27) finding #3: full key-set so the
@@ -2835,6 +2840,11 @@ def epic_create(title: str, description: str = "", labels: str = "",
         repo_path: Optional absolute path of a git checkout to run zh from.
         confirm_create: pass True to bypass the duplicate-check block.
         skip_duplicate_check: pass True to skip the pre-flight entirely.
+        related_issues: optional issue numbers to treat as structural
+            relatives (siblings or dependencies) so a hard similarity
+            match against one downgrades from block to warn instead of
+            hard-blocking (issue #46). `parent` is added automatically;
+            pass this for known siblings / dependencies in a bulk-load.
 
     Returns:
         dict with: ok, number, epic_number (back-compat alias for number),
@@ -2978,7 +2988,10 @@ def initiative_create(title: str, description: str = "", labels: str = "",
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
     create_issue. Use confirm_create=True to override a block,
-    skip_duplicate_check=True to bypass.
+    skip_duplicate_check=True to bypass. Pass related_issues=[...] (issue
+    numbers) to treat siblings / dependencies as structural relatives so a
+    hard match against one downgrades from block to warn (issue #46);
+    `parent` is added to that set automatically.
 
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
     estimate_requested, priority, priority_requested, raw, stderr,
@@ -3088,7 +3101,10 @@ def project_create(title: str, description: str = "", labels: str = "",
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
     create_issue. Use confirm_create=True to override a block,
-    skip_duplicate_check=True to bypass.
+    skip_duplicate_check=True to bypass. Pass related_issues=[...] (issue
+    numbers) to treat siblings / dependencies as structural relatives so a
+    hard match against one downgrades from block to warn (issue #46);
+    `parent` is added to that set automatically.
 
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
     estimate_requested, priority, priority_requested, raw, stderr,
@@ -3194,7 +3210,10 @@ def subtask_create(title: str, description: str = "", labels: str = "",
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
     create_issue. Use confirm_create=True to override a block,
-    skip_duplicate_check=True to bypass.
+    skip_duplicate_check=True to bypass. Pass related_issues=[...] (issue
+    numbers) to treat siblings / dependencies as structural relatives so a
+    hard match against one downgrades from block to warn (issue #46);
+    `parent` is added to that set automatically.
 
     Returns: dict with ok, number, url, type, pipeline, parent, estimate,
     estimate_requested, priority, priority_requested, raw, stderr,

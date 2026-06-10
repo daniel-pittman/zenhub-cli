@@ -102,3 +102,29 @@ def test_soft_only_match_warns_regardless_of_structure(monkeypatch):
     assert out["any_above_hard"] is False
     assert out["downgraded_structural"] is False
     assert out["matches"][0]["match_kind"] == "structural_relative"
+
+
+def test_related_issues_with_none_is_filtered_not_fatal(monkeypatch):
+    """v1.9.7 (#53 review #1): a falsy entry in related_issues (None / 0)
+    must be dropped, not crash. A bulk-load caller that resolves a Planning
+    ID for a ticket that failed to file would pass related_issues=[None];
+    `int(None)` would raise, the create wrapper's broad except would swallow
+    it, and the recommendation-less dup_info would silently DISABLE the
+    duplicate guard. The filter degrades to "no structural relative" so the
+    real candidate still blocks."""
+    # A genuine (non-structural) hard match alongside the None entry.
+    _patch_matches(monkeypatch, [_match(99, 0.90)])
+    out = check_duplicate("T", "b", "acme/widgets", related_issues=[None, 0])
+    # No TypeError, and the genuine duplicate still blocks (guard intact).
+    assert out["recommendation"] == "block"
+    assert out["matches"][0]["match_kind"] == "candidate"
+
+
+def test_related_issues_mixed_none_and_real_keeps_real_relative(monkeypatch):
+    """The real relative in a [None, N] list is still honored after the
+    falsy filter — the downgrade fires for N."""
+    _patch_matches(monkeypatch, [_match(7, 0.74)])
+    out = check_duplicate("T", "b", "acme/widgets", related_issues=[None, 7])
+    assert out["recommendation"] == "warn"
+    assert out["downgraded_structural"] is True
+    assert out["matches"][0]["match_kind"] == "structural_relative"

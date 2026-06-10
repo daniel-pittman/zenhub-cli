@@ -219,7 +219,7 @@ The motivating case for this rule: a "Users randomly logged out around 5pm" tick
 
 **Override carefully in bulk operations:** if you're filing many genuinely distinct tickets in a known-clean batch (e.g. wave creation where you've already audited the backlog), `skip_duplicate_check=True` is reasonable per-call to avoid noise. Document the choice in the batch audit YAML.
 
-**Structural relatives don't block (v1.9.6):** when you create a child under a parent (`parent=N`), a hard match against that parent is expected, not a duplicate: a parent whose body enumerates its children scores high against each child you wire under it. The pre-flight now tags such a match `match_kind="structural_relative"` and downgrades it from block to warn (`duplicate_check.downgraded_structural=True`), so a child-under-parent create is no longer hard-blocked by its own parent. Prefer passing `parent=N` at create time over `confirm_create=True` for this case. When bulk-loading a structured backlog where siblings also cross-match, pass `related_issues=[...]` with the sibling numbers so those matches downgrade too. Genuine (non-structural) hard matches still block and must be surfaced as above.
+**Structural relatives don't block (v1.9.6):** when you create a child under a parent (`parent=N`), a hard match against that parent is expected, not a duplicate: a parent whose body enumerates its children scores high against each child you wire under it. The pre-flight now tags such a match `match_kind="structural_relative"` and downgrades it from block to warn (`duplicate_check.downgraded_structural=True`), so a child-under-parent create is no longer hard-blocked by its own parent. Prefer passing `parent=N` at create time over `confirm_create=True` for this case. When bulk-loading a structured backlog where siblings or dependencies also cross-match, pass `related_issues=[...]` with their numbers so those matches downgrade too (see "Structured-plan bulk-load" under Operation patterns for the `depends_on`-forwarding pattern). Genuine (non-structural) hard matches still block and must be surfaced as above.
 
 ---
 
@@ -336,6 +336,68 @@ A robust reference pattern for safely executing many ZH operations in sequence:
 5. **Post-check** — verify each action took effect.
 6. **Announce** — thread per-sub-batch updates if the project has an announcement channel.
 7. **Audit log** — append a per-batch entry to the execution_log YAML. Capture ticket lists + drift + outcomes.
+
+### Structured-plan bulk-load (forwarding `depends_on` as `related_issues`)
+
+When you file a structured plan (a YAML ticket plan with Planning IDs like `E1-T1`, `E2-T4`, each carrying a `depends_on:` list), graph-linked tickets in the same domain often score above the hard duplicate threshold against each other (a feature and the feature it depends on share vocabulary). That match is expected, not a duplicate. Forward each ticket's resolved dependencies as `related_issues=` so the #46 structural-relative rule downgrades the match from block to warn (see Hard Rule #5) instead of hard-blocking the load.
+
+Pattern: keep a Planning-ID → issue-number map as you file, resolve each ticket's `depends_on` through it, and pass the resolved numbers as `related_issues`.
+
+```python
+# plan: list of {planning_id, title, body, type, labels, pipeline, estimate,
+#                priority, parent_planning_id, depends_on:[...]}
+id_to_num = {}                      # Planning ID -> real issue number (success only)
+for t in plan:                     # plan MUST be sorted depends_on-first
+    # Skip a ticket whose declared parent didn't file: a missing parent means
+    # the child would be created orphaned at the top level (parent=0 and
+    # parent=None behave identically in create_issue, so defaulting wouldn't
+    # save the hierarchy — only skipping does).
+    parent_pid = t.get("parent_planning_id")
+    if parent_pid and parent_pid not in id_to_num:
+        # Declared parent never filed. Halting is the safe default (don't
+        # silently file the child flat). Swap for a log+continue if your
+        # plan tolerates orphans.
+        raise RuntimeError(f"bulk-load halt: {t['planning_id']} parent {parent_pid} unfiled")
+    parent = id_to_num.get(parent_pid, 0)
+    # `(... or [])` guards the YAML `depends_on:` (empty value) shape, which
+    # PyYAML parses as None; `id_to_num.get(d)` drops deps that didn't file
+    # (forward-only) so no None reaches related_issues.
+    relatives = [id_to_num[d] for d in (t.get("depends_on") or []) if id_to_num.get(d)]
+    out = create_issue(
+        title=t["title"], body=t["body"],
+        type=t.get("type", "Task"), labels=t.get("labels", ""),
+        pipeline=t.get("pipeline", "Product Backlog"),
+        estimate=t.get("estimate", ""), priority=t.get("priority", ""),
+        parent=parent, related_issues=relatives,
+    )
+    # A clean success is ok=True AND partial_applied=False. partial_applied
+    # means the issue was created but its parent-wire (addSubIssues) failed,
+    # so it landed orphaned with number=N: recording N would feed a broken
+    # middle link to dependents. Treat it like a failure.
+    if not out["ok"] or out.get("partial_applied"):
+        # Surface the matches and halt so a human can decide. The two
+        # legitimate resolutions are: (1) genuinely distinct -> re-call with
+        # confirm_create=True and map the number only if that retry returns
+        # clean; (2) genuine duplicate / wire-failure -> fix the plan. Inline
+        # whichever your workflow wants in place of this raise.
+        raise RuntimeError(
+            f"bulk-load halt at {t['planning_id']}: "
+            f"{out.get('duplicate_check', {}).get('matches', [])}"
+        )
+    id_to_num[t["planning_id"]] = out["number"]
+```
+
+Constraints:
+
+- **Forward-only.** `related_issues` can only reference tickets already filed earlier in the same load (the issue number must exist). A `depends_on` pointing at a not-yet-filed ticket resolves to nothing and won't downgrade.
+- **Sort dependencies first.** Topologically order the plan by `depends_on` (dependencies before dependents) so the map is populated before any dependent references it. For an unavoidable back-edge (a true dependency cycle, or a forward reference you can't reorder away), fall back to `confirm_create=True` on that one create after reviewing the surfaced match.
+- **Only map clean successes.** A blocked / failed create returns `number=None`, and a parent-wire failure returns `ok=True, partial_applied=True` with the issue orphaned. Record a number only when `ok` is True AND `partial_applied` is falsy. A stored `None` or an orphaned number feeds a broken link to every dependent; leaving the planning ID unmapped keeps dependents honest (they resolve it to nothing rather than to a bad number).
+- **Forward the plan's metadata.** `create_issue` defaults to `type="Task"` and `pipeline="Product Backlog"`; if your plan carries types (Epic / Feature / Bug), labels, estimates, or priorities, pass them through, or every ticket files as a default Task in the backlog, silently (each create still returns `ok=True`).
+- **Plan field contract.** `title` and `body` are required per ticket (the example uses bracket access so a missing one fails loudly, and `create_issue` rejects an empty body through the `ok=False` path). `depends_on` must be a list of Planning IDs: a bare YAML scalar (`depends_on: E1-T1`) parses as a string and would be iterated character-by-character, silently dropping the dependency. Write `depends_on: [E1-T1]`.
+
+> Note: the example uses `create_issue`, which detects parent-wire failure via `partial_applied`. DO NOT substitute the planning-noun creates (`epic_create` / `initiative_create` / `project_create` / `subtask_create`) into this loop until #54 closes the gap: they hardcode `partial_applied=False`, so an orphaned create (wire failure) returns `ok=True, partial_applied=False` and the guard above treats it as a clean success, recording the orphan's number and corrupting the map for every dependent. (They also take `description=`, not `body=`.)
+
+`depends_on` is not a blanket duplicate-exemption: the downgrade is to **warn, not skip**, so a dependency pair that is also an accidental true duplicate still surfaces in `duplicate_check.matches`. Read those matches even on a warn.
 
 ### Sprint metadata
 
