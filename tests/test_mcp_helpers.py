@@ -1518,6 +1518,10 @@ def test_planning_create_parent_wire_failure_sets_partial_applied(
                 "estimate_requested", "priority", "priority_requested",
                 "raw", "stderr", "duplicate_check"):
         assert key in out, f"{noun_create} wire-failure shape missing {key!r}"
+    if noun_create == "epic_create":
+        # back-compat alias added by _with_epic_number_alias; pin it on the
+        # partial path too so a dropped setdefault is caught.
+        assert "epic_number" in out
 
 
 @pytest.mark.parametrize("noun_create", [
@@ -1526,7 +1530,11 @@ def test_planning_create_parent_wire_failure_sets_partial_applied(
 def test_planning_create_parent_mismatch_is_partial(monkeypatch, noun_create):
     """A non-null returned parent that differs from the requested one
     (requested 4, got 7) is also a wire failure -> partial_applied True.
-    Covers the != branch with both sides non-null."""
+
+    Defensive coverage of the `!=` branch with both sides non-null. Bash
+    `cmd_create` cannot actually produce a non-null mismatched parent (it
+    emits either the requested parent or null), so this pins the Python
+    boolean, not a reachable production path."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
         lambda args, cwd=None: {
