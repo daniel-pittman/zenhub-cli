@@ -6,6 +6,13 @@ This file provides guidance to Claude Code and other AI assistants when working 
 
 `zh` is a bash-based command-line interface for ZenHub that wraps both the GraphQL and REST APIs. It's designed to be used directly by developers or by AI assistants helping with project management tasks.
 
+## Automated Review Policy
+
+The PR review workflow enforces two rules the automated reviewer applies on every pull request:
+
+- **Tests ship with code.** If a PR changes application or library source code in a way that warrants tests (new or changed behavior, bug fixes, new branches or edge cases) and does not add or update corresponding tests, the reviewer flags it as a HIGH-severity finding. Docs-only, README, comments, formatting, and pure-configuration changes (CI YAML, lockfile bumps, asset-only, version bumps) are exempt.
+- **Security findings inform the review.** A free, token-free security scan runs before the Claude review and posts its findings as a single sticky PR comment, which the reviewer folds into its analysis. Semgrep (OSS) scans with the `p/python`, `p/bash`, `p/secrets`, and `p/ci` rule packs for source-level, committed-secret, and CI-misconfig detection. The CI workflow's bash + Python syntax checks (`bash -n`, `python -m py_compile`) remain the language linters. This replaces the metered Claude security-review job.
+
 ## Quick Reference
 
 ### Common Commands
