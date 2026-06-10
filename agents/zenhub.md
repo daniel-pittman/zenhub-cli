@@ -354,8 +354,10 @@ for t in plan:                     # plan MUST be sorted depends_on-first
     # save the hierarchy — only skipping does).
     parent_pid = t.get("parent_planning_id")
     if parent_pid and parent_pid not in id_to_num:
-        handle_unfiled_parent(t)       # surface + decide: file flat, or stop
-        continue
+        # Declared parent never filed. Halting is the safe default (don't
+        # silently file the child flat). Swap for a log+continue if your
+        # plan tolerates orphans.
+        raise RuntimeError(f"bulk-load halt: {t['planning_id']} parent {parent_pid} unfiled")
     parent = id_to_num.get(parent_pid, 0)
     # `(... or [])` guards the YAML `depends_on:` (empty value) shape, which
     # PyYAML parses as None; `id_to_num.get(d)` drops deps that didn't file
@@ -373,13 +375,15 @@ for t in plan:                     # plan MUST be sorted depends_on-first
     # so it landed orphaned with number=N: recording N would feed a broken
     # middle link to dependents. Treat it like a failure.
     if not out["ok"] or out.get("partial_applied"):
-        # Review out["duplicate_check"]["matches"]. Two legitimate paths:
-        #   genuinely distinct  -> re-call with confirm_create=True; map the
-        #                          number only if that retry returns clean
-        #   genuine duplicate / wire-failure -> stop the load (or skip and
-        #                          record nothing) so a human can fix the plan
-        handle_failed_create(t, out)
-        continue
+        # Surface the matches and halt so a human can decide. The two
+        # legitimate resolutions are: (1) genuinely distinct -> re-call with
+        # confirm_create=True and map the number only if that retry returns
+        # clean; (2) genuine duplicate / wire-failure -> fix the plan. Inline
+        # whichever your workflow wants in place of this raise.
+        raise RuntimeError(
+            f"bulk-load halt at {t['planning_id']}: "
+            f"{out.get('duplicate_check', {}).get('matches', [])}"
+        )
     id_to_num[t["planning_id"]] = out["number"]
 ```
 
@@ -389,8 +393,9 @@ Constraints:
 - **Sort dependencies first.** Topologically order the plan by `depends_on` (dependencies before dependents) so the map is populated before any dependent references it. For an unavoidable back-edge (a true dependency cycle, or a forward reference you can't reorder away), fall back to `confirm_create=True` on that one create after reviewing the surfaced match.
 - **Only map clean successes.** A blocked / failed create returns `number=None`, and a parent-wire failure returns `ok=True, partial_applied=True` with the issue orphaned. Record a number only when `ok` is True AND `partial_applied` is falsy. A stored `None` or an orphaned number feeds a broken link to every dependent; leaving the planning ID unmapped keeps dependents honest (they resolve it to nothing rather than to a bad number).
 - **Forward the plan's metadata.** `create_issue` defaults to `type="Task"` and `pipeline="Product Backlog"`; if your plan carries types (Epic / Feature / Bug), labels, estimates, or priorities, pass them through, or every ticket files as a default Task in the backlog, silently (each create still returns `ok=True`).
+- **Plan field contract.** `title` and `body` are required per ticket (the example uses bracket access so a missing one fails loudly, and `create_issue` rejects an empty body through the `ok=False` path). `depends_on` must be a list of Planning IDs: a bare YAML scalar (`depends_on: E1-T1`) parses as a string and would be iterated character-by-character, silently dropping the dependency. Write `depends_on: [E1-T1]`.
 
-> Note: the example uses `create_issue`, which detects parent-wire failure (`partial_applied`). The planning-noun creates (`epic_create`, etc.) do not surface that signal yet, so if you adapt the loop to them, the `partial_applied` guard above is a no-op until that gap is closed.
+> Note: the example uses `create_issue`, which detects parent-wire failure via `partial_applied`. DO NOT substitute the planning-noun creates (`epic_create` / `initiative_create` / `project_create` / `subtask_create`) into this loop until #54 closes the gap: they hardcode `partial_applied=False`, so an orphaned create (wire failure) returns `ok=True, partial_applied=False` and the guard above treats it as a clean success, recording the orphan's number and corrupting the map for every dependent. (They also take `description=`, not `body=`.)
 
 `depends_on` is not a blanket duplicate-exemption: the downgrade is to **warn, not skip**, so a dependency pair that is also an accidental true duplicate still surfaces in `duplicate_check.matches`. Read those matches even on a warn.
 
