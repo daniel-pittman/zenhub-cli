@@ -219,7 +219,7 @@ The motivating case for this rule: a "Users randomly logged out around 5pm" tick
 
 **Override carefully in bulk operations:** if you're filing many genuinely distinct tickets in a known-clean batch (e.g. wave creation where you've already audited the backlog), `skip_duplicate_check=True` is reasonable per-call to avoid noise. Document the choice in the batch audit YAML.
 
-**Structural relatives don't block (v1.9.6):** when you create a child under a parent (`parent=N`), a hard match against that parent is expected, not a duplicate: a parent whose body enumerates its children scores high against each child you wire under it. The pre-flight now tags such a match `match_kind="structural_relative"` and downgrades it from block to warn (`duplicate_check.downgraded_structural=True`), so a child-under-parent create is no longer hard-blocked by its own parent. Prefer passing `parent=N` at create time over `confirm_create=True` for this case. When bulk-loading a structured backlog where siblings also cross-match, pass `related_issues=[...]` with the sibling numbers so those matches downgrade too. Genuine (non-structural) hard matches still block and must be surfaced as above.
+**Structural relatives don't block (v1.9.6):** when you create a child under a parent (`parent=N`), a hard match against that parent is expected, not a duplicate: a parent whose body enumerates its children scores high against each child you wire under it. The pre-flight now tags such a match `match_kind="structural_relative"` and downgrades it from block to warn (`duplicate_check.downgraded_structural=True`), so a child-under-parent create is no longer hard-blocked by its own parent. Prefer passing `parent=N` at create time over `confirm_create=True` for this case. When bulk-loading a structured backlog where siblings or dependencies also cross-match, pass `related_issues=[...]` with their numbers so those matches downgrade too (see "Structured-plan bulk-load" under Operation patterns for the `depends_on`-forwarding pattern). Genuine (non-structural) hard matches still block and must be surfaced as above.
 
 ---
 
@@ -336,6 +336,30 @@ A robust reference pattern for safely executing many ZH operations in sequence:
 5. **Post-check** — verify each action took effect.
 6. **Announce** — thread per-sub-batch updates if the project has an announcement channel.
 7. **Audit log** — append a per-batch entry to the execution_log YAML. Capture ticket lists + drift + outcomes.
+
+### Structured-plan bulk-load (forwarding `depends_on` as `related_issues`)
+
+When you file a structured plan (a YAML ticket plan with Planning IDs like `E1-T1`, `E2-T4`, each carrying a `depends_on:` list), graph-linked tickets in the same domain often score above the hard duplicate threshold against each other (a feature and the feature it depends on share vocabulary). That match is expected, not a duplicate. Forward each ticket's resolved dependencies as `related_issues=` so the #46 structural-relative rule downgrades the match from block to warn (see Hard Rule #5) instead of hard-blocking the load.
+
+Pattern: keep a Planning-ID → issue-number map as you file, resolve each ticket's `depends_on` through it, and pass the resolved numbers as `related_issues`.
+
+```python
+# plan: list of {planning_id, title, body, parent_planning_id, depends_on:[...]}
+id_to_num = {}                      # Planning ID -> real issue number
+for t in plan:                     # plan MUST be sorted depends_on-first
+    parent = id_to_num.get(t.get("parent_planning_id"), 0)
+    relatives = [id_to_num[d] for d in t.get("depends_on", []) if d in id_to_num]
+    out = create_issue(title=t["title"], body=t["body"],
+                       parent=parent, related_issues=relatives)
+    id_to_num[t["planning_id"]] = out["number"]
+```
+
+Two constraints:
+
+- **Forward-only.** `related_issues` can only reference tickets already filed earlier in the same load (the issue number must exist). A `depends_on` pointing at a not-yet-filed ticket resolves to nothing and won't downgrade.
+- **Sort dependencies first.** Topologically order the plan by `depends_on` (dependencies before dependents) so the map is populated before any dependent references it. For an unavoidable back-edge (a true dependency cycle, or a forward reference you can't reorder away), fall back to `confirm_create=True` on that one create after reviewing the surfaced match.
+
+`depends_on` is not a blanket duplicate-exemption: the downgrade is to **warn, not skip**, so a dependency pair that is also an accidental true duplicate still surfaces in `duplicate_check.matches`. Read those matches even on a warn.
 
 ### Sprint metadata
 

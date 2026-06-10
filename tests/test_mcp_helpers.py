@@ -1322,6 +1322,142 @@ def test_planning_create_similarity_failure_does_not_block(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# v1.9.7 (#52): the create surfaces must FORWARD `parent` and `related_issues`
+# to check_duplicate so the #46 structural-relative downgrade is reachable
+# from a bulk-load caller. The check_duplicate(related_issues=...) downgrade
+# itself is unit-tested in test_similarity_structural.py; these pin the
+# forwarding seam (create_issue / _planning_create -> check_duplicate), which
+# nothing exercised before.
+# ---------------------------------------------------------------------------
+
+
+def _capture_check_duplicate(monkeypatch, *, result):
+    """Stub similarity.check_duplicate to record the kwargs it receives and
+    return `result`. Returns the captured-calls list."""
+    captured = []
+
+    def fake_check_duplicate(title, body, repo, **kwargs):
+        captured.append(kwargs)
+        return result
+
+    import similarity as _similarity_module
+    monkeypatch.setattr(
+        _similarity_module, "check_duplicate", fake_check_duplicate,
+    )
+    return captured
+
+
+# A structural-relative warn result: a hard match against a relative that #46
+# downgraded from block to warn. The create must proceed (warn doesn't block).
+_STRUCTURAL_WARN = {
+    "ok": True,
+    "recommendation": "warn",
+    "any_above_hard": True,
+    "any_above_soft": True,
+    "downgraded_structural": True,
+    "hard_threshold": 0.7,
+    "soft_threshold": 0.55,
+    "matches": [
+        {"number": 7, "title": "dep", "similarity": 0.74,
+         "match_kind": "structural_relative"},
+    ],
+}
+
+
+def test_create_issue_forwards_parent_and_related_issues(monkeypatch):
+    """create_issue must pass `parent` (when > 0) and `related_issues`
+    through to check_duplicate, and a structural-relative warn must NOT
+    block the create."""
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    captured = _capture_check_duplicate(monkeypatch, result=_STRUCTURAL_WARN)
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+
+    out = mcp_server.create_issue(
+        title="Pydantic response feature", body="depends on the projections",
+        parent=4, related_issues=[7, 8],
+    )
+
+    assert len(captured) == 1, "check_duplicate must be called exactly once"
+    assert captured[0].get("parent") == 4, (
+        f"create_issue must forward parent; got {captured[0]!r}"
+    )
+    assert captured[0].get("related_issues") == [7, 8], (
+        f"create_issue must forward related_issues; got {captured[0]!r}"
+    )
+    # warn (not block) -> the create proceeds and the downgrade is surfaced.
+    assert out["ok"] is True
+    assert out["duplicate_check"]["recommendation"] == "warn"
+    assert out["duplicate_check"]["downgraded_structural"] is True
+
+
+def test_create_issue_parent_zero_forwards_none(monkeypatch):
+    """`parent=0` (the no-parent default) must forward as `parent=None`,
+    not the literal 0, so check_duplicate doesn't treat issue #0 as a
+    structural relative."""
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    captured = _capture_check_duplicate(
+        monkeypatch,
+        result={"ok": True, "recommendation": "create", "matches": []},
+    )
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+
+    mcp_server.create_issue(title="T", body="b")  # parent defaults to 0
+
+    assert captured[0].get("parent") is None, (
+        f"parent=0 must forward as None, not 0; got {captured[0]!r}"
+    )
+    assert captured[0].get("related_issues") is None
+
+
+def test_planning_create_forwards_related_issues(monkeypatch):
+    """The planning-noun creates (via _planning_create / epic_create) must
+    forward `parent` and `related_issues` to check_duplicate too."""
+    monkeypatch.setattr(
+        mcp_server, "_similarity_repo",
+        lambda repo_path: ("owner/repo", None),
+    )
+    captured = _capture_check_duplicate(monkeypatch, result=_STRUCTURAL_WARN)
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
+            "stderr": "",
+        },
+    )
+
+    out = mcp_server.epic_create(
+        title="Pydantic response epic", description="depends on projections",
+        parent=4, related_issues=[7],
+    )
+
+    assert captured[0].get("parent") == 4
+    assert captured[0].get("related_issues") == [7]
+    assert out["ok"] is True
+    assert out["duplicate_check"]["downgraded_structural"] is True
+
+
+# ---------------------------------------------------------------------------
 # v1.9.1 round-6 fixes: MCP-side surface (PR #25 round-5 findings #4 and #6).
 # ---------------------------------------------------------------------------
 
