@@ -345,19 +345,31 @@ Pattern: keep a Planning-ID → issue-number map as you file, resolve each ticke
 
 ```python
 # plan: list of {planning_id, title, body, parent_planning_id, depends_on:[...]}
-id_to_num = {}                      # Planning ID -> real issue number
+id_to_num = {}                      # Planning ID -> real issue number (success only)
 for t in plan:                     # plan MUST be sorted depends_on-first
-    parent = id_to_num.get(t.get("parent_planning_id"), 0)
-    relatives = [id_to_num[d] for d in t.get("depends_on", []) if d in id_to_num]
+    # `or 0` / `if id_to_num.get(d)`: a ticket that failed to file is NOT in
+    # the map, so a dependent never resolves it to None. Passing None as
+    # parent silently orphans the child; passing [None] as related_issues
+    # raises inside check_duplicate and silently disables the dup guard.
+    parent = id_to_num.get(t.get("parent_planning_id")) or 0
+    relatives = [id_to_num[d] for d in t.get("depends_on", []) if id_to_num.get(d)]
     out = create_issue(title=t["title"], body=t["body"],
                        parent=parent, related_issues=relatives)
+    if not out["ok"]:              # blocked (genuine dup) or failed
+        # Review out["duplicate_check"], then decide: retry with
+        # confirm_create=True, or stop the load. Do NOT record a number —
+        # leaving this planning_id unmapped keeps its dependents honest
+        # (they resolve it to nothing rather than to None).
+        handle_failed_create(t, out)   # surface + confirm_create / abort
+        continue
     id_to_num[t["planning_id"]] = out["number"]
 ```
 
-Two constraints:
+Three constraints:
 
 - **Forward-only.** `related_issues` can only reference tickets already filed earlier in the same load (the issue number must exist). A `depends_on` pointing at a not-yet-filed ticket resolves to nothing and won't downgrade.
 - **Sort dependencies first.** Topologically order the plan by `depends_on` (dependencies before dependents) so the map is populated before any dependent references it. For an unavoidable back-edge (a true dependency cycle, or a forward reference you can't reorder away), fall back to `confirm_create=True` on that one create after reviewing the surfaced match.
+- **Only map successful creates.** A blocked or failed create returns `number=None`. Never store that: a `None` in the map propagates as `parent=None` (silently orphans the dependent) or `related_issues=[None, ...]` (raises in `check_duplicate`, whose swallowed error then disables the dup guard for that create). Skip the planning ID on failure so dependents resolve it to nothing, and decide explicitly whether to override or stop.
 
 `depends_on` is not a blanket duplicate-exemption: the downgrade is to **warn, not skip**, so a dependency pair that is also an accidental true duplicate still surfaces in `duplicate_check.matches`. Read those matches even on a warn.
 

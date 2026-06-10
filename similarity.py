@@ -560,7 +560,15 @@ def check_duplicate(title: str, body: str, repo: str, *,
     if parent:
         structural.add(int(parent))
     if related_issues:
-        structural.update(int(n) for n in related_issues)
+        # Filter falsy entries (None / 0) defensively. A bulk-load caller
+        # that resolves a Planning ID for a ticket that failed to file would
+        # otherwise pass related_issues=[None, ...]; int(None) raises, the
+        # create wrapper's broad except swallows it, and the resulting
+        # recommendation-less dup_info silently disables the duplicate guard
+        # for that create. Dropping falsy entries degrades to "no structural
+        # relative" instead of disabling the check. 0 is never a valid issue
+        # number (parent=0 already means "no parent").
+        structural.update(int(n) for n in related_issues if n)
 
     query = _embedding_text(title, body)
     matches = find_similar(

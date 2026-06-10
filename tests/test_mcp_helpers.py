@@ -1431,7 +1431,12 @@ def test_create_issue_parent_zero_forwards_none(monkeypatch):
 
 def test_planning_create_forwards_related_issues(monkeypatch):
     """The planning-noun creates (via _planning_create / epic_create) must
-    forward `parent` and `related_issues` to check_duplicate too."""
+    forward `parent` and `related_issues` to check_duplicate too.
+
+    epic_create is sufficient to cover all four planning nouns: they share
+    the single _planning_create -> check_duplicate seam, so initiative_create
+    / project_create / subtask_create exercise the identical forwarding path.
+    """
     monkeypatch.setattr(
         mcp_server, "_similarity_repo",
         lambda repo_path: ("owner/repo", None),
