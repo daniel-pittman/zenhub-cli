@@ -35,11 +35,16 @@ The interactive `@claude` bot is available for maintainer-triggered triage. **On
 - Personal identifiers (real ticket numbers, org names, paths) don't belong in the repo. The agent file at `agents/zenhub.md` is a deliberately generic template.
 - Updates to commands should be reflected in `README.md`, `CLAUDE.md`, and `agents/zenhub.md` together — they all describe the same surface from different angles.
 
-## Running tests locally
+## Running the tests locally
+
+Run the suite in a dedicated virtualenv, not your global interpreter:
 
 ```bash
-python -m pip install pytest
-python -m pytest tests/ -v
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests/ -v
 ```
 
-The tests mock the network entirely (no live ZenHub or GitHub calls), so they're fast and don't need credentials.
+The tests mock the network entirely (no live ZenHub or GitHub calls), so they're fast and don't need credentials. `requirements-dev.txt` is the single declared source for the test dependencies (pytest + numpy); CI installs from the same file, so a local venv run matches CI exactly.
+
+**Why a venv matters here:** the suite imports its fixtures through the `tests` namespace package (`tests/` has no `__init__.py`). If a *different* project that ships a regular `tests` package is editable-installed (`pip install -e`) into the interpreter you run pytest with, that regular package shadows this one and `tests._fixtures` fails to import (a regular package outranks a namespace package on `sys.path`). A clean `.venv` per the commands above is immune to whatever is installed globally. This is also exactly how CI stays reliable: it runs in a fresh, isolated environment every time.
