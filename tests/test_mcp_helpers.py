@@ -1614,6 +1614,112 @@ def test_planning_create_no_parent_requested_is_not_partial(
 
 
 # ---------------------------------------------------------------------------
+# v1.9.9 (#61): the four planning-noun creates accept `priority` inline,
+# forwarded as --priority to the bash noun-create (which delegates to
+# cmd_create), mirroring create_issue. Priority failure surfaces via the
+# priority / priority_requested divergence, NOT partial_applied.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("noun_create", [
+    "epic_create", "initiative_create", "project_create", "subtask_create",
+])
+def test_planning_create_forwards_priority_flag(monkeypatch, noun_create):
+    """`priority=` must be forwarded to bash as `--priority <name>`."""
+    captured = {}
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: captured.update(args=args) or {
+            "ok": True,
+            "stdout_plain": ('{"number": 99, "url": "u", "title": "T", '
+                             '"priority": "High", "priority_requested": "High"}'),
+            "stderr": "",
+        },
+    )
+    getattr(mcp_server, noun_create)(
+        title="T", priority="High", skip_duplicate_check=True,
+    )
+    args = captured["args"]
+    assert "--priority" in args, (
+        f"{noun_create} must forward --priority; got {args!r}"
+    )
+    assert args[args.index("--priority") + 1] == "High"
+
+
+@pytest.mark.parametrize("noun_create", [
+    "epic_create", "initiative_create", "project_create", "subtask_create",
+])
+def test_planning_create_priority_applied_success(monkeypatch, noun_create):
+    """On a confirmed priority, priority == priority_requested and
+    partial_applied stays False (priority is not a wire signal)."""
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": ('{"number": 99, "url": "u", "title": "T", '
+                             '"priority": "High", "priority_requested": "High"}'),
+            "stderr": "",
+        },
+    )
+    out = getattr(mcp_server, noun_create)(
+        title="T", priority="High", skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert out["priority"] == "High"
+    assert out["priority_requested"] == "High"
+    assert out["partial_applied"] is False
+
+
+@pytest.mark.parametrize("noun_create", [
+    "epic_create", "initiative_create", "project_create", "subtask_create",
+])
+def test_planning_create_priority_divergence_not_partial(monkeypatch, noun_create):
+    """Priority requested but not confirmed (priority=null,
+    priority_requested=High): the three-state divergence is the failure
+    signal — partial_applied must NOT flip (parity with create_issue,
+    where partial_applied is the parent-wire signal only)."""
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: {
+            "ok": True,
+            "stdout_plain": ('{"number": 99, "url": "u", "title": "T", '
+                             '"priority": null, "priority_requested": "High"}'),
+            "stderr": "",
+        },
+    )
+    out = getattr(mcp_server, noun_create)(
+        title="T", priority="High", skip_duplicate_check=True,
+    )
+    assert out["ok"] is True
+    assert out["priority"] is None
+    assert out["priority_requested"] == "High"
+    assert out["partial_applied"] is False, (
+        f"{noun_create}: a priority that didn't confirm must surface via the "
+        f"priority/priority_requested divergence, not partial_applied; "
+        f"got {out!r}"
+    )
+
+
+def test_planning_create_no_priority_does_not_forward_flag(monkeypatch):
+    """No priority requested -> no --priority in the bash args, and both
+    priority fields are null (not-requested state)."""
+    captured = {}
+    monkeypatch.setattr(
+        mcp_server, "_run_zh",
+        lambda args, cwd=None: captured.update(args=args) or {
+            "ok": True,
+            "stdout_plain": ('{"number": 99, "url": "u", "title": "T", '
+                             '"priority": null, "priority_requested": null}'),
+            "stderr": "",
+        },
+    )
+    out = mcp_server.epic_create(title="T", skip_duplicate_check=True)
+    assert "--priority" not in captured["args"]
+    assert out["priority"] is None
+    assert out["priority_requested"] is None
+
+
+# ---------------------------------------------------------------------------
 # v1.9.1 round-6 fixes: MCP-side surface (PR #25 round-5 findings #4 and #6).
 # ---------------------------------------------------------------------------
 
