@@ -8,10 +8,11 @@ This file provides guidance to Claude Code and other AI assistants when working 
 
 ## Automated Review Policy
 
-The PR review workflow enforces two rules the automated reviewer applies on every pull request:
+The PR review workflow enforces rules the automated reviewer applies on every pull request:
 
 - **Tests ship with code.** If a PR changes application or library source code in a way that warrants tests (new or changed behavior, bug fixes, new branches or edge cases) and does not add or update corresponding tests, the reviewer flags it as a HIGH-severity finding. Docs-only, README, comments, formatting, and pure-configuration changes (CI YAML, lockfile bumps, asset-only, version bumps) are exempt.
 - **Security findings inform the review.** A free, token-free security scan runs before the Claude review and posts its findings as a single sticky PR comment, which the reviewer folds into its analysis. Semgrep (OSS) scans with the `p/python`, `p/bash`, `p/secrets`, and `p/ci` rule packs for source-level, committed-secret, and CI-misconfig detection. The CI workflow's bash + Python syntax checks (`bash -n`, `python -m py_compile`) remain the language linters. This replaces the metered Claude security-review job.
+- **Merge gate on HIGH/CRITICAL findings (`review-gate` check).** The review emits a machine-readable verdict (`<!-- REVIEW-GATE verdict=PASS|BLOCK blocking=N -->`) and the `review-gate` job parses it. `BLOCK` (>=1 HIGH/CRITICAL finding on the diff) fails the check; `PASS` (no HIGH/CRITICAL) passes it. A failed or unparseable review reports `INCONCLUSIVE`, which also fails the check but as a distinct, re-runnable state, so a transient API throttle never reads as a clean pass. The HIGH/CRITICAL bar is deliberately strict (correctness on a common path, security, data loss, build/release breakage, or a CI Tests failure); style, missing-tests double-counting, and speculative hardening do NOT block. **Override:** a maintainer (write/maintain/admin) applies the `review-ack` label; the gate honors it only when it was applied at or after the current head commit (a stale ack can't clear a finding on new code). Admin-bypass on branch protection is the emergency break-glass. The gate is **observe-only until `review-gate` is added to the branch's required status checks** (intentional: tune the severity calibration on real PRs before giving it teeth).
 
 ## Quick Reference
 
