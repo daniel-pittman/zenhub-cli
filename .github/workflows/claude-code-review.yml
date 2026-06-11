@@ -245,3 +245,142 @@ jobs:
             already cover it, say so explicitly in one line (e.g. "No test changes needed:
             <reason>") rather than staying silent.
             - If tests were added or changed, briefly assess whether they meaningfully cover the change.
+            MERGE-GATE VERDICT (required, read carefully). The repository has a `review-gate`
+            check that parses your verdict and BLOCKS merge on a HIGH/CRITICAL finding, so the
+            severity bar must be precise. Emit, as the very LAST line of your review comment, an
+            HTML comment EXACTLY in one of these two forms (nothing after it):
+            <!-- REVIEW-GATE verdict=PASS blocking=0 -->
+            <!-- REVIEW-GATE verdict=BLOCK blocking=N -->
+            Set verdict=BLOCK only when at least one finding on the shipped diff meets this strict
+            HIGH/CRITICAL bar; otherwise verdict=PASS. `blocking` is the count of HIGH/CRITICAL
+            findings (0 on PASS).
+            HIGH/CRITICAL = a correctness bug reachable on a common code path; a security
+            vulnerability; data loss or corruption; a build, release, or import breakage; or a
+            "CI Tests" FAILURE on this PR.
+            NOT HIGH/CRITICAL, never block on these: style, naming, docs/comment wording, missing
+            tests (the test-coverage rule above already flags those at HIGH and the gate counts
+            them, so do not double-count here), speculative or defensive hardening for inputs the
+            code's own contract disallows, symmetric-gap or "while you're here" polish, or anything
+            you are not confident is a real, reachable defect. When in doubt it is MEDIUM, which
+            does NOT block. Emit the verdict line exactly once.
+
+  # ---------------------------------------------------------------------------
+  # Merge gate. Parses the Claude review's machine-readable verdict and FAILS
+  # this check when the review reports a HIGH/CRITICAL finding, so the PR cannot
+  # be merged until the latest review is clean. Three outcomes:
+  #
+  #   PASS          - review emitted `verdict=PASS` (no HIGH/CRITICAL). Check green.
+  #   BLOCK         - review emitted `verdict=BLOCK` (>=1 HIGH/CRITICAL). Check red.
+  #                   Push a fix (re-review runs on `synchronize` and can clear it),
+  #                   or a MAINTAINER applies the `review-ack` label to override.
+  #   INCONCLUSIVE  - the review job did not complete (transient API throttle) OR
+  #                   no parseable verdict was found. Check red, but distinct and
+  #                   re-runnable: a flaky API must NEVER read as PASS. Re-run the
+  #                   review or apply `review-ack`.
+  #
+  # The `review-ack` override is access-controlled and scoped: it counts only when
+  # the label was applied by someone with write/maintain/admin permission AND at or
+  # after the current head commit (a stale ack from a prior push cannot clear a new
+  # finding). Admin-bypass on branch protection remains the emergency break-glass.
+  #
+  # ROLLOUT (per-repo): this job is OBSERVE-ONLY until a maintainer adds the
+  # `review-gate` check to the branch's required status checks. Until then it
+  # reports its verdict as a comment + check result without blocking anything.
+  # Also create the label once:  gh label create review-ack -c '#0E8A16' \
+  #   -d 'Maintainer override: merge despite a blocking Claude review finding'
+  # ---------------------------------------------------------------------------
+  review-gate:
+    needs: [claude-review]
+    # always(): the gate must still run (and report INCONCLUSIVE) when the review
+    # job errored — `needs` would otherwise SKIP it, and a skipped required check
+    # could be misread as non-blocking. Skip only for dependabot (no review there).
+    if: ${{ always() && github.actor != 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Evaluate the review verdict
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_RESULT: ${{ needs.claude-review.result }}
+          ACK_LABEL: review-ack
+          MARKER: '### Review Gate'
+        run: |
+          set -euo pipefail
+          verdict=""; blocking="0"; reason=""; gate="BLOCK"
+
+          # 1) INCONCLUSIVE if the review job itself didn't succeed (throttle, etc.).
+          if [ "$REVIEW_RESULT" != "success" ]; then
+            verdict="INCONCLUSIVE"
+            reason="The Claude review did not complete (job result: \`${REVIEW_RESULT}\`). This is usually a transient API throttle, not a code finding."
+          else
+            # 2) Parse the verdict line from the latest review comment carrying the marker.
+            body=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq 'map(select(.body | contains("<!-- REVIEW-GATE"))) | last | .body // ""')
+            line=$(printf '%s' "$body" | grep -oE '<!-- REVIEW-GATE verdict=(PASS|BLOCK) blocking=[0-9]+ -->' | tail -1 || true)
+            if [ -z "$line" ]; then
+              verdict="INCONCLUSIVE"
+              reason="No parseable \`<!-- REVIEW-GATE verdict=... -->\` line was found in the review comment."
+            else
+              verdict=$(printf '%s' "$line" | sed -E 's/.*verdict=([A-Z]+).*/\1/')
+              blocking=$(printf '%s' "$line" | sed -E 's/.*blocking=([0-9]+).*/\1/')
+            fi
+          fi
+
+          # 3) review-ack override: maintainer-applied AND scoped to the current head.
+          override="no"; ack_actor=""
+          if gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null | grep -qx "$ACK_LABEL"; then
+            ev=$(gh api "repos/$REPO/issues/$PR/events" --paginate \
+              --jq "map(select(.event==\"labeled\" and .label.name==\"$ACK_LABEL\")) | last" 2>/dev/null || echo '{}')
+            ack_actor=$(printf '%s' "$ev" | jq -r '.actor.login // ""')
+            applied_at=$(printf '%s' "$ev" | jq -r '.created_at // ""')
+            head_at=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.committer.date // ""' 2>/dev/null || echo "")
+            perm=$(gh api "repos/$REPO/collaborators/$ack_actor/permission" --jq '.permission // "none"' 2>/dev/null || echo none)
+            # Scoped: ack must be applied at/after the head commit (ISO-8601 sorts
+            # lexically, so `sort -c` over head,applied succeeds iff applied >= head).
+            scoped="no"
+            if [ -n "$applied_at" ] && [ -n "$head_at" ] && \
+               printf '%s\n%s\n' "$head_at" "$applied_at" | sort -c >/dev/null 2>&1; then
+              scoped="yes"
+            fi
+            case "$perm" in admin|maintain|write) maint="yes" ;; *) maint="no" ;; esac
+            if [ "$scoped" = "yes" ] && [ "$maint" = "yes" ]; then
+              override="yes"
+            fi
+          fi
+
+          # 4) Decide.
+          if [ "$verdict" = "PASS" ]; then
+            gate="PASS"; reason="Review reported no HIGH/CRITICAL findings."
+          elif [ "$override" = "yes" ]; then
+            gate="PASS"; reason="Overridden via \`${ACK_LABEL}\` (applied by maintainer @${ack_actor} at/after the current head commit). Original verdict: ${verdict}${blocking:+, ${blocking} blocking}."
+          fi
+
+          # 5) Post a sticky gate comment.
+          {
+            printf '%s\n\n' "$MARKER"
+            case "$gate:$verdict" in
+              PASS:PASS)        printf '✅ **Gate: PASS** — %s\n' "$reason" ;;
+              PASS:*)           printf '✅ **Gate: PASS (override)** — %s\n' "$reason" ;;
+              BLOCK:BLOCK)      printf '🛑 **Gate: BLOCK** — the review reported %s HIGH/CRITICAL finding(s). Address them and push (the review re-runs on each push), or a maintainer can apply the `%s` label to override.\n' "$blocking" "$ACK_LABEL" ;;
+              *:INCONCLUSIVE)   printf '⚠️ **Gate: INCONCLUSIVE** — %s Re-run the review (Actions → Claude Code Review → Run workflow with this PR number, or push a commit), or a maintainer can apply the `%s` label.\n' "$reason" "$ACK_LABEL" ;;
+              *)                printf '🛑 **Gate: BLOCK** — %s\n' "$reason" ;;
+            esac
+            printf '\n_Observe-only until `review-gate` is added to the branch'"'"'s required status checks._\n'
+          } > gate-comment.md
+          gh api "repos/$REPO/issues/$PR/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" 2>/dev/null \
+          | while read -r id; do gh api -X DELETE "repos/$REPO/issues/comments/$id" >/dev/null 2>&1 || true; done
+          gh pr comment "$PR" --repo "$REPO" --body-file gate-comment.md || true
+
+          # 6) Set the check result.
+          if [ "$gate" = "PASS" ]; then
+            echo "review-gate: PASS — $reason"
+          else
+            echo "review-gate: ${verdict} — $reason"
+            exit 1
+          fi
