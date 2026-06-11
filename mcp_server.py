@@ -2238,7 +2238,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
                      parent: int, repo_path: str,
                      confirm_create: bool = False,
                      skip_duplicate_check: bool = False,
-                     related_issues: list[int] | None = None) -> dict:
+                     related_issues: list[int] | None = None,
+                     priority: str = "") -> dict:
     """Shared `zh <noun> create --json` wrapper for the planning nouns.
 
     Forwards every meaningful create-time flag the bash side exposes:
@@ -2262,6 +2263,14 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             match against one downgrades from block to warn instead of
             hard-blocking (issue #46). `parent` is added automatically;
             pass this for known siblings / dependencies in a bulk-load.
+        priority: optional priority name, resolved case-insensitively
+            against the workspace's configured priorities (discover with
+            list_priorities), applied inline at create time exactly as
+            create_issue's `priority` does (v1.9.9 / #61). The response
+            carries priority_requested (the input) and priority (the
+            confirmed value); priority_requested=<name> with priority=null
+            means the mutation did not confirm (retry) — this does NOT
+            flip partial_applied, which stays the parent-wire signal.
     """
     if not title.strip():
         # v1.9.2 round-2 (PR #27) finding #3: full key-set so the
@@ -2390,6 +2399,15 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         args.extend(["-e", estimate])
     if parent and parent > 0:
         args.extend(["--parent", str(parent)])
+    # v1.9.9 (#61): forward --priority to the bash noun-create (which
+    # already accepts it and delegates to cmd_create's post-create
+    # priority step), mirroring create_issue. The --json output carries
+    # priority / priority_requested with the same three-state divergence
+    # contract, so a priority that didn't confirm surfaces as
+    # priority=null / priority_requested=<name> — no partial_applied flip
+    # (that stays the parent-wire signal, matching create_issue).
+    if priority:
+        args.extend(["--priority", priority])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     created = _parse_create_json(r["stdout_plain"]) if r["ok"] else None
     # v1.9.8 (#54): mirror create_issue's parent-wire-failure detection.
@@ -2427,12 +2445,13 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         "estimate_requested": (
             created.get("estimate_requested") if created else None
         ),
-        # Round-4 finding #7: propagate the priority fields so the
-        # planning-noun create returns the same key set create_issue
-        # does. Planning creates do not accept --priority today, so
-        # these will normally be null; including them keeps shape parity
-        # against the future case where they DO get a priority flag,
-        # and lets MCP clients read both entry points uniformly.
+        # Round-4 finding #7 + v1.9.9 (#61): propagate the priority fields
+        # so the planning-noun create returns the same key set create_issue
+        # does. As of v1.9.9 the planning creates accept `priority` inline
+        # (forwarded as --priority above), so these reflect the requested
+        # vs confirmed value with the same three-state contract as
+        # estimate: priority_requested=<name> / priority=null means the
+        # priority mutation didn't confirm (retry).
         "priority": created.get("priority") if created else None,
         "priority_requested": (
             created.get("priority_requested") if created else None
@@ -2832,7 +2851,8 @@ def epic_create(title: str, description: str = "", labels: str = "",
                 parent: int = 0, repo_path: str = "",
                 confirm_create: bool = False,
                 skip_duplicate_check: bool = False,
-                related_issues: list[int] | None = None) -> dict:
+                related_issues: list[int] | None = None,
+                priority: str = "") -> dict:
     """Create an Epic (an issue with issue-type Epic).
 
     v1.9.0: an epic is a normal issue typed Epic, with a normal issue
@@ -2863,6 +2883,14 @@ def epic_create(title: str, description: str = "", labels: str = "",
             match against one downgrades from block to warn instead of
             hard-blocking (issue #46). `parent` is added automatically;
             pass this for known siblings / dependencies in a bulk-load.
+        priority: optional priority name, resolved case-insensitively
+            against the workspace's configured priorities (discover with
+            list_priorities), applied inline at create time exactly as
+            create_issue's `priority` does (v1.9.9 / #61). The response
+            carries priority_requested (the input) and priority (the
+            confirmed value); priority_requested=<name> with priority=null
+            means the mutation did not confirm (retry) — this does NOT
+            flip partial_applied, which stays the parent-wire signal.
 
     Returns:
         dict with: ok, partial_applied, number, epic_number (back-compat
@@ -2883,6 +2911,7 @@ def epic_create(title: str, description: str = "", labels: str = "",
         confirm_create=confirm_create,
         skip_duplicate_check=skip_duplicate_check,
         related_issues=related_issues,
+        priority=priority,
     ))
 
 
@@ -3004,7 +3033,8 @@ def initiative_create(title: str, description: str = "", labels: str = "",
                       repo_path: str = "",
                       confirm_create: bool = False,
                       skip_duplicate_check: bool = False,
-                      related_issues: list[int] | None = None) -> dict:
+                      related_issues: list[int] | None = None,
+                      priority: str = "") -> dict:
     """Create an Initiative (issue-type Initiative, level 1).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3012,7 +3042,11 @@ def initiative_create(title: str, description: str = "", labels: str = "",
     skip_duplicate_check=True to bypass. Pass related_issues=[...] (issue
     numbers) to treat siblings / dependencies as structural relatives so a
     hard match against one downgrades from block to warn (issue #46);
-    `parent` is added to that set automatically.
+    `parent` is added to that set automatically. Pass priority=<name> to
+    set a workspace priority inline at create time, exactly as create_issue
+    does (v1.9.9 / #61); the response carries priority / priority_requested
+    with the same three-state contract (priority_requested set + priority
+    null = mutation did not confirm; partial_applied is unaffected).
 
     Returns: dict with ok, partial_applied, number, url, type, pipeline,
     parent, estimate, estimate_requested, priority, priority_requested,
@@ -3029,7 +3063,8 @@ def initiative_create(title: str, description: str = "", labels: str = "",
                             pipeline, assignee, estimate, parent, repo_path,
                             confirm_create=confirm_create,
                             skip_duplicate_check=skip_duplicate_check,
-                            related_issues=related_issues)
+                            related_issues=related_issues,
+                            priority=priority)
 
 
 @mcp.tool()
@@ -3120,7 +3155,8 @@ def project_create(title: str, description: str = "", labels: str = "",
                    repo_path: str = "",
                    confirm_create: bool = False,
                    skip_duplicate_check: bool = False,
-                   related_issues: list[int] | None = None) -> dict:
+                   related_issues: list[int] | None = None,
+                   priority: str = "") -> dict:
     """Create a Project (issue-type Project, level 2).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3128,7 +3164,11 @@ def project_create(title: str, description: str = "", labels: str = "",
     skip_duplicate_check=True to bypass. Pass related_issues=[...] (issue
     numbers) to treat siblings / dependencies as structural relatives so a
     hard match against one downgrades from block to warn (issue #46);
-    `parent` is added to that set automatically.
+    `parent` is added to that set automatically. Pass priority=<name> to
+    set a workspace priority inline at create time, exactly as create_issue
+    does (v1.9.9 / #61); the response carries priority / priority_requested
+    with the same three-state contract (priority_requested set + priority
+    null = mutation did not confirm; partial_applied is unaffected).
 
     Returns: dict with ok, partial_applied, number, url, type, pipeline,
     parent, estimate, estimate_requested, priority, priority_requested,
@@ -3145,7 +3185,8 @@ def project_create(title: str, description: str = "", labels: str = "",
                             assignee, estimate, parent, repo_path,
                             confirm_create=confirm_create,
                             skip_duplicate_check=skip_duplicate_check,
-                            related_issues=related_issues)
+                            related_issues=related_issues,
+                            priority=priority)
 
 
 @mcp.tool()
@@ -3232,7 +3273,8 @@ def subtask_create(title: str, description: str = "", labels: str = "",
                    repo_path: str = "",
                    confirm_create: bool = False,
                    skip_duplicate_check: bool = False,
-                   related_issues: list[int] | None = None) -> dict:
+                   related_issues: list[int] | None = None,
+                   priority: str = "") -> dict:
     """Create a Sub-task (issue-type Sub-task, level 5).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3240,7 +3282,11 @@ def subtask_create(title: str, description: str = "", labels: str = "",
     skip_duplicate_check=True to bypass. Pass related_issues=[...] (issue
     numbers) to treat siblings / dependencies as structural relatives so a
     hard match against one downgrades from block to warn (issue #46);
-    `parent` is added to that set automatically.
+    `parent` is added to that set automatically. Pass priority=<name> to
+    set a workspace priority inline at create time, exactly as create_issue
+    does (v1.9.9 / #61); the response carries priority / priority_requested
+    with the same three-state contract (priority_requested set + priority
+    null = mutation did not confirm; partial_applied is unaffected).
 
     Returns: dict with ok, partial_applied, number, url, type, pipeline,
     parent, estimate, estimate_requested, priority, priority_requested,
@@ -3257,7 +3303,8 @@ def subtask_create(title: str, description: str = "", labels: str = "",
                             assignee, estimate, parent, repo_path,
                             confirm_create=confirm_create,
                             skip_duplicate_check=skip_duplicate_check,
-                            related_issues=related_issues)
+                            related_issues=related_issues,
+                            priority=priority)
 
 
 @mcp.tool()
