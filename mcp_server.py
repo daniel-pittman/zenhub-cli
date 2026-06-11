@@ -2883,6 +2883,14 @@ def epic_create(title: str, description: str = "", labels: str = "",
             match against one downgrades from block to warn instead of
             hard-blocking (issue #46). `parent` is added automatically;
             pass this for known siblings / dependencies in a bulk-load.
+        priority: optional priority name, resolved case-insensitively
+            against the workspace's configured priorities (discover with
+            list_priorities), applied inline at create time exactly as
+            create_issue's `priority` does (v1.9.9 / #61). The response
+            carries priority_requested (the input) and priority (the
+            confirmed value); priority_requested=<name> with priority=null
+            means the mutation did not confirm (retry) — this does NOT
+            flip partial_applied, which stays the parent-wire signal.
 
     Returns:
         dict with: ok, partial_applied, number, epic_number (back-compat
