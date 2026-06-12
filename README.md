@@ -849,7 +849,13 @@ The agent file is genuinely portable — strip the example "Project-specific con
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full workflow; the essentials:
+
+- Branch off `develop` (the default branch); `main` only receives release PRs.
+- Run the test suite in a virtualenv: `python -m venv .venv && .venv/bin/python -m pip install -r requirements-dev.txt && .venv/bin/python -m pytest tests/`.
+- Every PR runs the `syntax` checks (bash + Python + pytest across 3.10/3.11/3.12), a Semgrep scan, and an automated Claude review whose verdict drives the `review-gate` merge check.
+
+Security issues go through [`SECURITY.md`](SECURITY.md), not the public tracker.
 
 ## License
 

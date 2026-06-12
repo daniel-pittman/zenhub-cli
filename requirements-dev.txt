@@ -1,0 +1,15 @@
+# Test/development dependencies for the zenhub-cli pytest suite.
+#
+# The suite mocks the network and the embedding model entirely, so it does
+# NOT need the MCP runtime stack (mcp / sentence-transformers / torch). It
+# needs:
+#   - pytest: the test runner.
+#   - numpy:  the similarity-scoring tests construct fake normalized
+#             embedding vectors to exercise find_similar's threshold math.
+#             (Without it those tests importorskip and silently don't run.)
+#
+# Install into an isolated virtualenv (see CONTRIBUTING.md "Running the
+# tests locally"). CI installs from this same file so local and CI runs
+# resolve identical test deps.
+pytest
+numpy
