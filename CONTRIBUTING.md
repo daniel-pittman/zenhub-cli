@@ -22,9 +22,21 @@ The first time an outside contributor opens a PR, GitHub holds Actions execution
 
 ## CI and review automation
 
-- **`syntax` (required)** — bash and Python syntax checks. Must pass before merge into `develop` or `main`. No secrets needed; runs on every push and PR including from forks.
-- **Claude code review (advisory)** — automated PR review using a subscription-bound OAuth token. Output appears as a PR comment; not a merge gate.
-- **Semgrep security scan (advisory)**: free, token-free Semgrep OSS (`p/python`, `p/bash`, `p/secrets`, `p/ci`) runs first on every PR and posts a single sticky findings comment, which the Claude code review folds into its analysis. No API key; not a merge gate.
+- **`syntax` (required)** — bash and Python syntax checks plus the pytest suite across Python 3.10/3.11/3.12. Must pass before merge into `develop` or `main`. No secrets needed; runs on every push and PR including from forks.
+- **Claude code review** — automated PR review using a subscription-bound OAuth token. Output appears as a PR comment and drives the `review-gate` check (below).
+- **Semgrep security scan (advisory)**: free, token-free Semgrep OSS (`p/python`, `p/bash`, `p/secrets`, `p/ci`) runs first on every PR and posts a single sticky findings comment, which the Claude code review folds into its analysis. No API key; advisory.
+
+### Merge gate (`review-gate`)
+
+The review's verdict is enforced, not just advisory. After the main review posts, a cheap single-purpose second pass (`verdict-extract`) reads it and emits one machine line, and `review-gate` turns that into a check:
+
+- **PASS** — the review reported no HIGH/CRITICAL findings. Green.
+- **BLOCK** — at least one HIGH/CRITICAL finding (a correctness bug on a common path, a security/data-loss issue, a build/release breakage, or a CI Tests failure). Push a fix — the review re-runs on every push and can clear it — or a maintainer overrides. Style, missing-tests double-counting, and speculative hardening deliberately do **not** block.
+- **INCONCLUSIVE** — the review or the extractor didn't complete (usually a transient API throttle) or emitted no parseable verdict. Distinct, re-runnable, and **also red**: a flaky run never reads as a clean pass. Re-run via Actions → Claude Code Review → Run workflow (with the PR number), or override.
+
+**Override:** a maintainer (write/maintain/admin) applies the `review-ack` label, honored only when applied at or after the current head commit (a stale ack can't clear a finding on newly-pushed code). Admin branch-protection bypass is the emergency break-glass.
+
+**PRs that edit `.github/workflows/claude-code-review.yml` itself:** the review action refuses to run on a PR that modifies its own workflow file (a token-exfiltration guard — "Workflow validation failed … this is normal"). Such a PR shows the review failed and the gate INCONCLUSIVE; that's expected. Merge it via the non-review checks (`syntax`, `semgrep`) plus diff review; subsequent PRs are reviewed normally.
 
 The interactive `@claude` bot is available for maintainer-triggered triage. **Only comments authored by `OWNER`, `MEMBER`, or `COLLABORATOR` accounts trigger it**, by design — outside contributors who type `@claude` won't get a response, to bound subscription-quota burn. See [`SECURITY.md` §5](SECURITY.md) for the rationale.
 
