@@ -310,7 +310,15 @@ jobs:
         uses: anthropics/claude-code-action@787c5a0ce96a9a6cfb050ea0c8f4c05f2447c251 # v1.0.133
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          track_progress: true
+          # track_progress MUST stay false here. With it on, the action posts a
+          # placeholder comment ("I'll analyze this and get back to you.") that the
+          # agent must then UPDATE with its result; on this tiny one-shot the Haiku
+          # agent intermittently never performs that update, so the placeholder
+          # survives, the gate finds no verdict line, and reports INCONCLUSIVE on a
+          # perfectly good PR (observed across the lab repos, 2026-06-18). With
+          # track_progress off the action posts the agent's final message directly
+          # as the comment — no update step to drop — which is what the gate reads.
+          track_progress: false
           claude_args: '--model haiku'
           prompt: >-
             Read the file ./REVIEW.md in the repository — it is an automated code review of this
@@ -318,7 +326,8 @@ jobs:
             review itself rates HIGH or CRITICAL severity (a "CI Tests" FAILURE called out in the
             review also counts). Do NOT re-judge the diff, do NOT add findings of your own, and do
             NOT count MEDIUM/LOW findings, missing-test notes, or anything the review did not label
-            HIGH/CRITICAL. Your published PR comment must be EXACTLY one line, nothing else:
+            HIGH/CRITICAL. Respond with EXACTLY one line and NOTHING else — no preamble, no
+            acknowledgement, no "I'll analyze this", just the line itself:
             MERGE-VERDICT-GATE VERDICT=PASS COUNT=0
             (when the review has zero HIGH/CRITICAL findings), or
             MERGE-VERDICT-GATE VERDICT=BLOCK COUNT=N
