@@ -254,3 +254,4 @@ Common errors and solutions:
 - "Not in a git repository": Must run from a git repo with GitHub remote
 - "Could not get GitHub repo ID": Ensure `gh auth status` shows authenticated
 - "ZenHub API error": Check token validity and repository workspace connection
+- "ZenHub can't see this repository..." / `NO_ACCESS`: lapsed ZenHub↔GitHub authorization. ZenHub's GitHub access expires separately from `ZH_TOKEN`, so reads (workspaces, boards) keep working while repo resolution and `create_issue` fail. Sign in at app.zenhub.com and re-authorize GitHub, then retry. (The error message itself now spells this out — `get_repo_id` / `get_workspace_id` emit the guidance, and `zh_graphql` appends a re-auth hint on `NO_ACCESS`.)

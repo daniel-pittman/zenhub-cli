@@ -701,6 +701,12 @@ Ensure the GitHub CLI is authenticated: `gh auth status`
 - Check your token is valid and not expired
 - Ensure you're using the correct token type (GraphQL vs REST)
 - Verify the repository is connected to a ZenHub workspace
+- A `NO_ACCESS` error (e.g. on `create_issue`) usually means a lapsed ZenHub↔GitHub authorization — see the next entry
+
+### "ZenHub can't see this repository" / lapsed ZenHub↔GitHub authorization
+If `zh` reports it can't see a repo that clearly exists on GitHub, while reads of workspaces/boards keep working (and creates fail with `NO_ACCESS`), the cause is almost always that **ZenHub's GitHub authorization has lapsed**. ZenHub reaches GitHub repo objects through a GitHub grant that expires *separately* from your `zh` token, so the token still authenticates and lists workspaces while repo access is denied — which is easy to misread as a broken token or an unattached repo.
+
+Fix: sign in at [app.zenhub.com](https://app.zenhub.com); if it prompts you to re-authorize GitHub, do so, then retry. If that doesn't resolve it, confirm the repo is attached to a workspace (ZenHub → workspace → Manage Repositories).
 
 ### "Issue not found"
 The issue must exist in a repository that's part of your ZenHub workspace.

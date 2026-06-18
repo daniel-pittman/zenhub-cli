@@ -351,8 +351,20 @@ zh_graphql() {
 
     # Check for errors
     if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
-        local error_msg
+        local error_msg error_kind
         error_msg=$(echo "$response" | jq -r '.errors[0].message // "Unknown error"')
+        # NO_ACCESS (e.g. on createIssue against a repo object) is the mutation-
+        # side face of a lapsed ZenHub<->GitHub authorization. Inspect the error
+        # type / extensions.code / message and append the re-auth hint so the
+        # mutation path gets the same guidance as the empty-result resolution
+        # path (see zh_repo_access_hint).
+        error_kind=$(echo "$response" | jq -r '[.errors[0].type, .errors[0].extensions.code] | map(select(. != null)) | join(" ")')
+        if printf '%s %s' "$error_kind" "$error_msg" | grep -qiE 'NO_ACCESS|no access|not authorized|unauthorized|forbidden'; then
+            error "ZenHub API error: $error_msg
+This usually means ZenHub's GitHub authorization has lapsed (its GitHub access
+expires separately from your zh token). Sign in at https://app.zenhub.com and
+re-authorize GitHub if prompted, then retry."
+        fi
         error "ZenHub API error: $error_msg"
     fi
 
@@ -454,6 +466,32 @@ resolve_gh_repo_id() {
 }
 
 # Get ZenHub repository ID from owner/repo (uses gh CLI to get GitHub ID first)
+# Shared, actionable guidance for the "ZenHub can't see a repo we know exists on
+# GitHub" failure. The tell is "reads work but repo access fails": ZenHub
+# authenticates ZH_TOKEN and lists workspaces, yet returns no repo object for the
+# repo. ZenHub reaches GitHub repo objects through a GitHub OAuth/App grant that
+# expires INDEPENDENTLY of ZH_TOKEN, so the usual cause is a lapsed ZenHub<->GitHub
+# authorization (re-auth on the website), not a bad token or a missing repo. The
+# other cause is the repo simply not being attached to a workspace. Both surface
+# identically (empty repositoriesByGhId), so we name both and lead with the auth
+# one. Echoes a multi-line message for error() to frame.
+zh_repo_access_hint() {
+    local owner_repo="$1" gh_id="${2:-}"
+    local idnote=""
+    [[ -n "$gh_id" ]] && idnote=" (GitHub ID: ${gh_id})"
+    cat <<EOF
+ZenHub can't see this repository for your account: ${owner_repo}${idnote}.
+The token authenticated and workspaces are readable, but ZenHub returned no repo
+object. This is usually one of:
+  1. ZenHub's GitHub authorization has lapsed. Sign in at https://app.zenhub.com
+     and re-authorize GitHub if prompted, then retry. ZenHub's GitHub access
+     expires separately from your zh token, so reads keep working while repo
+     access is denied -- easy to miss.
+  2. The repo isn't connected to a ZenHub workspace. Add it in ZenHub ->
+     workspace -> Manage Repositories.
+EOF
+}
+
 get_repo_id() {
     local owner_repo="$1"
 
@@ -482,7 +520,7 @@ get_repo_id() {
     repo_id=$(echo "$response" | jq -r '.data.repositoriesByGhId[0].id // empty')
 
     if [[ -z "$repo_id" ]]; then
-        error "Repository not found in ZenHub: $owner_repo (GitHub ID: $gh_id)"
+        error "$(zh_repo_access_hint "$owner_repo" "$gh_id")"
     fi
 
     echo "$repo_id"
@@ -584,7 +622,7 @@ get_workspace_id() {
     node_count=$(echo "$workspace_nodes" | jq 'length')
 
     if [[ "$node_count" -eq 0 ]]; then
-        error "No workspace found for this repository"
+        error "$(zh_repo_access_hint "$owner_repo" "$gh_id")"
     fi
 
     # Resolve effective name: flag-set override beats env/config value
