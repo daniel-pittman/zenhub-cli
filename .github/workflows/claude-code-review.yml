@@ -492,7 +492,7 @@ jobs:
               PASS:PASS)        printf '✅ **Gate: PASS** — %s\n' "$reason" ;;
               PASS:*)           printf '✅ **Gate: PASS (override)** — %s\n' "$reason" ;;
               BLOCK:BLOCK)      printf '🛑 **Gate: BLOCK** — the review reported %s HIGH/CRITICAL finding(s). Address them and push (the review re-runs on each push), or a maintainer can apply the `%s` label to override.\n' "$count" "$ACK_LABEL" ;;
-              *:INCONCLUSIVE)   printf '⚠️ **Gate: INCONCLUSIVE** — %s Re-run via Actions → Claude Code Review → Run workflow (with this PR number), or a maintainer can apply the `%s` label.\n' "$reason" "$ACK_LABEL" ;;
+              *:INCONCLUSIVE)   printf '⚠️ **Gate: INCONCLUSIVE** — %s Push a new commit to re-run the checks (they re-run on every push), or a maintainer can apply the `%s` label.\n' "$reason" "$ACK_LABEL" ;;
               *)                printf '🛑 **Gate: BLOCK** — %s\n' "$reason" ;;
             esac
             printf '\n_Observe-only until `review-gate` is added to the branch'"'"'s required status checks._\n'
