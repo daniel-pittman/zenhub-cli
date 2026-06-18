@@ -142,10 +142,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
           SHA: ${{ github.event.pull_request.head.sha }}
           MARKER: '### CI Tests'
         run: |
+          # On a manual workflow_dispatch re-run there is no pull_request context,
+          # so head.sha arrives empty — resolve it from the PR number instead, or
+          # await-tests fails and drags the review + gate down with it.
+          if [ -z "${SHA:-}" ]; then
+            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo "")
+          fi
           # Poll the CI workflow run for this head commit (~30 min ceiling). The
           # &event=pull_request filter selects the PR-context run, not the push
           # run ci.yml also fires on the same commit, so the conclusion reflects
@@ -419,6 +425,12 @@ jobs:
           MARKER: '### Review Gate'
         run: |
           set -euo pipefail
+          # On a manual workflow_dispatch re-run there is no pull_request context,
+          # so head.sha is empty — resolve it from the PR number (used below for
+          # review-ack head-scoping).
+          if [ -z "${SHA:-}" ]; then
+            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid -q .headRefOid 2>/dev/null || echo "")
+          fi
           verdict=""; count="0"; reason=""; gate="BLOCK"
 
           # 1) INCONCLUSIVE if the review or the extractor didn't complete.
