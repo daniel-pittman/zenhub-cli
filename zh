@@ -459,16 +459,8 @@ For multi-workspace repos, also see -w / --workspace and ZH_WORKSPACE."
 # capture keeps the inner failure from tripping `set -e` before we inspect it.
 resolve_gh_repo_id() {
     local owner_repo="$1"
-    local gh_id gh_status=0
-    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>&1) || gh_status=$?
-
-    if (( gh_status != 0 )) || [[ ! "$gh_id" =~ ^[0-9]+$ ]]; then
-        local detail
-        detail=$(printf '%s' "$gh_id" | tr '\n' ' ')
-        printf "  GitHub lookup for '%s' failed: %s\n" "$owner_repo" "$detail" >&2
-        return 1
-    fi
-
+    local gh_id
+    gh_id=$(gh api "repos/${owner_repo}" --jq '.id' 2>&1)
     printf '%s' "$gh_id"
 }
 
