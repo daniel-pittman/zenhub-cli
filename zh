@@ -359,13 +359,20 @@ zh_graphql() {
         # mutation path gets the same guidance as the empty-result resolution
         # path (see zh_repo_access_hint).
         error_kind=$(echo "$response" | jq -r '[.errors[0].type, .errors[0].extensions.code] | map(select(. != null)) | join(" ")')
-        if printf '%s %s' "$error_kind" "$error_msg" | grep -qiE 'NO_ACCESS|no access|not authorized|unauthorized|forbidden'; then
+        # Match ZenHub's actual access-denied vocabulary (NO_ACCESS type, and the
+        # "no access" / "not authorized" human-message variants). Kept narrow on
+        # purpose: broader synonyms like "forbidden"/"unauthorized" would risk
+        # appending the re-auth hint to unrelated errors. Explicit else (not a
+        # fall-through to a second `error`) so the control flow doesn't silently
+        # depend on error() calling exit.
+        if printf '%s %s' "$error_kind" "$error_msg" | grep -qiE 'NO_ACCESS|no access|not authorized'; then
             error "ZenHub API error: $error_msg
 This usually means ZenHub's GitHub authorization has lapsed (its GitHub access
 expires separately from your zh token). Sign in at https://app.zenhub.com and
 re-authorize GitHub if prompted, then retry."
+        else
+            error "ZenHub API error: $error_msg"
         fi
-        error "ZenHub API error: $error_msg"
     fi
 
     echo "$response"
