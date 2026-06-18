@@ -28,7 +28,7 @@ The first time an outside contributor opens a PR, GitHub holds Actions execution
 
 ### Merge gate (`review-gate`)
 
-The review's verdict is enforced, not just advisory. After the main review posts, a cheap single-purpose second pass (`verdict-extract`) reads it and emits one machine line, and `review-gate` turns that into a check:
+The review's verdict is enforced, not just advisory. After the main review posts, a cheap single-purpose second pass (`verdict-extract`) reads it and emits one machine line, and `review-gate` turns that into a check. The gate posts a single human-readable `### Review Gate` comment with the outcome (it tidies away the machine line), so you can read the verdict directly in the PR thread:
 
 - **PASS** — the review reported no HIGH/CRITICAL findings. Green.
 - **BLOCK** — at least one HIGH/CRITICAL finding (a correctness bug on a common path, a security/data-loss issue, a build/release breakage, or a CI Tests failure). Push a fix — the review re-runs on every push and can clear it — or a maintainer overrides. Style, missing-tests double-counting, and speculative hardening deliberately do **not** block.
