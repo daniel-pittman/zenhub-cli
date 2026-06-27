@@ -2041,18 +2041,25 @@ cmd_assign() {
     load_config
 
     local issue_num="${1:-}"
-    local username="${2:-}"
+    shift || true
 
-    if [[ -z "$issue_num" ]] || [[ -z "$username" ]]; then
-        error "Usage: zh assign <issue_number> <github_username>
-Example: zh assign 42 acme-user
-         zh assign 42 @acme-user"
+    # Accept one or more usernames (symmetric with unassign). Strip @ prefixes.
+    local -a usernames=()
+    local arg
+    for arg in "$@"; do
+        usernames+=("${arg#@}")
+    done
+
+    if [[ -z "$issue_num" ]] || [[ ${#usernames[@]} -eq 0 ]]; then
+        error "Usage: zh assign <issue_number> <github_username> [github_username ...]
+Examples:
+  zh assign 42 acme-user
+  zh assign 42 @acme-user
+  zh assign 42 alice bob          # assign multiple users"
     fi
 
     # Strip # prefix if present
     issue_num="${issue_num#\#}"
-    # Strip @ prefix if present
-    username="${username#@}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -2090,11 +2097,11 @@ Example: zh assign 42 acme-user
         error "Issue #${issue_num} not found"
     fi
 
-    # Get workspace ID to look up user
+    # Get workspace ID to look up users
     local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
 
-    # Get the ZenHub user ID from workspace assignees
+    # Get the ZenHub user IDs from workspace assignees
     local user_query='
     query($workspaceId: ID!) {
         workspace(id: $workspaceId) {
@@ -2113,27 +2120,33 @@ Example: zh assign 42 acme-user
     local user_response
     user_response=$(zh_graphql "$user_query" "$user_vars")
 
-    local zh_user_id
-    zh_user_id=$(echo "$user_response" | jq -r --arg user "$username" \
-        '.data.workspace.assignees.nodes[] | select(.login == $user) | .id // empty')
+    # Requested logins (deduped) as a JSON array for set operations.
+    local want_json
+    want_json=$(printf '%s\n' "${usernames[@]}" | jq -R . | jq -s 'unique_by(.)')
 
-    if [[ -z "$zh_user_id" ]]; then
-        error "User '${username}' not found in workspace. Use 'zh users' to list available users."
+    # Any requested user not present in the workspace is a hard error.
+    local not_in_ws
+    not_in_ws=$(echo "$user_response" | jq -r --argjson want "$want_json" \
+        '($want - [.data.workspace.assignees.nodes[].login]) | join(", ")')
+    if [[ -n "$not_in_ws" ]]; then
+        error "User(s) not found in workspace: ${not_in_ws}. Use 'zh users' to list available users."
     fi
 
-    # Check if user is already assigned
-    local already_assigned
-    already_assigned=$(echo "$issue_response" | jq -r --arg user "$username" \
-        '[.data.issueByInfo.assignees.nodes[].login] | index($user) // empty')
+    # IDs to add = requested users not already assigned to the issue.
+    local assigned_json
+    assigned_json=$(echo "$issue_response" | jq -c '[.data.issueByInfo.assignees.nodes[].login]')
+    local ids_to_add
+    ids_to_add=$(echo "$user_response" | jq -c --argjson want "$want_json" --argjson assigned "$assigned_json" \
+        '[.data.workspace.assignees.nodes[] | select(.login as $l | ($want | index($l)) != null) | select(.login as $l | ($assigned | index($l)) == null) | .id]')
 
-    if [[ -n "$already_assigned" ]]; then
+    if [[ "$ids_to_add" == "[]" ]]; then
         echo ""
-        success "${username} is already assigned to #${issue_num}: ${issue_title}"
+        success "${usernames[*]} already assigned to #${issue_num}: ${issue_title}"
         echo -e "  Assignees: ${GREEN}${current_assignees}${NC}"
         return 0
     fi
 
-    info "Assigning ${username} to issue #${issue_num}..."
+    info "Assigning ${usernames[*]} to issue #${issue_num}..."
 
     local mutation='
     mutation($input: AddAssigneesToIssuesInput!) {
@@ -2144,8 +2157,8 @@ Example: zh assign 42 acme-user
     }'
 
     local mutation_vars
-    mutation_vars=$(jq -n --arg issue_id "$issue_id" --arg user_id "$zh_user_id" \
-        '{input: {issueIds: [$issue_id], assigneeIds: [$user_id]}}')
+    mutation_vars=$(jq -n --arg issue_id "$issue_id" --argjson assignee_ids "$ids_to_add" \
+        '{input: {issueIds: [$issue_id], assigneeIds: $assignee_ids}}')
 
     local response
     response=$(zh_graphql "$mutation" "$mutation_vars")
@@ -2156,7 +2169,7 @@ Example: zh assign 42 acme-user
     if [[ "$success_count" -eq 0 ]]; then
         local github_errors
         github_errors=$(echo "$response" | jq -r '.data.addAssigneesToIssues.githubErrors // "Unknown error"')
-        error "Failed to assign ${username}: ${github_errors}"
+        error "Failed to assign ${usernames[*]}: ${github_errors}"
     fi
 
     # Brief delay then re-fetch to get updated assignees list
@@ -2166,7 +2179,7 @@ Example: zh assign 42 acme-user
     new_assignees=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].login] | join(", ")')
 
     echo ""
-    success "Assigned ${username} to #${issue_num}: ${issue_title}"
+    success "Assigned ${usernames[*]} to #${issue_num}: ${issue_title}"
     echo -e "  Assignees: ${GREEN}${new_assignees}${NC}"
 }
 
@@ -2174,20 +2187,47 @@ cmd_unassign() {
     load_config
 
     local issue_num="${1:-}"
-    local username="${2:-}"
+    shift || true
+
+    # Parse the remaining args into a list of usernames and an explicit --all
+    # flag. Clearing all assignees is now OPT-IN: a bare `zh unassign <n>` used
+    # to remove EVERY assignee, so a missing/misnamed target (e.g. the MCP layer
+    # silently dropping a wrong kwarg and falling back to the empty default)
+    # would silently un-assign teammates on a shared issue (#80). Now the only
+    # way to clear everyone is the explicit --all flag.
+    local clear_all=false
+    local -a usernames=()
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            --all|-a) clear_all=true ;;
+            *) usernames+=("${arg#@}") ;;   # strip @ prefix
+        esac
+    done
 
     if [[ -z "$issue_num" ]]; then
-        error "Usage: zh unassign <issue_number> [username]
+        error "Usage: zh unassign <issue_number> <username> [username ...]
+       zh unassign <issue_number> --all
 
 Examples:
-  zh unassign 42 johndoe    # Remove johndoe from issue
-  zh unassign 42            # Remove all assignees from issue"
+  zh unassign 42 johndoe          # Remove only johndoe
+  zh unassign 42 johndoe janedoe  # Remove both named users
+  zh unassign 42 --all            # Remove ALL assignees (explicit)"
+    fi
+
+    # SAFETY: refuse to clear everyone unless --all was explicitly passed.
+    if [[ "$clear_all" != true ]] && [[ ${#usernames[@]} -eq 0 ]]; then
+        error "Refusing to remove all assignees by default (this is a destructive, shared-state change).
+Name the user(s) to remove, or pass --all to clear everyone:
+  zh unassign ${issue_num#\#} <username> [username ...]
+  zh unassign ${issue_num#\#} --all"
+    fi
+    if [[ "$clear_all" == true ]] && [[ ${#usernames[@]} -gt 0 ]]; then
+        error "Pass specific username(s) OR --all, not both."
     fi
 
     # Strip # prefix if present
     issue_num="${issue_num#\#}"
-    # Strip @ prefix if present (if username provided)
-    [[ -n "$username" ]] && username="${username#@}"
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -2227,18 +2267,8 @@ Examples:
 
     # Determine which assignees to remove
     local assignee_ids_to_remove
-    if [[ -n "$username" ]]; then
-        # Remove specific user - get their ID from the issue's assignees
-        assignee_ids_to_remove=$(echo "$issue_response" | jq -r --arg user "$username" \
-            '[.data.issueByInfo.assignees.nodes[] | select(.login == $user) | .id]')
-
-        if [[ "$assignee_ids_to_remove" == "[]" ]]; then
-            error "User '${username}' is not assigned to issue #${issue_num}"
-        fi
-
-        info "Removing ${username} from issue #${issue_num}..."
-    else
-        # Remove all assignees
+    if [[ "$clear_all" == true ]]; then
+        # Explicit --all: remove every current assignee.
         assignee_ids_to_remove=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].id]')
 
         if [[ "$assignee_ids_to_remove" == "[]" ]]; then
@@ -2246,6 +2276,24 @@ Examples:
         fi
 
         info "Removing all assignees from issue #${issue_num}..."
+    else
+        # Remove ONLY the named users. Each must currently be assigned — a named
+        # user who isn't assigned is a hard error (don't silently no-op a typo).
+        local want_json
+        want_json=$(printf '%s\n' "${usernames[@]}" | jq -R . | jq -s 'unique_by(.)')
+
+        local not_assigned
+        not_assigned=$(echo "$issue_response" | jq -r --argjson want "$want_json" \
+            '($want - [.data.issueByInfo.assignees.nodes[].login]) | join(", ")')
+        if [[ -n "$not_assigned" ]]; then
+            error "Not assigned to issue #${issue_num}: ${not_assigned}
+Current assignees: $(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].login] | join(", ") | if . == "" then "none" else . end')"
+        fi
+
+        assignee_ids_to_remove=$(echo "$issue_response" | jq -r --argjson want "$want_json" \
+            '[.data.issueByInfo.assignees.nodes[] | select(.login as $l | ($want | index($l)) != null) | .id]')
+
+        info "Removing ${usernames[*]} from issue #${issue_num}..."
     fi
 
     local mutation='
@@ -2279,10 +2327,10 @@ Examples:
     remaining_assignees=$(echo "$issue_response" | jq -r '[.data.issueByInfo.assignees.nodes[].login] | join(", ") | if . == "" then "none" else . end')
 
     echo ""
-    if [[ -n "$username" ]]; then
-        success "Removed ${username} from #${issue_num}: ${issue_title}"
-    else
+    if [[ "$clear_all" == true ]]; then
         success "Removed all assignees from #${issue_num}: ${issue_title}"
+    else
+        success "Removed ${usernames[*]} from #${issue_num}: ${issue_title}"
     fi
     echo -e "  Assignees: ${CYAN}${remaining_assignees}${NC}"
 }

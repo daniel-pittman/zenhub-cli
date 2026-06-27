@@ -1995,51 +1995,97 @@ def comment(number: int, message: str, repo_path: str = "") -> dict:
     }
 
 
+def _assignee_targets(assignees: list[str] | None, user: str) -> list[str]:
+    """Merge the canonical `assignees` list with the back-compat single `user`
+    into a deduped, empties-removed target list (order preserved)."""
+    targets = list(assignees or [])
+    if user:
+        targets.append(user)
+    return [t for t in dict.fromkeys(targets) if t]
+
+
 @mcp.tool()
-def assign(number: int, user: str, repo_path: str = "") -> dict:
-    """Assign a user to an issue.
+def assign(number: int, assignees: list[str] | None = None, user: str = "",
+           repo_path: str = "") -> dict:
+    """Assign one or more users to an issue.
 
     Args:
         number: Issue number.
-        user: GitHub username to assign.
+        assignees: GitHub username(s) to assign (one or more).
+        user: Back-compat alias for a single assignee (merged into `assignees`).
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, partial_applied, number, user, raw, stderr.
+        dict with: ok, partial_applied, number, assignees, raw, stderr.
     """
-    r = _run_zh(["assign", str(number), user], cwd=_resolve_cwd(repo_path))
+    targets = _assignee_targets(assignees, user)
+    if not targets:
+        return {
+            "ok": False, "partial_applied": False, "number": number,
+            "assignees": [], "raw": "",
+            "stderr": "No assignee specified: pass assignees=[\"user\", ...] (or user=\"user\").",
+        }
+    r = _run_zh(["assign", str(number), *targets], cwd=_resolve_cwd(repo_path))
     # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
         "partial_applied": False,
         "number": number,
-        "user": user,
+        "assignees": targets,
         "raw": r["stdout_plain"],
         "stderr": _stderr_plain(r),
     }
 
 
 @mcp.tool()
-def unassign(number: int, user: str = "", repo_path: str = "") -> dict:
-    """Remove assignee(s) from an issue.
+def unassign(number: int, assignees: list[str] | None = None,
+             clear_all: bool = False, user: str = "", repo_path: str = "") -> dict:
+    """Remove specific assignee(s) from an issue, or all of them with clear_all.
+
+    SAFETY: removing assignees is a destructive, shared-state change, so this
+    NEVER clears everyone by default. Pass the specific `assignees` to remove,
+    or set `clear_all=True` to remove all of them. Calling with neither is an
+    error (it does not touch the issue) — this prevents a missing/misnamed
+    argument from silently un-assigning teammates.
 
     Args:
         number: Issue number.
-        user: Optional specific user to unassign. If omitted, removes all assignees.
+        assignees: GitHub username(s) to remove (one or more).
+        clear_all: Remove ALL assignees. Must be set explicitly.
+        user: Back-compat alias for a single assignee (merged into `assignees`).
         repo_path: Optional absolute path of a git checkout to run zh from.
 
     Returns:
-        dict with: ok, partial_applied, number, raw, stderr.
+        dict with: ok, partial_applied, number, assignees, cleared_all, raw, stderr.
     """
+    targets = _assignee_targets(assignees, user)
+    if clear_all and targets:
+        return {
+            "ok": False, "partial_applied": False, "number": number,
+            "assignees": targets, "cleared_all": False, "raw": "",
+            "stderr": "Pass specific assignees OR clear_all=True, not both.",
+        }
+    if not clear_all and not targets:
+        return {
+            "ok": False, "partial_applied": False, "number": number,
+            "assignees": [], "cleared_all": False, "raw": "",
+            "stderr": ("Refusing to remove all assignees by default. Pass "
+                       "assignees=[\"user\", ...] to remove specific users, or "
+                       "clear_all=True to remove everyone."),
+        }
     args = ["unassign", str(number)]
-    if user:
-        args.append(user)
+    if clear_all:
+        args.append("--all")
+    else:
+        args.extend(targets)
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
         "partial_applied": False,
         "number": number,
+        "assignees": targets,
+        "cleared_all": clear_all,
         "raw": r["stdout_plain"],
         "stderr": _stderr_plain(r),
     }
