@@ -64,8 +64,8 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh move <issue#> "<pipeline>"` — move between pipelines
 - `zh reorder <issue#> <position|top|bottom>` — reorder within current pipeline (numeric positions supported, top = 1)
 - `zh estimate <issue#> <points|clear>` — set/clear story-point estimate
-- `zh assign <issue#> <user>` — assign user
-- `zh unassign <issue#> [user]` — remove assignee(s)
+- `zh assign <issue#> <user> [user...]` — assign one or more users
+- `zh unassign <issue#> <user> [user...]` — remove ONLY the named assignee(s); `zh unassign <issue#> --all` to clear everyone (a bare unassign with no user errors rather than removing all, so a missing target can't silently un-assign teammates)
 - `zh priority <issue#> <name|clear>`: set priority by name. Priorities are workspace-defined, NOT a fixed high/medium/low set: the name is matched case-insensitively against the configured priorities (discover with `zh priorities`). An unconfigured name errors and lists the available ones rather than silently mis-setting. `clear` removes the priority.
 
 ### Write operations (relationships)
