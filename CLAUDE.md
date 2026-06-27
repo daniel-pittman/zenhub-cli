@@ -32,8 +32,9 @@ zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 zh move <issue> "Pipeline"    # Move to pipeline
 zh reorder <issue> top        # Prioritize
 zh estimate <issue> <points>  # Set estimate
-zh assign <issue> <user>      # Assign user
-zh unassign <issue> [user]    # Remove assignee(s)
+zh assign <issue> <user> [user...]      # Assign one or more users
+zh unassign <issue> <user> [user...]    # Remove only the named assignee(s)
+zh unassign <issue> --all               # Remove ALL assignees (explicit; a bare unassign no longer clears everyone)
 zh comment <issue> "text"     # Add comment
 zh close <issue> [comment]    # Close issue
 zh reopen <issue>             # Reopen closed issue

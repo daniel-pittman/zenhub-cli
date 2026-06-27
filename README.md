@@ -154,8 +154,9 @@ ZH_REST_TOKEN=your_rest_token_here
 | `move <issue> <pipeline>` | `mv`, `m` | Move an issue to a pipeline |
 | `reorder <issue> <position>` | `order`, `pos` | Reorder issue within its pipeline |
 | `estimate <issue> <points>` | `est`, `points` | Set story point estimate |
-| `assign <issue> <user>` | | Assign a user to an issue |
-| `unassign <issue> [user]` | | Remove assignee(s) from an issue |
+| `assign <issue> <user> [user...]` | | Assign one or more users to an issue |
+| `unassign <issue> <user> [user...]` | | Remove the named assignee(s) |
+| `unassign <issue> --all` | | Remove ALL assignees (explicit) |
 | `comment <issue> [text]` | `c` | Add a comment to an issue |
 | `attach <issue>` | | Open issue in browser to add attachments |
 | `close <issue> [comment]` | | Close an issue |
@@ -241,11 +242,15 @@ zh estimate 42 clear      # Remove estimate
 
 # Assign users
 zh assign 42 username
-zh assign 42 @username    # @ prefix works too
+zh assign 42 @username       # @ prefix works too
+zh assign 42 alice bob       # assign multiple users at once
 
 # Remove assignees
-zh unassign 42 username   # Remove specific user
-zh unassign 42            # Remove all assignees
+zh unassign 42 username      # Remove only the named user
+zh unassign 42 alice bob     # Remove multiple named users
+zh unassign 42 --all         # Remove ALL assignees (explicit)
+# Note: `zh unassign 42` with no user now errors instead of clearing everyone,
+# so a missing/mistyped target can't silently un-assign teammates.
 ```
 
 ### Comments
