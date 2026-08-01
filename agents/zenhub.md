@@ -38,6 +38,8 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 
 ### Read operations (safe, fire-and-forget)
 - `zh board` — overview: per-pipeline counts
+- `zh count [pipeline] [-q] [--json]` — **exact** issue counts, taken from the API's own totalCount. Use this whenever the answer is a number: a listing's length can be a truncated page, and a count that is quietly short is indistinguishable from a correct one. `-q` prints a bare number for scripting.
+- `zh doctor [--json]` — hierarchy health check: open issues whose parent is CLOSED (they roll up to nothing and are invisible in normal listings), plus parent cycles. Exits 1 when it finds problems. Run it after any bulk restructure or container close.
 - `zh pipelines` — list pipeline names for the workspace
 - `zh pipeline "<name>"` — list issues in a pipeline (order matters; top = highest priority)
 - `zh issue <N>` — full ticket detail (title, state, body, pipeline, priority, estimate, assignee, ZH + GH URLs)
@@ -88,6 +90,7 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh subissue remove <parent#> <child#> [...]` — unlink sub-issues from a parent (aliases: `rm`)
 - `zh subissue list <parent#>` — list a parent's sub-issues with the same format `zh epic show` uses (aliases: `ls`)
 - `zh subissue reorder <child#> <top|bottom|after <sib#>|before <sib#>>` — reorder a sub-issue among its siblings. **Different positioning model from `zh reorder`**: ZenHub's `reprioritizeSubIssue` mutation uses sibling-anchored positioning, not integer positions. (aliases: `order`, `pos`)
+- `zh reparent <new_parent#> <child#> [...] [--dry-run]` — **move** children to a new parent. Use this instead of `subissue add` / `<noun> add` whenever a child might already have a parent: a child may have only ONE parent, so a bulk add returns a partial success where every already-parented child fails with "Sub issue may only have one parent". `reparent` resolves each child's current parent and detaches it first, so you only specify the destination. `--dry-run` prints the plan (including which current parents are CLOSED) without changing anything. (alias: `move-parent`)
 
 ### Write operations (sprint membership)
 - `zh sprint add <name|current|active> <issue#> [<issue#> ...]` — add one or more issues to a sprint (single API call). Top-level alias: `zh sa <name> <issue#> [...]`.

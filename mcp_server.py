@@ -1237,6 +1237,149 @@ def board(repo_path: str = "") -> dict:
     }
 
 
+def _parse_json_stdout(plain: str):
+    """Best-effort parse of a `--json` payload from zh stdout.
+
+    zh writes human chatter to stderr and the JSON object to stdout, but be
+    tolerant: scan for the first line that parses as JSON rather than assuming
+    the whole buffer is clean.
+    """
+    if not plain:
+        return None
+    try:
+        return json.loads(plain)
+    except (ValueError, TypeError):
+        pass
+    for line in plain.splitlines():
+        line = line.strip()
+        if line.startswith("{") or line.startswith("["):
+            try:
+                return json.loads(line)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+@mcp.tool()
+def count(pipeline_name: str = "", include_closed: bool = False,
+          repo_path: str = "") -> dict:
+    """Exact issue counts — never a silently truncated page.
+
+    Counts come from the API's own totalCount, so the number is the server's
+    count rather than the length of one fetched page. Use this (not a listing's
+    length) whenever the answer is a number.
+
+    Args:
+        pipeline_name: Optional pipeline to count. Omit for every pipeline.
+        include_closed: Count closed issues too (default: open only).
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, total, exact, includes_closed, pipelines, raw, stderr.
+    """
+    args = ["count"]
+    if pipeline_name:
+        args.append(pipeline_name)
+    if include_closed:
+        args.append("--all")
+    args.append("--json")
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"]) or {}
+    return {
+        "ok": r["ok"],
+        "total": data.get("total"),
+        "exact": data.get("exact", False),
+        "includes_closed": data.get("includes_closed", include_closed),
+        "pipelines": data.get("pipelines", []),
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def doctor(repo_path: str = "") -> dict:
+    """Check the planning hierarchy for structural problems.
+
+    Closing a parent does not detach its children, so a closed container
+    silently orphans everything under it: those issues disappear from every
+    container-level rollup while each still looks healthy on its own. This
+    surfaces that (and parent cycles) directly.
+
+    Args:
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, healthy, checked, open, complete, closed_parent_orphans,
+        parent_cycles, raw, stderr. `ok` reports whether the CHECK ran;
+        `healthy` reports whether the hierarchy passed it.
+    """
+    r = _run_zh(["doctor", "--json"], cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"]) or {}
+    # zh doctor exits 1 when it finds problems, so a non-zero exit is a
+    # FINDING, not a tool failure — only treat it as failure if no payload.
+    ran = bool(data)
+    return {
+        "ok": ran,
+        "healthy": data.get("ok", False),
+        "checked": data.get("checked"),
+        "open": data.get("open"),
+        "complete": data.get("complete"),
+        "closed_parent_orphans": data.get("closed_parent_orphans", []),
+        "parent_cycles": data.get("parent_cycles", []),
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def move_children(to: int, issue_numbers: list[int], dry_run: bool = False,
+                  repo_path: str = "") -> dict:
+    """Move sub-issues to a new parent, detaching them from their current one.
+
+    A child may have only one parent, so plain `*_add_children` fails with
+    "Sub issue may only have one parent" for any issue that already has one —
+    and the blocker is often a CLOSED issue that no longer appears in listings.
+    This resolves each child's current parent and does the detach itself, so
+    the caller only has to say where the children should END UP.
+
+    Args:
+        to: Destination parent issue number.
+        issue_numbers: Children to move.
+        dry_run: Report the plan (which child detaches from which parent)
+            without changing anything.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, partial_applied, to, issue_numbers, dry_run, raw, stderr.
+    """
+    nums = [int(n) for n in (issue_numbers or [])]
+    if not nums:
+        return {
+            "ok": False, "partial_applied": False, "to": to,
+            "issue_numbers": [], "dry_run": dry_run, "raw": "",
+            "stderr": "No issue_numbers given: pass the children to move.",
+        }
+    args = ["reparent", str(to), *[str(n) for n in nums]]
+    if dry_run:
+        args.append("--dry-run")
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    # Exit 1 from the attach step means some children did not land; the detach
+    # may already have happened, so surface that as partial rather than clean.
+    # The partial marker is `warn "Attached N/M ..."`, which goes to STDERR —
+    # stdout only ever carries "Attaching …" (present tense) and "Moved …", so
+    # matching stdout here made this flag dead code.
+    stderr_text = _stderr_plain(r)
+    return {
+        "ok": r["ok"],
+        "partial_applied": (not r["ok"]) and "Attached" in (stderr_text or ""),
+        "to": to,
+        "issue_numbers": nums,
+        "dry_run": dry_run,
+        "raw": r["stdout_plain"],
+        "stderr": stderr_text,
+    }
+
+
 @mcp.tool()
 def pipeline(name: str, repo_path: str = "") -> dict:
     """List issues in a specific pipeline.
