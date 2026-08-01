@@ -149,6 +149,8 @@ ZH_REST_TOKEN=your_rest_token_here
 | `issue <number>` | `i`, `show` | View issue details |
 | `mine [user]` | `my` | List issues assigned to you (or specified user) |
 | `board [--all]` | `b`, `overview` | Show board overview with issue counts |
+| `count [pipeline] [--all] [-q] [--json]` | `n` | **Exact** issue counts (from the API's own totalCount — never a truncated page) |
+| `doctor [--json]` | `check`, `health` | Hierarchy health check: open issues under a CLOSED parent, parent cycles. Exits 1 on findings |
 | `pipeline <name> [--all]` | `pipe`, `col` | List issues in a specific pipeline |
 | `pipelines [repo]` | `pipes`, `p` | List pipeline names for a workspace |
 | `move <issue> <pipeline>` | `mv`, `m` | Move an issue to a pipeline |
@@ -173,6 +175,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `project <subcommand>` | `projects` | Manage Project issues (level 2) |
 | `subtask <subcommand>` | `subtasks` | Manage Sub-task issues (level 5) |
 | `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues, the parent/child wiring (see [Sub-issues](#sub-issues)) |
+| `reparent <new_parent> <child...> [--dry-run]` | `move-parent` | Move sub-issues to a new parent, detaching them from their current one |
 | `sprints [--all]` | `sp` | List sprints in workspace (see [Sprints](#sprints)) |
 | `sprint <name>` | | View sprint details and issues |
 | `sprint add <name> <issue#> [...]` | `sa` (top-level) | Add one or more issues to a sprint |
@@ -481,6 +484,36 @@ zh subissue reorder 100 after 101
 zh subissue reorder 100 before 102
 ```
 
+### Reparenting (moving children between parents)
+
+A child may have only **one** parent, so `subissue add` rejects any issue that already has one with *"Sub issue may only have one parent"* — without naming the parent that's in the way. That parent is frequently a **closed** issue, which no longer shows up in the listings you'd naturally check.
+
+`zh reparent` takes the destination and the children and does the detach itself, so you never have to know where each child currently lives:
+
+```bash
+# Move #60, #72, #73 under #586 — wherever they are now
+zh reparent 586 60 72 73
+
+# See the plan first; changes nothing
+zh reparent 586 60 72 73 --dry-run
+  #60  detach from #501 (CLOSED) -> attach to #586
+  #72  detach from #502 (CLOSED) -> attach to #586
+  #73  no current parent -> attach to #586
+```
+
+Children already under the destination are skipped, and a closed destination is called out (attaching live work to a closed parent means it rolls up to nothing).
+
+### Hierarchy health (`zh doctor`)
+
+Closing a parent does **not** detach its children: they keep pointing at the closed issue and roll up to nothing, disappearing from every container-level count while each still looks healthy on its own. Nothing in a normal listing reveals it. `zh doctor` is the check:
+
+```bash
+zh doctor          # exits 1 if it finds problems (usable as a CI gate)
+zh doctor --json   # machine-readable
+```
+
+It reports open issues whose parent is CLOSED (with the `zh reparent` command to fix them) and any parent cycles. `zh close` also warns when the issue being closed still has open sub-issues, naming them.
+
 `zh issue <N>` opportunistically surfaces parent/child info when present:
 
 ```
@@ -727,6 +760,8 @@ Roughly 35 tools covering the same surface as `zh`:
 | Category | Tools |
 |---|---|
 | Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `sprint_list`, `sprint_show`, `sprint_current`, `list_users`, `list_labels`, `list_types` |
+| Counting & health | `count` (exact totals, never a truncated page), `doctor` (hierarchy health) |
+| Reparenting | `move_children` (move sub-issues to a new parent, detaching from the current one) |
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
