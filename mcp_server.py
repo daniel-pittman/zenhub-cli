@@ -1365,14 +1365,18 @@ def move_children(to: int, issue_numbers: list[int], dry_run: bool = False,
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # Exit 1 from the attach step means some children did not land; the detach
     # may already have happened, so surface that as partial rather than clean.
+    # The partial marker is `warn "Attached N/M ..."`, which goes to STDERR —
+    # stdout only ever carries "Attaching …" (present tense) and "Moved …", so
+    # matching stdout here made this flag dead code.
+    stderr_text = _stderr_plain(r)
     return {
         "ok": r["ok"],
-        "partial_applied": (not r["ok"]) and "Attached" in (r["stdout_plain"] or ""),
+        "partial_applied": (not r["ok"]) and "Attached" in (stderr_text or ""),
         "to": to,
         "issue_numbers": nums,
         "dry_run": dry_run,
         "raw": r["stdout_plain"],
-        "stderr": _stderr_plain(r),
+        "stderr": stderr_text,
     }
 
 

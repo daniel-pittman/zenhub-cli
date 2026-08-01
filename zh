@@ -7000,7 +7000,14 @@ Example: zh subissue add 42 100 101"
                     echo -e "  #${blocked_n} is currently a sub-issue of #${blocker_num}${blocker_note}"
                 fi
             done
-            echo -e "  To move them anyway: zh reparent ${stripped_parent} ${failed_nums_pretty//#/}"
+            # Build the arg list space-separated and hash-free. failed_nums_pretty
+            # is the comma-separated human form ("#60, #72"), which strips to
+            # "60, 72" and yields a command that dies on reparent's own numeric
+            # guard — a suggested fix must be copy-pasteable.
+            local failed_nums_plain
+            failed_nums_plain=$(echo "$response" | jq -r \
+                '(.data.addSubIssues.failedIssues // []) | map(.number|tostring) | join(" ")')
+            echo -e "  To move them anyway: zh reparent ${stripped_parent} ${failed_nums_plain}"
         fi
         # Round-10 Pattern C (round-9 #4): surface the fail-divergence
         # case (API reported failures but did not account for every

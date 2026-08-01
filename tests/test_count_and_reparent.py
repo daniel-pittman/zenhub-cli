@@ -319,6 +319,53 @@ def test_mcp_move_children_empty_list_does_not_invoke_zh(monkeypatch):
     assert calls == []
 
 
+def test_one_parent_error_hint_is_copy_pasteable() -> None:
+    """A suggested fix must actually run.
+
+    The hint was built from the comma-separated human list ("#60, #72"), so it
+    printed `zh reparent 42 60, 72` — which dies on reparent's own numeric guard.
+    """
+    stubs = r"""
+        load_config() { :; }
+        get_repo_info() { printf 'acme/widgets'; }
+        get_repo_id() { printf 'repo-gid'; }
+        get_workspace_id() { printf 'ws-gid'; }
+        zh_resolve_issue_ids() { printf '%s' '["gid-60","gid-72"]'; }
+        zh_graphql() {
+            local q="$1"
+            if [[ "$q" == *addSubIssues* ]]; then
+                printf '%s' '{"data":{"addSubIssues":{"successCount":0,"githubErrors":["Sub issue may only have one parent"],"failedIssues":[{"number":60},{"number":72}]}}}'
+            else
+                printf '%s' '{"data":{"issueByInfo":{"id":"gid-x","number":1,"title":"t","state":"OPEN","parentIssue":{"id":"p","number":501,"title":"old","state":"CLOSED"}}}}'
+            fi
+        }
+    """
+    r = run_zh_with_stubs(stubs, "cmd_subissue_add 42 60 72 || true")
+    out = r.stdout + r.stderr
+    hint = next((ln for ln in out.splitlines() if "To move them anyway" in ln), "")
+    assert hint, f"expected a reparent hint; got {out!r}"
+    assert "zh reparent 42 60 72" in hint, f"hint must be runnable as-is; got {hint!r}"
+    # The comma form is fine in the human "2 failed: #60, #72" line — but the
+    # suggested COMMAND must carry bare space-separated numbers.
+    assert "," not in hint.split("zh reparent")[-1], f"suggested command has comma args: {hint!r}"
+    assert "#" not in hint.split("zh reparent")[-1], f"suggested command has # prefixes: {hint!r}"
+
+
+def test_mcp_move_children_partial_detected_from_stderr(monkeypatch):
+    """Regression: the partial marker is warn()->STDERR, so matching stdout made
+    partial_applied dead code — it stayed False in the exact
+    detach-succeeded/attach-partially-failed case it exists to flag."""
+    def fake_run_zh(args, **kwargs):
+        return {"ok": False,
+                "stdout_plain": "Attaching 2 issue(s) to #586...",
+                "stderr_plain": "Warning: Attached 1/2 to #586"}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.move_children(to=586, issue_numbers=[60, 73])
+    assert out["ok"] is False
+    assert out["partial_applied"] is True, "must flag the partial detach/attach state"
+
+
 def test_mcp_count_parses_exact_total(monkeypatch):
     _capture(monkeypatch, stdout='{"total":125,"includes_closed":false,"exact":true,"pipelines":[]}')
     out = mcp_server.count(pipeline_name="Product Backlog")
