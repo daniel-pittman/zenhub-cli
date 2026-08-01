@@ -26,6 +26,9 @@ zh mine @username       # Issues assigned to user
 zh mine --no-urls       # Compact output without URLs
 zh users                # List assignable users
 zh board                # Board overview
+zh count                # EXACT issue counts per pipeline (never a truncated page)
+zh count "Backlog" -q   # Bare exact number for one pipeline (scripting)
+zh doctor               # Hierarchy health: open issues under a CLOSED parent, parent cycles
 zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 
 # Manage issues
@@ -78,6 +81,14 @@ zh subissue remove <parent#> <child#> [...]   # Unlink sub-issues
 zh subissue list <parent#>                    # List sub-issues of a parent
 zh subissue reorder <child#> top|bottom|after <sib#>|before <sib#>
                                               # Reorder among siblings (sibling-anchored, not integer positions)
+
+# Reparenting (moving children between parents)
+# A child may have only ONE parent, so `subissue add` fails for a child that
+# already has one — and the blocker is often a CLOSED issue that no longer
+# appears in listings. `reparent` resolves each child's current parent and
+# does the detach itself, so you only say where they should END UP.
+zh reparent <new_parent#> <child#> [<child#> ...]   # Move children to a new parent
+zh reparent 586 60 72 73 --dry-run                 # Show the plan, change nothing
 
 # Sprints — read
 zh sprints [--all]                            # List sprints (● marks active; --all includes closed)

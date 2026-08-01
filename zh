@@ -821,6 +821,20 @@ COMMANDS:
     board [--all]           Show board overview (issue count per pipeline)
                            Excludes closed issues by default
 
+    count [pipeline]        EXACT issue counts (from the API's totalCount —
+                           never a truncated page). -q for a bare number,
+                           --json for machine output, --all to include closed
+                           Example: zh count "Product Backlog" -q
+
+    doctor                  Hierarchy health check: open issues under a CLOSED
+                           parent (they roll up to nothing) and parent cycles
+                           Exits 1 if problems are found
+
+    reparent <parent#> <child#> [...]
+                           Move sub-issues to a new parent, detaching them from
+                           their current one. --dry-run shows the plan only
+                           Example: zh reparent 586 60 72 73 --dry-run
+
     pipeline <name> [--all] List issues in a specific pipeline
                            Excludes closed issues by default
                            Example: zh pipeline "In Progress"
@@ -990,6 +1004,9 @@ ALIASES:
     issue: i, show
     mine: my
     board: b, overview
+    count: n
+    doctor: check, health
+    reparent: move-parent
     pipeline: pipe, col
     pipelines: pipes, p
     move: mv, m
@@ -1428,6 +1445,132 @@ Example: zh issue 42"
     echo ""
 }
 
+# Fetch EVERY issue in a pipeline, paginating to exhaustion, plus the
+# connection's authoritative totalCount.
+#
+# Why this exists: the callers used to issue a single `first: 50` query and then
+# derive a count from `nodes | length`. That silently reports a PAGE as if it
+# were the SET — a 125-issue pipeline rendered as "(50 issues)" with nothing to
+# indicate the number was wrong. A count that is confidently wrong is worse than
+# an error, because an error gets noticed (#86). totalCount comes from the
+# connection itself, so it is exact regardless of how many pages we walk.
+#
+# Echoes JSON: { totalCount: N, nodes: [...], complete: true|false }
+# `complete` is false when a pagination defense tripped, so the caller can say
+# "showing N of M" instead of implying it rendered everything.
+#
+# filters_json is the IssueSearchFiltersInput payload ({} for all issues,
+# {assignees:{in:[user]}} for `zh mine`).
+zh_pipeline_issues_fetch_all() {
+    local pipeline_id="$1"
+    local workspace_id="$2"
+    local filters_json="${3:-{\}}"
+
+    local query='
+    query($pipelineId: ID!, $workspaceId: ID!, $filters: IssueSearchFiltersInput!, $after: String) {
+        searchIssuesByPipeline(
+            pipelineId: $pipelineId
+            filters: $filters
+            first: 100
+            after: $after
+        ) {
+            totalCount
+            pageInfo {
+                hasNextPage
+                endCursor
+            }
+            nodes {
+                number
+                title
+                state
+                zenhubUrl(workspaceId: $workspaceId)
+                estimate {
+                    value
+                }
+                assignees {
+                    nodes {
+                        login
+                    }
+                }
+                repository {
+                    ownerName
+                    name
+                }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local prev_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+    local total_count=0
+    local first_page=true
+    local complete=true
+
+    while :; do
+        # Same runaway-pagination defenses as zh_subissue_fetch_all: bail on a
+        # non-advancing cursor, and cap iterations as a backstop. 200 pages ×
+        # 100 issues = 20,000, far above any real pipeline.
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Pagination iteration cap (200) hit on pipeline — returning partial result"
+            complete=false
+            break
+        fi
+
+        local variables
+        variables=$(jq -n \
+            --arg pipeline_id "$pipeline_id" \
+            --arg workspace_id "$workspace_id" \
+            --argjson filters "$filters_json" \
+            --argjson after "$cursor" \
+            '{pipelineId: $pipeline_id, workspaceId: $workspace_id, filters: $filters, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables") || { complete=false; break; }
+
+        local conn
+        conn=$(echo "$response" | jq '.data.searchIssuesByPipeline')
+        if [[ -z "$conn" ]] || [[ "$conn" == "null" ]]; then
+            complete=false
+            break
+        fi
+
+        if [[ "$first_page" == "true" ]]; then
+            total_count=$(echo "$conn" | jq -r '.totalCount // 0')
+            first_page=false
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$conn" | jq -c '[(.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$conn" | jq -r '.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$conn" | jq -r '.pageInfo.endCursor // empty')
+
+        if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then
+            break
+        fi
+
+        if [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]]; then
+            warn "Pagination cursor did not advance (endCursor=${end_cursor:0:16}…) — returning partial result"
+            complete=false
+            break
+        fi
+        prev_cursor="$end_cursor"
+
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n \
+        --argjson nodes "$all_nodes" \
+        --argjson total "$total_count" \
+        --argjson complete "$complete" \
+        '{totalCount: $total, nodes: $nodes, complete: $complete}'
+}
+
 cmd_mine() {
     load_config
 
@@ -1496,51 +1639,31 @@ cmd_mine() {
 
     # Collect all issues assigned to user across pipelines
     local all_issues="[]"
+    # Set when any pipeline's pagination bailed early, so the count line can
+    # admit it is a floor rather than presenting a short number as exact (#86).
+    local mine_incomplete=false
 
     while IFS= read -r pipeline; do
         local pipeline_id pipeline_name
         pipeline_id=$(echo "$pipeline" | jq -r '.id')
         pipeline_name=$(echo "$pipeline" | jq -r '.name')
 
-        # Search issues in this pipeline filtered by assignee
-        local query='
-        query($pipelineId: ID!, $workspaceId: ID!, $filters: IssueSearchFiltersInput!) {
-            searchIssuesByPipeline(
-                pipelineId: $pipelineId
-                filters: $filters
-                first: 50
-            ) {
-                nodes {
-                    number
-                    title
-                    zenhubUrl(workspaceId: $workspaceId)
-                    estimate {
-                        value
-                    }
-                    assignees {
-                        nodes {
-                            login
-                        }
-                    }
-                    repository {
-                        ownerName
-                        name
-                    }
-                }
-            }
-        }'
+        # Fetch every assigned issue in this pipeline (paginated — a single
+        # `first: 50` page silently dropped assignments past the 50th, #86).
+        local assignee_filters
+        assignee_filters=$(jq -n --arg user "$target_user" '{assignees: {in: [$user]}}')
 
-        local variables
-        variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg workspace_id "$workspace_id" --arg user "$target_user" \
-            '{pipelineId: $pipeline_id, workspaceId: $workspace_id, filters: {assignees: {in: [$user]}}}')
+        local page
+        page=$(zh_pipeline_issues_fetch_all "$pipeline_id" "$workspace_id" "$assignee_filters" 2>/dev/null) || continue
 
-        local response
-        response=$(zh_graphql "$query" "$variables" 2>/dev/null) || continue
+        if [[ "$(echo "$page" | jq -r '.complete')" != "true" ]]; then
+            mine_incomplete=true
+        fi
 
         # Add pipeline name to each issue and merge
         local issues_with_pipeline
-        issues_with_pipeline=$(echo "$response" | jq --arg pname "$pipeline_name" \
-            '[.data.searchIssuesByPipeline.nodes[] | . + {pipeline: $pname}]')
+        issues_with_pipeline=$(echo "$page" | jq --arg pname "$pipeline_name" \
+            '[.nodes[] | . + {pipeline: $pname}]')
 
         all_issues=$(echo "$all_issues" "$issues_with_pipeline" | jq -s 'add')
     done <<< "$pipelines"
@@ -1549,7 +1672,11 @@ cmd_mine() {
     count=$(echo "$all_issues" | jq 'length')
 
     echo ""
-    echo -e "${BOLD}Issues assigned to ${target_user} (${count}):${NC}"
+    if [[ "$mine_incomplete" == "true" ]]; then
+        echo -e "${BOLD}Issues assigned to ${target_user} (at least ${count} — listing incomplete):${NC}"
+    else
+        echo -e "${BOLD}Issues assigned to ${target_user} (${count}):${NC}"
+    fi
     echo ""
 
     if [[ "$count" -eq 0 ]]; then
@@ -1668,6 +1795,127 @@ cmd_board() {
     echo ""
 }
 
+# Exact issue counts, by construction.
+#
+# Triage asks "how many are in this state" constantly, and a count is the one
+# answer where being quietly short is indistinguishable from being right (#86).
+# Every number here comes from the connection's own totalCount — the server's
+# count, not the length of whatever page we happened to fetch — so it cannot be
+# a truncated page presented as a total.
+cmd_count() {
+    load_config
+
+    local pipeline_name=""
+    local include_closed=false
+    local as_json=false
+    local quiet=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a) include_closed=true; shift ;;
+            --json)   as_json=true; shift ;;
+            -q|--quiet) quiet=true; shift ;;
+            -h|--help)
+                error "Usage: zh count [pipeline] [--all] [--json] [-q]
+
+Exact issue counts (never a truncated page).
+
+Examples:
+  zh count                      # every pipeline + total
+  zh count \"Product Backlog\"    # one pipeline
+  zh count --all                # include closed issues
+  zh count -q                   # bare number, for scripting
+  zh count --json               # machine-readable"
+                ;;
+            *)
+                if [[ -z "$pipeline_name" ]]; then pipeline_name="$1"; fi
+                shift
+                ;;
+        esac
+    done
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # totalCount on the pipeline's own issues connection is the authoritative
+    # server-side count; state: OPEN narrows it without paging anything.
+    local query
+    if [[ "$include_closed" == "true" ]]; then
+        query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                pipelinesConnection {
+                    nodes { name issues { totalCount } }
+                }
+            }
+        }'
+    else
+        query='
+        query($workspaceId: ID!) {
+            workspace(id: $workspaceId) {
+                pipelinesConnection {
+                    nodes { name issues(state: OPEN) { totalCount } }
+                }
+            }
+        }'
+    fi
+
+    local variables response
+    variables=$(jq -n --arg workspace_id "$workspace_id" '{workspaceId: $workspace_id}')
+    response=$(zh_graphql "$query" "$variables")
+
+    local rows
+    rows=$(echo "$response" | jq -c '[.data.workspace.pipelinesConnection.nodes[] | {name: .name, count: (.issues.totalCount // 0)}]')
+
+    # Narrow to one pipeline (case-insensitive, partial match — same resolution
+    # rule as `zh pipeline`), erroring rather than guessing when ambiguous.
+    if [[ -n "$pipeline_name" ]]; then
+        local matched
+        matched=$(echo "$rows" | jq -c --arg n "$pipeline_name" \
+            '[.[] | select((.name | ascii_downcase) == ($n | ascii_downcase))] as $exact
+             | if ($exact | length) > 0 then $exact
+               else [.[] | select((.name | ascii_downcase) | contains($n | ascii_downcase))] end')
+        local matches
+        matches=$(echo "$matched" | jq 'length')
+        if [[ "$matches" -eq 0 ]]; then
+            error "Pipeline not found: ${pipeline_name}
+Available: $(echo "$rows" | jq -r '[.[].name] | join(", ")')"
+        fi
+        if [[ "$matches" -gt 1 ]]; then
+            error "Ambiguous pipeline '${pipeline_name}' matches: $(echo "$matched" | jq -r '[.[].name] | join(", ")')
+Use the full name."
+        fi
+        rows="$matched"
+    fi
+
+    local total
+    total=$(echo "$rows" | jq '[.[].count] | add // 0')
+
+    if [[ "$as_json" == "true" ]]; then
+        jq -n --argjson pipelines "$rows" --argjson total "$total" \
+            --argjson closed "$([[ "$include_closed" == "true" ]] && echo true || echo false)" \
+            '{total: $total, includes_closed: $closed, exact: true, pipelines: $pipelines}'
+        return 0
+    fi
+
+    if [[ "$quiet" == "true" ]]; then
+        echo "$total"
+        return 0
+    fi
+
+    echo ""
+    local scope; scope=$([[ "$include_closed" == "true" ]] && echo "all" || echo "open")
+    echo "$rows" | jq -r '.[] | "  \(.name)\t\(.count)"' | while IFS=$'\t' read -r name c; do
+        printf "  %-28s %s\n" "$name" "$c"
+    done
+    echo ""
+    echo -e "  ${BOLD}TOTAL (${scope})${NC}  ${total}"
+    echo ""
+}
+
 cmd_pipeline() {
     load_config
 
@@ -1744,65 +1992,45 @@ Example: zh pipeline \"In Progress\"
         exit 1
     fi
 
-    # Get issues in this pipeline
-    local query='
-    query($pipelineId: ID!, $workspaceId: ID!, $filters: IssueSearchFiltersInput!) {
-        searchIssuesByPipeline(
-            pipelineId: $pipelineId
-            filters: $filters
-            first: 50
-        ) {
-            nodes {
-                number
-                title
-                state
-                zenhubUrl(workspaceId: $workspaceId)
-                estimate {
-                    value
-                }
-                assignees {
-                    nodes {
-                        login
-                    }
-                }
-                repository {
-                    ownerName
-                    name
-                }
-            }
-        }
-    }'
+    # Get EVERY issue in this pipeline. Previously this issued one `first: 50`
+    # page and then derived the header count from `nodes | length` — so a
+    # 125-issue pipeline printed "(50 issues)" and nothing said otherwise (#86).
+    local page
+    page=$(zh_pipeline_issues_fetch_all "$pipeline_id" "$workspace_id" '{}')
 
-    local variables
-    variables=$(jq -n --arg pipeline_id "$pipeline_id" --arg workspace_id "$workspace_id" \
-        '{pipelineId: $pipeline_id, workspaceId: $workspace_id, filters: {}}')
-
-    local response
-    response=$(zh_graphql "$query" "$variables")
+    local fetched complete api_total
+    fetched=$(echo "$page" | jq '.nodes | length')
+    complete=$(echo "$page" | jq -r '.complete')
+    api_total=$(echo "$page" | jq -r '.totalCount')
 
     local issues
     if [[ "$include_closed" == "true" ]]; then
-        issues=$(echo "$response" | jq '.data.searchIssuesByPipeline.nodes')
+        issues=$(echo "$page" | jq '.nodes')
     else
-        issues=$(echo "$response" | jq '[.data.searchIssuesByPipeline.nodes[] | select(.state != "CLOSED")]')
+        issues=$(echo "$page" | jq '[.nodes[] | select(.state != "CLOSED")]')
     fi
 
     local count
     count=$(echo "$issues" | jq 'length')
 
-    local total_count
-    total_count=$(echo "$response" | jq '.data.searchIssuesByPipeline.nodes | length')
+    local closed_count=$((fetched - count))
 
-    local closed_count=$((total_count - count))
+    # Only ever claim a number we actually fetched. If a pagination defense
+    # tripped, or the connection's own totalCount exceeds what we walked, say
+    # "showing X of Y" rather than presenting a page as the set.
+    local trunc_note=""
+    if [[ "$complete" != "true" ]] || [[ "$fetched" -lt "$api_total" ]]; then
+        trunc_note=" — showing ${fetched} of ${api_total}, listing incomplete"
+    fi
 
     echo ""
     if [[ "$include_closed" == "true" ]]; then
-        echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues)"
+        echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues${trunc_note})"
     else
         if [[ $closed_count -gt 0 ]]; then
-            echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} open, ${closed_count} closed hidden)"
+            echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} open, ${closed_count} closed hidden${trunc_note})"
         else
-            echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues)"
+            echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues${trunc_note})"
         fi
     fi
     echo ""
@@ -2501,6 +2729,22 @@ Examples:
 
     if [[ -z "$issue_title" ]]; then
         error "Issue #${issue_num} not found"
+    fi
+
+    # Closing a parent does NOT detach its children: they keep pointing at the
+    # now-closed issue, so they roll up to nothing — they vanish from every
+    # container-level count while each still looks healthy on its own (#85).
+    # Auto-reparenting would be too clever and blocking would be rude, but
+    # saying which children are about to be orphaned costs one call. Fail-soft:
+    # a lookup failure must never stop a close.
+    local open_children=""
+    open_children=$(gh api "repos/${owner_repo}/issues/${issue_num}/sub_issues" --paginate \
+        --jq '.[] | select(.state=="open") | .number' 2>/dev/null | tr '\n' ' ' | sed 's/ *$//') || open_children=""
+    if [[ -n "$open_children" ]]; then
+        local pretty_children="${open_children// /, #}"
+        warn "#${issue_num} still has open sub-issue(s): #${pretty_children}"
+        echo "  They will keep pointing at this closed issue and roll up to nothing."
+        echo "  Move them first if they should stay tracked: zh reparent <new_parent#> ${open_children}"
     fi
 
     info "Closing issue #${issue_num}..."
@@ -6134,6 +6378,425 @@ zh_resolve_issue_id() {
     echo "$ids_json" | jq -r '.[0]'
 }
 
+# Walk EVERY issue in the workspace with its parent link, for `zh doctor`.
+# Echoes JSON: { totalCount: N, nodes: [{number,title,state,parent}], complete: bool }
+zh_doctor_fetch_issues() {
+    local workspace_id="$1"
+
+    local query='
+    query($workspaceId: ID!, $after: String) {
+        workspace(id: $workspaceId) {
+            issues(first: 100, after: $after) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                    number
+                    title
+                    state
+                    parentIssue { number title state }
+                }
+            }
+        }
+    }'
+
+    local cursor="null" prev_cursor="" iterations=0
+    local all_nodes="[]" total_count=0 first_page=true complete=true
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Pagination iteration cap (200) hit — checking a partial set"
+            complete=false
+            break
+        fi
+
+        local variables response conn
+        variables=$(jq -n --arg workspace_id "$workspace_id" --argjson after "$cursor" \
+            '{workspaceId: $workspace_id, after: $after}')
+        response=$(zh_graphql "$query" "$variables") || { complete=false; break; }
+        conn=$(echo "$response" | jq '.data.workspace.issues')
+        if [[ -z "$conn" ]] || [[ "$conn" == "null" ]]; then complete=false; break; fi
+
+        if [[ "$first_page" == "true" ]]; then
+            total_count=$(echo "$conn" | jq -r '.totalCount // 0')
+            first_page=false
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$conn" | jq -c '[(.nodes // [])[] | select(. != null) | {
+            number, title, state,
+            parent: (if (.parentIssue // null) == null then null
+                     else {number: .parentIssue.number, title: .parentIssue.title, state: .parentIssue.state} end)
+        }]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$conn" | jq -r '.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$conn" | jq -r '.pageInfo.endCursor // empty')
+        if [[ "$has_next" != "true" ]] || [[ -z "$end_cursor" ]]; then break; fi
+        if [[ -n "$prev_cursor" ]] && [[ "$end_cursor" == "$prev_cursor" ]]; then
+            warn "Pagination cursor did not advance — checking a partial set"
+            complete=false
+            break
+        fi
+        prev_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n --argjson nodes "$all_nodes" --argjson total "$total_count" --argjson complete "$complete" \
+        '{totalCount: $total, nodes: $nodes, complete: $complete}'
+}
+
+# Structural health check for the planning hierarchy.
+#
+# Closing a parent does not detach its children, so a closed container silently
+# orphans everything under it: those issues vanish from every container-level
+# rollup while each still looks perfectly healthy viewed on its own. Nothing in
+# any listing surfaces it, because the blocking parent is closed and therefore
+# absent from the listings you would naturally consult (#85). This is the check
+# that would have caught it immediately.
+#
+# Exits 1 when problems are found so scripts and CI can gate on it.
+cmd_doctor() {
+    load_config
+
+    local as_json=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) as_json=true; shift ;;
+            -h|--help)
+                error "Usage: zh doctor [--json]
+
+Check the planning hierarchy for structural problems:
+  - open issues whose parent is CLOSED (they roll up to nothing)
+  - parent cycles
+
+Exits 1 if problems are found."
+                ;;
+            *) shift ;;
+        esac
+    done
+
+    local owner_repo workspace_id
+    owner_repo=$(get_repo_info)
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    # info() writes to stdout, so it would corrupt --json. warn() already goes
+    # to stderr, so pagination warnings are safe to leave on either path.
+    [[ "$as_json" != "true" ]] && info "Checking hierarchy health..."
+
+    local data
+    data=$(zh_doctor_fetch_issues "$workspace_id")
+
+    local checked open_count complete
+    checked=$(echo "$data" | jq '.nodes | length')
+    open_count=$(echo "$data" | jq '[.nodes[] | select(.state != "CLOSED")] | length')
+    complete=$(echo "$data" | jq -r '.complete')
+
+    # Open issues pointing at a closed parent: the silent-orphan case.
+    local orphans
+    orphans=$(echo "$data" | jq -c '[.nodes[]
+        | select(.state != "CLOSED")
+        | select(.parent != null and .parent.state == "CLOSED")
+        | {number, title, parent: .parent.number, parentTitle: .parent.title}]')
+
+    # Parent cycles: walking up from any issue must terminate. `recurse(f; cond)`
+    # (not `recurse(f) | select(...)`) is load-bearing — the filtered form never
+    # ends on a cycle, because limit() can never fill from a stream whose tail is
+    # entirely discarded, and the check hangs instead of reporting.
+    local cycles
+    cycles=$(echo "$data" | jq -c '
+        (reduce .nodes[] as $n ({}; .[$n.number|tostring] = ($n.parent.number // null))) as $up
+        | [.nodes[] | select(.state != "CLOSED") | .number
+           | . as $start
+           | ([limit(64; recurse($up[.|tostring]; . != null))] | length) as $len
+           | select($len >= 64)
+           | $start]')
+
+    local orphan_count cycle_count
+    orphan_count=$(echo "$orphans" | jq 'length')
+    cycle_count=$(echo "$cycles" | jq 'length')
+
+    if [[ "$as_json" == "true" ]]; then
+        jq -n --argjson checked "$checked" --argjson open "$open_count" \
+            --argjson orphans "$orphans" --argjson cycles "$cycles" --argjson complete "$complete" \
+            '{checked: $checked, open: $open, complete: $complete,
+              closed_parent_orphans: $orphans, parent_cycles: $cycles,
+              ok: (($orphans|length) == 0 and ($cycles|length) == 0)}'
+        [[ "$orphan_count" -eq 0 && "$cycle_count" -eq 0 ]] && return 0 || return 1
+    fi
+
+    echo ""
+    echo -e "${BOLD}Hierarchy check${NC} — ${checked} issue(s) scanned, ${open_count} open"
+    [[ "$complete" != "true" ]] && warn "Scan incomplete — results cover only the issues fetched"
+    echo ""
+
+    if [[ "$orphan_count" -gt 0 ]]; then
+        echo -e "  ${RED}✗${NC} ${orphan_count} open issue(s) with a CLOSED parent (rolling up to nothing):"
+        echo "$orphans" | jq -r '.[] | "      #\(.number) \(.title)  ->  parent #\(.parent) (CLOSED)"'
+        echo ""
+        echo -e "      Fix: ${BOLD}zh reparent <new_parent#> $(echo "$orphans" | jq -r '[.[].number] | join(" ")')${NC}"
+        echo ""
+    else
+        echo -e "  ${GREEN}✓${NC} No open issue has a closed parent"
+    fi
+
+    if [[ "$cycle_count" -gt 0 ]]; then
+        echo -e "  ${RED}✗${NC} ${cycle_count} issue(s) in a parent cycle: $(echo "$cycles" | jq -r '[.[] | "#\(.)"] | join(", ")')"
+    else
+        echo -e "  ${GREEN}✓${NC} No parent cycles"
+    fi
+    echo ""
+
+    if [[ "$orphan_count" -gt 0 ]] || [[ "$cycle_count" -gt 0 ]]; then
+        return 1
+    fi
+    success "Hierarchy is healthy"
+}
+
+# Look up one issue plus its CURRENT parent, for reparenting and diagnostics.
+#
+# Echoes JSON {id, number, title, state, parent: {id,number,title,state}|null},
+# or "null" when the issue does not exist in this repo. The parent's state is
+# included on purpose: a closed parent is invisible in most listings, so "which
+# parent is blocking this?" is otherwise a manual hunt (#85).
+zh_issue_with_parent() {
+    local repo_id="$1"
+    local issue_num="$2"
+
+    local query='
+    query($repoId: ID!, $issueNumber: Int!) {
+        issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
+            id
+            number
+            title
+            state
+            parentIssue {
+                id
+                number
+                title
+                state
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg repo_id "$repo_id" --argjson n "$issue_num" \
+        '{repoId: $repo_id, issueNumber: $n}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables" 2>/dev/null) || { echo "null"; return; }
+
+    echo "$response" | jq -c '
+        if (.data.issueByInfo // null) == null then null
+        else {
+            id: .data.issueByInfo.id,
+            number: .data.issueByInfo.number,
+            title: .data.issueByInfo.title,
+            state: .data.issueByInfo.state,
+            parent: (if (.data.issueByInfo.parentIssue // null) == null then null
+                     else {
+                        id: .data.issueByInfo.parentIssue.id,
+                        number: .data.issueByInfo.parentIssue.number,
+                        title: .data.issueByInfo.parentIssue.title,
+                        state: .data.issueByInfo.parentIssue.state
+                     } end)
+        } end'
+}
+
+# Move sub-issues from wherever they currently live to a new parent.
+#
+# ZenHub has no reparent mutation — only addSubIssues / removeSubIssues — and a
+# child may have only one parent, so adding a child that already has one fails
+# with "Sub issue may only have one parent" and no indication of WHICH parent is
+# in the way. Worse, a closed parent still holds its children, so the blocker is
+# frequently an issue that no longer appears in any listing you would think to
+# check (#85). This does the detach-then-attach itself: the caller says where
+# the children should end up, not where they currently are.
+cmd_reparent() {
+    load_config
+
+    local new_parent=""
+    local dry_run=false
+    local -a child_nums=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run|-n) dry_run=true; shift ;;
+            -h|--help)
+                error "Usage: zh reparent <new_parent#> <child#> [<child#> ...] [--dry-run]
+
+Move sub-issues to a new parent, detaching them from their current one.
+
+Examples:
+  zh reparent 586 60 72 73        # move #60,#72,#73 under #586
+  zh reparent 586 60 --dry-run    # show the plan, change nothing"
+                ;;
+            *)
+                if [[ -z "$new_parent" ]]; then new_parent="${1#\#}"; else child_nums+=("${1#\#}"); fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$new_parent" ]] || [[ ${#child_nums[@]} -eq 0 ]]; then
+        error "Usage: zh reparent <new_parent#> <child#> [<child#> ...] [--dry-run]
+Example: zh reparent 586 60 72 73"
+    fi
+
+    if ! [[ "$new_parent" =~ ^[0-9]+$ ]]; then
+        error "Invalid parent issue number: ${new_parent}"
+    fi
+
+    # Dedup children (first-occurrence order), rejecting bad numbers and the
+    # self-parent case before any network call.
+    local -a uniq_children=()
+    local n seen
+    for n in "${child_nums[@]}"; do
+        if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${n}"
+        fi
+        if [[ "$n" == "$new_parent" ]]; then
+            error "Cannot make #${n} a sub-issue of itself"
+        fi
+        local dup=false
+        for seen in ${uniq_children[@]+"${uniq_children[@]}"}; do
+            [[ "$seen" == "$n" ]] && { dup=true; break; }
+        done
+        [[ "$dup" == "false" ]] && uniq_children+=("$n")
+    done
+
+    local owner_repo repo_id
+    owner_repo=$(get_repo_info)
+    repo_id=$(get_repo_id "$owner_repo")
+
+    # Destination must exist. A closed destination is legal but almost always a
+    # mistake, so say so rather than silently parenting live work to it.
+    local parent_info
+    parent_info=$(zh_issue_with_parent "$repo_id" "$new_parent")
+    if [[ "$parent_info" == "null" ]]; then
+        error "Destination parent #${new_parent} not found in ${owner_repo}"
+    fi
+    local parent_title parent_state
+    parent_title=$(echo "$parent_info" | jq -r '.title')
+    parent_state=$(echo "$parent_info" | jq -r '.state')
+    if [[ "$parent_state" == "CLOSED" ]]; then
+        warn "Destination parent #${new_parent} is CLOSED — children attached to a closed parent roll up to nothing."
+    fi
+
+    # Build the plan: for each child, where it is now and what we will do.
+    local detach_ids="[]" attach_ids="[]"
+    local plan_lines=() already=0
+    local c
+    for c in "${uniq_children[@]}"; do
+        local info
+        info=$(zh_issue_with_parent "$repo_id" "$c")
+        if [[ "$info" == "null" ]]; then
+            error "Issue #${c} not found in ${owner_repo}"
+        fi
+
+        local cid cur_num cur_state
+        cid=$(echo "$info" | jq -r '.id')
+        cur_num=$(echo "$info" | jq -r '.parent.number // empty')
+        cur_state=$(echo "$info" | jq -r '.parent.state // empty')
+
+        if [[ -n "$cur_num" ]] && [[ "$cur_num" == "$new_parent" ]]; then
+            plan_lines+=("  #${c}  already a sub-issue of #${new_parent} — skipping")
+            already=$((already + 1))
+            continue
+        fi
+
+        if [[ -n "$cur_num" ]]; then
+            local closed_note=""
+            [[ "$cur_state" == "CLOSED" ]] && closed_note=" (CLOSED)"
+            plan_lines+=("  #${c}  detach from #${cur_num}${closed_note} -> attach to #${new_parent}")
+            detach_ids=$(jq -n --argjson a "$detach_ids" --arg id "$cid" '$a + [$id]')
+        else
+            plan_lines+=("  #${c}  no current parent -> attach to #${new_parent}")
+        fi
+        attach_ids=$(jq -n --argjson a "$attach_ids" --arg id "$cid" '$a + [$id]')
+    done
+
+    echo ""
+    echo -e "${BOLD}Reparent to #${new_parent}: ${parent_title}${NC}"
+    local line
+    for line in ${plan_lines[@]+"${plan_lines[@]}"}; do
+        echo -e "$line"
+    done
+    echo ""
+
+    local attach_count
+    attach_count=$(echo "$attach_ids" | jq 'length')
+
+    if [[ "$dry_run" == "true" ]]; then
+        info "Dry run — no changes made. ${attach_count} would move, ${already} already in place."
+        return 0
+    fi
+
+    if [[ "$attach_count" -eq 0 ]]; then
+        success "Nothing to do — all ${already} issue(s) already under #${new_parent}"
+        return 0
+    fi
+
+    # 1) Detach. removeSubIssues takes only child IDs (it unlinks each from its
+    # actual parent), so we never need the old parent's ID — which is what makes
+    # this composable without the caller knowing where each child lives.
+    local detach_count
+    detach_count=$(echo "$detach_ids" | jq 'length')
+    if [[ "$detach_count" -gt 0 ]]; then
+        info "Detaching ${detach_count} issue(s) from their current parents..."
+        local rm_mutation='
+        mutation($input: RemoveSubIssuesInput!) {
+            removeSubIssues(input: $input) {
+                clientMutationId
+            }
+        }'
+        local rm_vars rm_response
+        rm_vars=$(jq -n --argjson child_ids "$detach_ids" '{input: {childIssueIds: $child_ids}}')
+        rm_response=$(zh_graphql "$rm_mutation" "$rm_vars") || rm_response=""
+        if [[ -z "$rm_response" ]]; then
+            error "Failed to detach sub-issues from their current parents. Nothing was attached to #${new_parent}; verify with 'zh subissue list ${new_parent}' before retrying."
+        fi
+    fi
+
+    # 2) Attach to the destination.
+    info "Attaching ${attach_count} issue(s) to #${new_parent}..."
+    local add_mutation='
+    mutation($input: AddSubIssuesInput!) {
+        addSubIssues(input: $input) {
+            successCount
+            githubErrors
+        }
+    }'
+    local add_vars add_response
+    add_vars=$(jq -n --arg parent_id "$(echo "$parent_info" | jq -r '.id')" --argjson child_ids "$attach_ids" \
+        '{input: {parentId: $parent_id, childIssueIds: $child_ids}}')
+    add_response=$(zh_graphql "$add_mutation" "$add_vars") || add_response=""
+
+    if [[ -z "$add_response" ]]; then
+        error "Detach succeeded but attach to #${new_parent} failed — the issue(s) now have NO parent. Re-run 'zh reparent ${new_parent} ${uniq_children[*]}' to finish, or 'zh subissue add ${new_parent} ${uniq_children[*]}'."
+    fi
+
+    local ok_count
+    ok_count=$(echo "$add_response" | jq -r '.data.addSubIssues.successCount // 0')
+
+    echo ""
+    if [[ "$ok_count" -lt "$attach_count" ]]; then
+        warn "Attached ${ok_count}/${attach_count} to #${new_parent}"
+        local gh_errors
+        gh_errors=$(echo "$add_response" | jq -c '.data.addSubIssues.githubErrors // []')
+        if [[ "$gh_errors" != "[]" ]] && [[ "$gh_errors" != "{}" ]] && [[ "$gh_errors" != "null" ]]; then
+            echo -e "  ${YELLOW}GitHub errors:${NC} ${gh_errors}"
+        fi
+        echo "  Verify with: zh subissue list ${new_parent}"
+        return 1
+    fi
+
+    success "Moved ${ok_count} issue(s) to #${new_parent}: ${parent_title}"
+    [[ "$already" -gt 0 ]] && echo "  (${already} already in place)"
+    echo "  Verify with: zh subissue list ${new_parent}"
+}
+
 cmd_subissue_add() {
     local parent_num="${1:-}"
     shift || true
@@ -6318,6 +6981,26 @@ Example: zh subissue add 42 100 101"
         gh_errors_len=$(echo "$gh_errors" | jq 'if type == "object" or type == "array" then length else 1 end')
         if [[ "$gh_errors_len" -gt 0 ]]; then
             warn "  githubErrors: ${gh_errors}"
+        fi
+        # "Sub issue may only have one parent" does not say WHICH parent is in
+        # the way, and the blocker is frequently a CLOSED issue that no longer
+        # appears in any listing the caller would think to check (#85). Resolve
+        # it, name it, and point at the command that fixes it in one step.
+        if printf '%s' "$gh_errors" | grep -qiE 'only have one parent|already has a parent'; then
+            local blocked_nums blocked_n blocker_info blocker_num blocker_state blocker_note
+            blocked_nums=$(echo "$response" | jq -r '(.data.addSubIssues.failedIssues // [])[] | .number')
+            for blocked_n in $blocked_nums; do
+                blocker_info=$(zh_issue_with_parent "$repo_id" "$blocked_n" 2>/dev/null) || blocker_info="null"
+                [[ "$blocker_info" == "null" ]] && continue
+                blocker_num=$(echo "$blocker_info" | jq -r '.parent.number // empty')
+                blocker_state=$(echo "$blocker_info" | jq -r '.parent.state // empty')
+                if [[ -n "$blocker_num" ]]; then
+                    blocker_note=""
+                    [[ "$blocker_state" == "CLOSED" ]] && blocker_note=" (CLOSED — invisible in most listings)"
+                    echo -e "  #${blocked_n} is currently a sub-issue of #${blocker_num}${blocker_note}"
+                fi
+            done
+            echo -e "  To move them anyway: zh reparent ${stripped_parent} ${failed_nums_pretty//#/}"
         fi
         # Round-10 Pattern C (round-9 #4): surface the fail-divergence
         # case (API reported failures but did not account for every
@@ -7532,6 +8215,9 @@ main() {
         board|b|overview)
             cmd_board "$@"
             ;;
+        count|n)
+            cmd_count "$@"
+            ;;
         pipeline|pipe|col)
             cmd_pipeline "$@"
             ;;
@@ -7621,6 +8307,12 @@ main() {
             ;;
         subissue|subissues|sub|child|children)
             cmd_subissue "$@"
+            ;;
+        reparent|move-parent)
+            cmd_reparent "$@"
+            ;;
+        doctor|check|health)
+            cmd_doctor "$@"
             ;;
         sprints|sp)
             cmd_sprints "$@"
