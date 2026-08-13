@@ -666,6 +666,51 @@ def test_full_probe_recomputes_from_venv_deps(monkeypatch):
     assert probe == "import mcp; import numpy"
 
 
+# --- version-pinned deps (the bug that took the MCP server down) -------------
+# _VENV_DEPS entries are REQUIREMENT SPECIFIERS, not module names. The probes
+# used a bare `name.replace('-', '_')`, so the moment a dep carried a version
+# constraint the probe emitted `import mcp>=1.0,<2` — a SyntaxError. The probe
+# then "failed", the freshly-built venv was judged broken and DELETED, and every
+# launch rebuilt (~1GB) and failed identically. Pinning `mcp<2` was required
+# (the 2.x SDK dropped `mcp.server.fastmcp`), so this path had to work.
+
+def test_dep_module_name_strips_version_specifiers():
+    assert mcp_server._dep_module_name("mcp>=1.0,<2") == "mcp"
+    assert mcp_server._dep_module_name("numpy==1.26.4") == "numpy"
+    assert mcp_server._dep_module_name("sentence-transformers") == "sentence_transformers"
+    assert mcp_server._dep_module_name("pkg[extra]>=2") == "pkg"
+    assert mcp_server._dep_module_name("torch ~= 2.0") == "torch"
+
+
+def test_probes_emit_valid_python_for_pinned_deps(monkeypatch):
+    """STRUCTURAL: every statement a probe emits must actually parse.
+
+    Asserting on the exact string would have passed the buggy version too if
+    someone wrote the expectation to match; parsing is what proves the probe can
+    run at all.
+    """
+    import ast
+
+    monkeypatch.setattr(
+        mcp_server, "_VENV_DEPS", ("mcp>=1.0,<2", "sentence-transformers", "numpy==1.26.4")
+    )
+    full = mcp_server._venv_full_probe()
+    for stmt in full.split("; "):
+        ast.parse(stmt)  # raises SyntaxError on the pre-fix output
+    ast.parse(mcp_server._venv_per_launch_probe())
+
+    assert full == "import mcp; import sentence_transformers; import numpy"
+    assert mcp_server._venv_per_launch_probe() == "import mcp"
+
+
+def test_probe_never_emits_a_version_specifier(monkeypatch):
+    """No specifier character may survive into an import statement."""
+    monkeypatch.setattr(mcp_server, "_VENV_DEPS", ("mcp>=1.0,<2", "numpy==1.26.4"))
+    probe = mcp_server._venv_full_probe()
+    for ch in "<>=!~[]":
+        assert ch not in probe, f"{ch!r} leaked into the probe: {probe!r}"
+
+
 # -----------------------------------------------------------------------------
 # v1.7.0 — _venv_build_lock (item 2)
 # Smoke test: lock is acquired + released, no exceptions, lock file exists.
