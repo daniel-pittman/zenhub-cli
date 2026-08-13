@@ -172,7 +172,11 @@ def _default_venv_dir() -> tuple[Path, bool]:
 # [0] would make every launch slow without tripping any error — exactly
 # the cost the per-launch/full probe split exists to avoid.
 _VENV_DEPS = (
-    "mcp",
+    # Pinned below 2.0: the 2.x MCP SDK restructured and dropped
+    # `mcp.server.fastmcp`, which this server imports, so an unpinned bootstrap
+    # resolves to a version that cannot start. Every existing working install
+    # is on 1.x only because it predates the 2.0 release.
+    "mcp>=1.0,<2",
     # similarity search: sentence-transformers brings in torch + transformers
     # + huggingface_hub. The model weights themselves are cached under
     # ~/.cache/huggingface/ so they survive even if the venv is rebuilt.
@@ -213,6 +217,27 @@ _VENV_BUILD_TIMEOUT = 60              # `python -m venv ...`
 _VENV_PIP_TIMEOUT = 600               # `pip install ...` (torch is ~400MB)
 
 
+# A requirement specifier's name is everything before the first version
+# constraint, extras bracket, marker, or whitespace.
+_DEP_NAME_RE = re.compile(r"^\s*([A-Za-z0-9._-]+)")
+
+
+def _dep_module_name(spec: str) -> str:
+    """Importable module name for a `_VENV_DEPS` entry.
+
+    Entries are PyPI REQUIREMENT SPECIFIERS, not module names, so the version
+    constraint has to come off before the name can be imported: a pin like
+    `mcp>=1.0,<2` must probe `import mcp`, never `import mcp>=1.0,<2` — which
+    is a SyntaxError, so the probe fails, the freshly-built venv is judged
+    broken and deleted, and every subsequent launch rebuilds and fails the same
+    way. Extras (`pkg[extra]`) are stripped for the same reason. The remaining
+    PyPI dash convention maps to the module underscore convention.
+    """
+    match = _DEP_NAME_RE.match(spec)
+    base = match.group(1) if match else spec
+    return base.replace("-", "_")
+
+
 def _venv_per_launch_probe() -> str:
     """Lightweight probe — imports just the first declared dep (`mcp`) —
     runs on every MCP launch.
@@ -226,7 +251,7 @@ def _venv_per_launch_probe() -> str:
     rename/reorder of the deps tuple can't leave this probing a module
     that no longer exists.
     """
-    return f"import {_VENV_DEPS[0].replace('-', '_')}"
+    return f"import {_dep_module_name(_VENV_DEPS[0])}"
 
 
 def _venv_full_probe() -> str:
@@ -234,13 +259,12 @@ def _venv_full_probe() -> str:
 
     Catches a partial install where one wheel landed cleanly and
     another failed mid-stream. Recomputes from `_VENV_DEPS` at call
-    time so monkeypatching tests see matching imports. Maps PyPI
-    names to module names by `s/-/_/`. If a future dep has a
-    non-trivial mapping (`Pillow` → `PIL`), the probe fails loudly
+    time so monkeypatching tests see matching imports. If a future dep has a
+    non-trivial name→module mapping (`Pillow` → `PIL`), the probe fails loudly
     at the call site — desired behavior.
     """
     return "; ".join(
-        f"import {name.replace('-', '_')}" for name in _VENV_DEPS
+        f"import {_dep_module_name(name)}" for name in _VENV_DEPS
     )
 
 
