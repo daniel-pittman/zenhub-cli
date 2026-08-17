@@ -38,6 +38,7 @@ from zh_api import (
     RepoContext,
     ZhApiError,
     check_graphql_errors,
+    get_gh_issue_state,
     repos_match,
     _ISSUE_BY_INFO_QUERY,
 )
@@ -366,7 +367,8 @@ def _classify_outcome(success_count: int, failed_count: int) -> str:
 
 
 def add_sub_issues(
-    ctx: RepoContext, parent_number: int, child_numbers: list[int]
+    ctx: RepoContext, parent_number: int, child_numbers: list[int],
+    allow_closed_parent: bool = False,
 ) -> dict:
     """Add child issues as sub-issues of `parent_number`.
 
@@ -375,10 +377,31 @@ def add_sub_issues(
     `failedIssues`. We rely on that rather than doing a symmetric
     pre-flight check (see module docstring).
 
+    A CLOSED parent IS pre-flighted, because the API accepts that attach
+    happily and the result is invisible: closing a parent does not detach
+    its children, so the child drops out of every container-level rollup
+    while still looking healthy on its own, and no listing surfaces the
+    condition afterwards (#92). Pass `allow_closed_parent=True` to attach
+    anyway; the response then carries `closed_parent_warning`.
+
+    Args:
+        ctx: repository context.
+        parent_number: issue number of the parent.
+        child_numbers: issue numbers to link.
+        allow_closed_parent: attach even when the parent is CLOSED.
+
     Returns:
         dict with:
             ok: bool — true iff outcome == "ok"
             parent_number: int
+            parent_state: str|None — "OPEN"/"CLOSED" when the parent was
+                resolved, None when it was not (parent-not-found).
+            blocked_closed_parent: bool — true only on the closed-parent
+                refusal. Distinguishes "we declined to attach" from every
+                other `ok=False`; retry with allow_closed_parent=True (or
+                pick an open parent) rather than retrying verbatim.
+            closed_parent_warning: str|None — set when the attach went
+                ahead against a closed parent via the override.
             outcome: "ok"|"partial"|"fail"|"noop"
             success_count: int
             failed_count: int
@@ -414,6 +437,9 @@ def add_sub_issues(
         return {
             "ok": False,
             "parent_number": parent_number,
+            "parent_state": None,
+            "blocked_closed_parent": False,
+            "closed_parent_warning": None,
             "outcome": "fail",
             "success_count": 0,
             "failed_count": 0,
@@ -426,6 +452,63 @@ def add_sub_issues(
             "error": f"Parent #{parent_number} not found in this repository",
         }
     parent_id = parent_issue["id"]
+
+    # Closed-parent guard (#92). Runs before any child is resolved, so a
+    # refusal costs one lookup and mutates nothing.
+    #
+    # CLOSED from EITHER source wins. GitHub is authoritative but reachable
+    # only when gh is authenticated; ZenHub's copy is always present but can
+    # be stale (see get_gh_issue_state). Taking the union resolves a
+    # disagreement toward refusing, the recoverable direction: a wrong refusal
+    # costs one flag, a wrong allow costs a silent orphan.
+    #
+    # Fail-soft when NEITHER source says CLOSED (including when both lookups
+    # failed), so an outage cannot block every attach in the workspace.
+    # MERGED counts as closed: issues and PRs share one number namespace, so a
+    # PR number passed as a parent reports MERGED rather than CLOSED, and a
+    # merged PR is not a container live work can roll up into.
+    zenhub_state = parent_issue.get("state")
+    gh_state = get_gh_issue_state(ctx.owner_repo, parent_number)
+    parent_state = (
+        "CLOSED"
+        if zenhub_state == "CLOSED" or gh_state in ("CLOSED", "MERGED")
+        else (gh_state or zenhub_state)
+    )
+
+    closed_parent_warning: str | None = None
+    if parent_state == "CLOSED":
+        if not allow_closed_parent:
+            return {
+                "ok": False,
+                "parent_number": parent_number,
+                "parent_state": parent_state,
+                "blocked_closed_parent": True,
+                "closed_parent_warning": None,
+                "outcome": "fail",
+                "success_count": 0,
+                "failed_count": 0,
+                "succeeded": [],
+                "failed": [],
+                # Nothing was attempted, so every input is unaccounted:
+                # the same conservation invariant the parent-not-found
+                # branch above maintains (round-10 Pattern A).
+                "unaccounted": list(child_numbers),
+                "failed_unknown_count": 0,
+                "github_errors": None,
+                "partial_success_warning": None,
+                "error": (
+                    f"Refused: parent #{parent_number} is CLOSED. Children of a "
+                    "closed parent roll up to nothing: they drop out of every "
+                    "container-level count while each still looks healthy on "
+                    "its own. Choose an open parent, reopen the parent, or "
+                    "retry with allow_closed_parent=True if this is deliberate."
+                ),
+            }
+        closed_parent_warning = (
+            f"Parent #{parent_number} is CLOSED; the attached children roll up "
+            "to nothing until it is reopened or they are reparented "
+            "(allow_closed_parent=True was given)."
+        )
 
     # Resolve each child's ID. The bash version did this in a single mid-
     # loop accumulator; we replicate the same pattern — collect every
@@ -446,6 +529,9 @@ def add_sub_issues(
         return {
             "ok": False,
             "parent_number": parent_number,
+            "parent_state": parent_state,
+            "blocked_closed_parent": False,
+            "closed_parent_warning": closed_parent_warning,
             "outcome": "fail",
             "success_count": 0,
             "failed_count": len(not_found),
@@ -594,6 +680,9 @@ def add_sub_issues(
     return {
         "ok": outcome == "ok",
         "parent_number": parent_number,
+        "parent_state": parent_state,
+        "blocked_closed_parent": False,
+        "closed_parent_warning": closed_parent_warning,
         "outcome": outcome,
         "success_count": success_count,
         "failed_count": failed_count,

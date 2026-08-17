@@ -29,6 +29,9 @@ zh board                # Board overview
 zh count                # EXACT issue counts per pipeline (never a truncated page)
 zh count "Backlog" -q   # Bare exact number for one pipeline (scripting)
 zh doctor               # Hierarchy health: open issues under a CLOSED parent, parent cycles
+                        # 0 healthy or unverified / 1 findings / 2 inconclusive (states stale vs GitHub)
+                        # --json: read `conclusive` before `ok`; trust mirror_check.covered, not .attempted
+zh doctor --no-verify   # Skip the GitHub cross-check (faster, proves less)
 zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 
 # Manage issues
@@ -125,6 +128,7 @@ zh workspaces           # List workspaces (● marks active target)
 5. **Multi-repo workspaces**: Output shows repo name for each issue (issues may come from different repos)
 6. **Repo / workspace overrides**: `-r owner/repo` and `-w "Name"` work in front of any subcommand. Persist via `ZH_REPO` / `ZH_WORKSPACE` in `~/.config/zh/config`.
 7. **GitHub-backed scope**: Issue numbers resolve through GitHub, so issue-level commands target the GitHub issue behind a card. **ZenHub-only cards** (no GitHub issue; shown as `NoOwner/<repo>` with `…/issues/zh/<n>` URLs — e.g. a workspace's seed card) are not reliably addressable — `1` resolves to GitHub #1, not `zh/1`. Direct the user to the ZenHub web UI for those.
+8. **Closed parents are refused on attach**: `zh subissue add`, `zh <noun> add`, `zh create --parent`, and `zh reparent` refuse a CLOSED parent and mutate nothing; `--allow-closed-parent` overrides and warns. Closing a parent does not detach its children, so anything attached to a closed one drops out of every rollup while still looking healthy on its own. On the MCP surface the refusal is `blocked_closed_parent=True`: branch on it rather than retrying `ok=False` verbatim, because a verbatim retry refuses again. The check reads GitHub as the authority, not only ZenHub's mirror: a lapsed ZenHub↔GitHub authorization reports closed issues as OPEN, so CLOSED from either source refuses and a disagreement is named. `zh issue` and `zh subissue list` mark a closed parent on read; `zh doctor` stays the after-the-fact sweep for orphans created elsewhere.
 
 ## For AI Assistants
 

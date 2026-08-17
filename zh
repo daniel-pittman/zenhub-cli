@@ -833,6 +833,8 @@ COMMANDS:
     reparent <parent#> <child#> [...]
                            Move sub-issues to a new parent, detaching them from
                            their current one. --dry-run shows the plan only
+                           A CLOSED destination is refused; override with
+                           --allow-closed-parent
                            Example: zh reparent 586 60 72 73 --dry-run
 
     pipeline <name> [--all] List issues in a specific pipeline
@@ -953,6 +955,8 @@ COMMANDS:
                              reorder <child#> <position>       Reorder sub-issue among siblings
                                                                 Position: top | bottom |
                                                                           after <sib#> | before <sib#>
+                           A CLOSED parent is refused on add; override with
+                           --allow-closed-parent
                            Example: zh subissue add 42 100 101
                            Example: zh subissue list 42
                            Example: zh subissue reorder 100 after 101
@@ -1338,6 +1342,7 @@ Example: zh issue 42"
             parentIssue {
                 number
                 title
+                state
             }
             githubChildIssues(first: 1) {
                 totalCount
@@ -1361,7 +1366,7 @@ Example: zh issue 42"
         error "Issue #${issue_num} not found"
     fi
 
-    local title state pipeline priority estimate assignees labels gh_url zh_url blocking_issues blocked_issues parent_num parent_title child_count type_name type_level
+    local title state pipeline priority estimate assignees labels gh_url zh_url blocking_issues blocked_issues parent_num parent_title parent_state child_count type_name type_level
     title=$(echo "$issue" | jq -r '.title')
     state=$(echo "$issue" | jq -r '.state')
     # v1.9.1 round-3 finding #5: read pipeline and priority via the
@@ -1390,6 +1395,7 @@ Example: zh issue 42"
     blocked_issues=$(echo "$issue" | jq -r '[.blockedIssues.nodes[] | "#\(.number)"] | join(", ")')
     parent_num=$(echo "$issue" | jq -r '.parentIssue.number // empty')
     parent_title=$(echo "$issue" | jq -r '.parentIssue.title // ""')
+    parent_state=$(echo "$issue" | jq -r '.parentIssue.state // empty')
     child_count=$(echo "$issue" | jq -r '.githubChildIssues.totalCount // 0')
 
     echo ""
@@ -1411,7 +1417,17 @@ Example: zh issue 42"
         echo -e "  ${YELLOW}Blocking:${NC}  ${blocked_issues}"
     fi
     if [[ -n "$parent_num" ]]; then
-        echo -e "  ${CYAN}Parent:${NC}    #${parent_num} ${parent_title}"
+        # A closed parent is the one piece of an issue's context that is
+        # invisible everywhere else: this issue looks healthy, and the parent
+        # is absent from every listing that would show the relationship (#92).
+        # Marking it here is what makes the condition legible to whoever, or
+        # whatever, reads this output next.
+        if [[ "$parent_state" == "CLOSED" ]]; then
+            echo -e "  ${CYAN}Parent:${NC}    #${parent_num} ${YELLOW}(CLOSED)${NC} ${parent_title}"
+            echo -e "             ${YELLOW}This issue rolls up to a closed parent. Fix: zh reparent <new_parent#> ${issue_num}${NC}"
+        else
+            echo -e "  ${CYAN}Parent:${NC}    #${parent_num} ${parent_title}"
+        fi
     fi
     if [[ "$child_count" -gt 0 ]]; then
         # Noun-neutral pointer plus a noun-specific one when we can: the
@@ -2928,6 +2944,7 @@ cmd_create() {
     local priority_name=""
     local json_out="false"
     local quiet_out="false"
+    local allow_closed_parent="false"
 
     # Parse arguments.
     # v1.9.1 round-3 finding #4: every long flag uses an exact-match
@@ -2963,7 +2980,7 @@ cmd_create() {
                 --type|--parent|--priority|--label|--labels|--assign|--assignee|--pipeline|--estimate|--body|--file|--body-file|--description)
                     _is_known_flag="true"
                     ;;
-                --json|--quiet|--stdin)
+                --json|--quiet|--stdin|--allow-closed-parent)
                     # v1.9.2 round-7 finding #2: these flags are boolean
                     # (their case arms use single shift, no value
                     # consumed). The pre-fix code listed them as known
@@ -2994,6 +3011,10 @@ cmd_create() {
             --parent)
                 parent="$2"
                 shift 2
+                ;;
+            --allow-closed-parent)
+                allow_closed_parent="true"
+                shift
                 ;;
             --priority)
                 # v1.9.1 item #8 (G5): set priority at create time. Resolved
@@ -3080,6 +3101,8 @@ Options:
   -p, --pipeline <name>   Pipeline to place issue in
   -e, --estimate <pts>    Story points estimate
   --parent <issue#>       Wire the new issue as a sub-issue of <issue#>
+                          Refused when <issue#> is CLOSED (nothing is created)
+  --allow-closed-parent   Attach to a CLOSED --parent anyway
   --priority <name>       Set a configured priority by name (case-insensitive)
   -b, --body <text>       Issue body/description (short)
   -f, --file <path>       Read body from file (for longer descriptions)
@@ -3199,6 +3222,18 @@ Examples:
         if [[ -z "$parent_id" ]]; then
             error "Could not resolve parent issue #${parent_stripped}"
         fi
+
+        # State check belongs in the SAME pre-flight block as the existence
+        # check, for the same reason: a refusal here leaves nothing created,
+        # whereas the post-create wire below would already have produced the
+        # issue before discovering the parent was closed (#92).
+        local parent_pre_info parent_pre_state=""
+        parent_pre_info=$(zh_issue_with_parent "$repo_id" "$parent_stripped")
+        if [[ "$parent_pre_info" != "null" ]]; then
+            parent_pre_state=$(echo "$parent_pre_info" | jq -r '.state // empty')
+        fi
+        zh_closed_parent_guard "$owner_repo" "$parent_stripped" "$parent_pre_state" \
+            "$allow_closed_parent" "zh create ... --parent ${parent_stripped}"
     fi
 
     # Validate --estimate up-front so a non-numeric value never aborts jq
@@ -4390,7 +4425,7 @@ cmd_hierarchy_create() {
                 -d|--description|--label|--labels|--pipeline|--assign|--assignee|--estimate|--body|--file|--body-file|--parent|--priority|--type)
                     _h_is_known="true"
                     ;;
-                --json|--quiet|--stdin)
+                --json|--quiet|--stdin|--allow-closed-parent)
                     _h_is_known="true"
                     _h_is_boolean="true"
                     ;;
@@ -4444,7 +4479,7 @@ cmd_hierarchy_create() {
                 passthrough+=("$1" "$2")
                 shift 2
                 ;;
-            -q|--json|--quiet|--stdin)
+            -q|--json|--quiet|--stdin|--allow-closed-parent)
                 # v1.9.2 round-3 (PR #27) finding #3: similarly,
                 # explicit boolean-flag arm so the next token never
                 # gets mis-classified as the boolean's "value" and
@@ -4999,6 +5034,8 @@ SUBCOMMANDS:
     list                           List issues of type ${type_name}
     show <issue#>                  Show an issue + its sub-issues
     add <parent#> <child#> [...]   Attach sub-issues (addSubIssues)
+                                     --allow-closed-parent  attach to a
+                                     CLOSED parent (refused by default)
     remove <parent#> <child#> [...] Detach sub-issues
     update <issue#> [opts]         Edit title/body
                                      -t, --title <text>
@@ -6379,7 +6416,13 @@ zh_resolve_issue_id() {
 }
 
 # Walk EVERY issue in the workspace with its parent link, for `zh doctor`.
-# Echoes JSON: { totalCount: N, nodes: [{number,title,state,parent}], complete: bool }
+# Echoes JSON:
+#   { totalCount: N, nodes: [{number,title,state,repo,parent}], complete: bool }
+#
+# `repo` ("owner/name", or "" when the API omits it) exists for the mirror
+# cross-check (#94): a workspace can span several GitHub repos, where two issues
+# legitimately share a number, so a number alone cannot be matched against one
+# repo's issue states without producing false disagreements.
 zh_doctor_fetch_issues() {
     local workspace_id="$1"
 
@@ -6393,6 +6436,7 @@ zh_doctor_fetch_issues() {
                     number
                     title
                     state
+                    repository { ownerName name }
                     parentIssue { number title state }
                 }
             }
@@ -6425,6 +6469,8 @@ zh_doctor_fetch_issues() {
         local page_nodes
         page_nodes=$(echo "$conn" | jq -c '[(.nodes // [])[] | select(. != null) | {
             number, title, state,
+            repo: (if (.repository // null) == null then ""
+                   else "\(.repository.ownerName)/\(.repository.name)" end),
             parent: (if (.parentIssue // null) == null then null
                      else {number: .parentIssue.number, title: .parentIssue.title, state: .parentIssue.state} end)
         }]')
@@ -6456,22 +6502,39 @@ zh_doctor_fetch_issues() {
 # absent from the listings you would naturally consult (#85). This is the check
 # that would have caught it immediately.
 #
-# Exits 1 when problems are found so scripts and CI can gate on it.
+# Every conclusion here is drawn from ZenHub's MIRROR of GitHub's issue states,
+# which can lapse and keep serving stale values (#94). A stale mirror makes this
+# check report HEALTH rather than noise, which is the dangerous polarity: a check
+# that breaks loudly gets fixed, one that quietly starts reporting health is
+# trusted until somebody counts by hand. So the check cross-checks its own inputs
+# against GitHub and, on disagreement, refuses to claim health instead of
+# reporting a clean bill it has no basis for.
+#
+# Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale, so the
+# answer cannot be trusted either way). A CI gate that treats any non-zero as
+# failure therefore gates on inconclusive too, which is the intent.
 cmd_doctor() {
     load_config
 
     local as_json=false
+    local skip_verify=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --json) as_json=true; shift ;;
+            --no-verify) skip_verify=true; shift ;;
             -h|--help)
-                error "Usage: zh doctor [--json]
+                error "Usage: zh doctor [--json] [--no-verify]
 
 Check the planning hierarchy for structural problems:
   - open issues whose parent is CLOSED (they roll up to nothing)
   - parent cycles
 
-Exits 1 if problems are found."
+Cross-checks ZenHub's issue states against GitHub, because a lapsed
+ZenHub<->GitHub sync reports closed issues as open and would make this
+check report a health it cannot verify. --no-verify skips that step
+(faster, but a clean result then proves nothing).
+
+Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
                 ;;
             *) shift ;;
         esac
@@ -6517,13 +6580,120 @@ Exits 1 if problems are found."
     orphan_count=$(echo "$orphans" | jq 'length')
     cycle_count=$(echo "$cycles" | jq 'length')
 
+    # ---- Mirror cross-check (#94) -------------------------------------------
+    #
+    # Verify the states the conclusions above were drawn from. Only issues in
+    # the CURRENT repo are checkable: `zh` resolves numbers through one repo, so
+    # in a multi-repo workspace the other repos' issues are left unverified
+    # rather than matched by bare number (two repos legitimately share numbers).
+    #
+    # Only ZenHub-says-not-CLOSED is worth checking. That is the direction the
+    # staleness runs (a lapsed mirror has not caught up with closures) and the
+    # direction that hides orphans: an issue ZenHub calls open, whose parent
+    # ZenHub also calls open, is invisible to the orphan check even when the
+    # parent is closed on GitHub.
+    local verify_attempted=false verify_covered=false
+    local verified_count=0 candidate_count=0 verify_truncated=false
+    local disagreements="[]" mirror_stale=false
+    if [[ "$skip_verify" != "true" ]]; then
+        # `.repo == ""` (the API omitted `repository`) is matched against the
+        # current repo. If such an issue really lived in another repo sharing
+        # the number, that invents a spurious disagreement, which gates rather
+        # than hides (the safe direction), and the projection above populates
+        # `repository` so it should not arise in practice.
+        local candidates
+        candidates=$(echo "$data" | jq -c --arg repo "$owner_repo" \
+            '[.nodes[] | select(.state != "CLOSED") | select(.repo == "" or .repo == $repo) | .number]')
+        candidate_count=$(echo "$candidates" | jq 'length')
+        if [[ "$candidate_count" -gt 0 ]]; then
+            verify_attempted=true
+            local batch gh_states batch_ok
+            batch=$(zh_github_issue_states_batch "$owner_repo" "$candidates")
+            batch_ok=$(echo "$batch" | jq -r '.ok // false')
+            verify_truncated=$(echo "$batch" | jq -r '.truncated // false')
+            verified_count=$(echo "$batch" | jq -r '.queried // 0')
+            gh_states=$(echo "$batch" | jq -c '.states // []')
+            # Coverage, not merely "no disagreement found". Every number asked
+            # about must have been answered for: a failed batch, a truncated
+            # walk, or a short answer all mean the checks above are unverified,
+            # and reporting them as agreement would be the same reassuring
+            # failure this whole check exists to remove, one level down.
+            if [[ "$batch_ok" == "true" ]] && [[ "$verify_truncated" != "true" ]] \
+                && [[ "$verified_count" -ge "$candidate_count" ]]; then
+                verify_covered=true
+            fi
+            # A disagreement is: ZenHub did not say CLOSED, GitHub did.
+            disagreements=$(jq -n --argjson zh "$data" --argjson gh "$gh_states" --arg repo "$owner_repo" '
+                ($gh | map(select(.state == "CLOSED") | .number)) as $closed
+                | [$zh.nodes[]
+                   | select(.state != "CLOSED")
+                   | select(.repo == "" or .repo == $repo)
+                   | select([.number] | inside($closed))
+                   | {number, title, zenhub_state: .state, github_state: "CLOSED"}]')
+            [[ "$(echo "$disagreements" | jq 'length')" -gt 0 ]] && mirror_stale=true
+        fi
+    fi
+    local disagreement_count
+    disagreement_count=$(echo "$disagreements" | jq 'length')
+
+    # Precedence, matching the convention the sub-issue verbs use: a real
+    # finding outranks an inconclusive result. Orphans found against a stale
+    # mirror are still real (ZenHub-says-CLOSED is the trustworthy direction);
+    # the list is simply not known to be complete.
+    local conclusive=false
+    if [[ "$verify_covered" == "true" ]] && [[ "$disagreement_count" -eq 0 ]]; then
+        conclusive=true
+    fi
+
+    # Four states, because three cannot carry the difference between "the
+    # mirror is stale" and "the mirror was never read". Only DETECTED staleness
+    # gates (exit 2); being unable to verify is honest-but-not-a-failure
+    # (exit 0), or `--no-verify` and every un-authenticated CI run would newly
+    # break a gate that was fine.
+    local outcome="ok"
+    if [[ "$orphan_count" -gt 0 ]] || [[ "$cycle_count" -gt 0 ]]; then
+        outcome="problems"
+    elif [[ "$mirror_stale" == "true" ]]; then
+        outcome="inconclusive"
+    elif [[ "$conclusive" != "true" ]]; then
+        outcome="unverified"
+    fi
+
     if [[ "$as_json" == "true" ]]; then
+        # `ok` keeps its exact pre-#94 meaning: no orphans and no cycles were
+        # found. It is deliberately NOT redefined to fold in trustworthiness,
+        # because machine consumers branch on it. Read `conclusive` alongside
+        # it: `ok: true, conclusive: false` is "found nothing, and could not
+        # have found it either" — not a clean bill of health.
         jq -n --argjson checked "$checked" --argjson open "$open_count" \
             --argjson orphans "$orphans" --argjson cycles "$cycles" --argjson complete "$complete" \
+            --argjson disagreements "$disagreements" \
+            --argjson verified "$verified_count" \
+            --argjson candidates "$candidate_count" \
+            --argjson attempted "$verify_attempted" \
+            --argjson covered "$verify_covered" \
+            --argjson truncated "$verify_truncated" \
+            --argjson conclusive "$conclusive" \
+            --arg outcome "$outcome" \
             '{checked: $checked, open: $open, complete: $complete,
               closed_parent_orphans: $orphans, parent_cycles: $cycles,
-              ok: (($orphans|length) == 0 and ($cycles|length) == 0)}'
-        [[ "$orphan_count" -eq 0 && "$cycle_count" -eq 0 ]] && return 0 || return 1
+              ok: (($orphans|length) == 0 and ($cycles|length) == 0),
+              outcome: $outcome,
+              conclusive: $conclusive,
+              mirror_check: {
+                attempted: $attempted,
+                covered: $covered,
+                truncated: $truncated,
+                candidates: $candidates,
+                verified: $verified,
+                stale: (($disagreements|length) > 0),
+                disagreements: $disagreements
+              }}'
+        case "$outcome" in
+            problems) return 1 ;;
+            inconclusive) return 2 ;;
+            *) return 0 ;;
+        esac
     fi
 
     echo ""
@@ -6546,12 +6716,57 @@ Exits 1 if problems are found."
     else
         echo -e "  ${GREEN}✓${NC} No parent cycles"
     fi
+
+    # Report what the conclusions above are actually worth.
+    if [[ "$mirror_stale" == "true" ]]; then
+        echo ""
+        echo -e "  ${RED}✗${NC} ZenHub's issue states are STALE. ${disagreement_count} issue(s) are closed on GitHub but reported open here:"
+        echo "$disagreements" | jq -r '.[] | "      #\(.number) \(.title)"' | head -10
+        [[ "$disagreement_count" -gt 10 ]] && echo "      ... and $((disagreement_count - 10)) more"
+        echo ""
+        echo -e "      The ZenHub<->GitHub sync for this workspace has lapsed, so the"
+        echo -e "      checks above were computed from wrong data. Re-authorize GitHub at"
+        echo -e "      ${BOLD}https://app.zenhub.com${NC} (Settings -> Integrations), then re-run."
+    elif [[ "$verify_covered" == "true" ]]; then
+        echo -e "  ${GREEN}✓${NC} ZenHub's issue states agree with GitHub (${verified_count} verified)"
+    elif [[ "$skip_verify" == "true" ]]; then
+        echo -e "  ${CYAN}-${NC} ZenHub's issue states not cross-checked against GitHub (--no-verify)"
+    elif [[ "$verify_truncated" == "true" ]]; then
+        echo -e "  ${YELLOW}!${NC} ZenHub's issue states only PARTLY cross-checked (${verified_count} of ${candidate_count}); the rest are unverified"
+    elif [[ "$verify_attempted" == "true" ]]; then
+        echo -e "  ${YELLOW}!${NC} ZenHub's issue states not cross-checked against GitHub (the GitHub lookup failed: check 'gh auth status' and rate limits)"
+    else
+        echo -e "  ${CYAN}-${NC} ZenHub's issue states not cross-checked against GitHub (nothing to check)"
+    fi
     echo ""
 
-    if [[ "$orphan_count" -gt 0 ]] || [[ "$cycle_count" -gt 0 ]]; then
+    if [[ "$outcome" == "problems" ]]; then
+        # Say so explicitly: the findings are real, but a stale mirror means the
+        # LIST may be short. Reporting N problems from data known to be wrong,
+        # without saying the count is a floor, is the same overclaim in miniature.
+        [[ "$mirror_stale" == "true" ]] && \
+            warn "Findings above are a FLOOR, not a total: the mirror is stale, so more may be hidden."
         return 1
     fi
-    success "Hierarchy is healthy"
+    if [[ "$outcome" == "inconclusive" ]]; then
+        # Deliberately not `success`, and deliberately not `error` either:
+        # `error` exits 1, which would be indistinguishable from "problems
+        # found". Inconclusive is its own exit code so a caller can tell
+        # "the hierarchy is broken" from "I cannot tell you".
+        printf "${RED}INCONCLUSIVE:${NC} %s\n" \
+            "no problems found, but the data they were read from is stale, so this is not a clean bill of health. Fix the sync and re-run." >&2
+        return 2
+    fi
+    if [[ "$outcome" == "unverified" ]]; then
+        # Nothing found, and the states were not confirmed against GitHub. Exit
+        # 0, because inability to verify must not break a gate that was fine.
+        # But do not call it healthy either: the honest claim is the narrower
+        # one, and saying "healthy" one line after "not cross-checked" would
+        # contradict itself.
+        success "No problems found (issue states not verified against GitHub)"
+        return 0
+    fi
+    success "Hierarchy is healthy (issue states verified against GitHub)"
 }
 
 # Look up one issue plus its CURRENT parent, for reparenting and diagnostics.
@@ -6559,7 +6774,9 @@ Exits 1 if problems are found."
 # Echoes JSON {id, number, title, state, parent: {id,number,title,state}|null},
 # or "null" when the issue does not exist in this repo. The parent's state is
 # included on purpose: a closed parent is invisible in most listings, so "which
-# parent is blocking this?" is otherwise a manual hunt (#85).
+# parent is blocking this?" is otherwise a manual hunt (#85). Every verb that
+# SETS a parent (cmd_create --parent, cmd_subissue_add, cmd_reparent) also
+# reads its `state` through here to feed zh_closed_parent_guard (#92).
 zh_issue_with_parent() {
     local repo_id="$1"
     local issue_num="$2"
@@ -6604,6 +6821,202 @@ zh_issue_with_parent() {
         } end'
 }
 
+# Read an issue's open/closed state from GitHub. Echoes OPEN, CLOSED, or "".
+#
+# GitHub is the authority for whether an issue is closed; ZenHub mirrors it.
+# The mirror can lapse (the same expired ZenHub↔GitHub authorization
+# zh_repo_access_hint documents), and a lapsed mirror reports `state: OPEN` for
+# an issue that is closed on GitHub. A closed-parent guard trusting only the
+# ZenHub field would therefore fail OPEN precisely when the workspace is in a
+# degraded state, and silently. Verified live 2026-08-17 against a workspace
+# whose mirror had lapsed: four GitHub-closed issues all reported OPEN with a
+# null closedAt.
+#
+# Fail-soft by design: gh being absent, unauthenticated, or rate-limited yields
+# "" so the caller falls back to the ZenHub state rather than blocking work.
+zh_github_issue_state() {
+    local owner_repo="$1"
+    local issue_num="$2"
+
+    local state=""
+    state=$(gh issue view "$issue_num" --repo "$owner_repo" --json state \
+        --jq '.state' 2>/dev/null) || state=""
+    printf '%s' "$state"
+}
+
+# Read GitHub's state for MANY issue numbers at once, for the doctor mirror
+# cross-check (#94).
+#
+# Echoes JSON: { ok, truncated, queried, states: [{number, state}] }
+#
+# A bare array would not be enough. "No disagreement found" and "nothing was
+# checked" produce the SAME empty array, and a caller that cannot tell them
+# apart reports agreement it never verified. That is the very failure this
+# check exists to remove, so the coverage has to be reported alongside the
+# answer:
+#   ok=false        no usable answer at all (auth, transport, rate limit)
+#   truncated=true  the chunk cap stopped the walk short of every number
+#   queried         how many numbers were actually asked about and answered for
+# `queried` counts numbers ASKED, not rows returned: a PR or deleted issue
+# resolves to null and yields no row, yet it WAS checked.
+#
+# One aliased GraphQL query per chunk of up to 100 numbers, rather than one REST
+# call per issue. That distinction is the whole reason this check is affordable:
+# a per-issue cross-check over a real workspace is hundreds or thousands of
+# round-trips, which would discourage the routine use `doctor` exists for, while
+# 100-at-a-time makes a 2000-issue workspace 20 calls.
+#
+# It answers for EXACTLY the numbers asked about rather than sampling. A sampled
+# cross-check would reintroduce a smaller version of the bug being fixed: a
+# sample that misses is still a check that quietly returns the wrong answer.
+#
+# `repository.issue(number:)` returns null for a number that is a PR or does not
+# exist; those are dropped rather than guessed at.
+#
+# Fail-soft: gh absent, unauthenticated, or rate-limited yields [] so the caller
+# reports "not verified" instead of inventing a disagreement.
+zh_github_issue_states_batch() {
+    local owner_repo="$1"
+    local numbers_json="$2"
+
+    local owner="${owner_repo%%/*}"
+    local name="${owner_repo##*/}"
+
+    local total
+    total=$(echo "$numbers_json" | jq 'length')
+    if [[ "$total" -eq 0 ]]; then
+        printf '{"ok":true,"truncated":false,"queried":0,"states":[]}'
+        return 0
+    fi
+
+    local out="[]" offset=0 chunks=0 queried=0 truncated=false
+    while [[ "$offset" -lt "$total" ]]; do
+        chunks=$((chunks + 1))
+        # Cap the walk so a pathologically large workspace degrades to a
+        # partial verification instead of a long stall. 20 chunks = 2000
+        # issues. `truncated` is reported so the caller can refuse to call a
+        # partial verification conclusive.
+        if [[ "$chunks" -gt 20 ]]; then truncated=true; break; fi
+
+        local chunk fields query response
+        chunk=$(echo "$numbers_json" | jq -c --argjson o "$offset" '.[$o:($o+100)]')
+        # Aliased fields: i86: issue(number: 86) { number state }
+        fields=$(echo "$chunk" | jq -r '.[] | "i\(.): issue(number: \(.)) { number state }"' | tr '\n' ' ')
+        query="query { repository(owner: \"${owner}\", name: \"${name}\") { ${fields} } }"
+
+        # A partial-success response is the NORMAL case, not an error: any PR
+        # number or deleted issue in the set resolves to a NOT_FOUND for its
+        # alias, so GitHub returns a populated `data` block AND an `errors`
+        # array, and `gh api graphql` exits 1. Bailing on the exit code would
+        # therefore abandon the whole chunk whenever a single workspace card
+        # happened to be a PR. Keep stdout, ignore the status, and decide based
+        # on whether a `.data.repository` object actually came back.
+        response=$(gh api graphql -f query="$query" 2>/dev/null) || true
+        local repo_obj=""
+        if [[ -n "$response" ]]; then
+            repo_obj=$(echo "$response" | jq -c '.data.repository // empty' 2>/dev/null) || repo_obj=""
+        fi
+        # No usable data at all (auth failure, transport error, rate limit) is
+        # the one case that must NOT look like "verified, no disagreements".
+        if [[ -z "$repo_obj" ]] || [[ "$repo_obj" == "null" ]]; then
+            printf '{"ok":false,"truncated":false,"queried":0,"states":[]}'
+            return 0
+        fi
+
+        local page
+        page=$(echo "$repo_obj" | jq -c '
+            [(to_entries[])
+             | select(.value != null)
+             | select((.value.number | type) == "number")
+             | {number: .value.number, state: .value.state}]' 2>/dev/null) || page="[]"
+        out=$(jq -cn --argjson a "$out" --argjson b "$page" '$a + $b')
+
+        queried=$((queried + $(echo "$chunk" | jq 'length')))
+        offset=$((offset + 100))
+    done
+
+    jq -cn --argjson states "$out" --argjson queried "$queried" \
+        --argjson truncated "$truncated" \
+        '{ok: true, truncated: $truncated, queried: $queried, states: $states}'
+}
+
+# Refuse to attach work to a CLOSED parent unless the caller opts in.
+#
+# Closing a parent does not detach its children, so anything wired to a closed
+# container drops out of every container-level rollup while each issue still
+# looks perfectly healthy on its own (#92). Nothing surfaces the condition
+# afterwards, because every listing that would reveal it is one the closed
+# parent is absent from.
+#
+# This REFUSES rather than warns, which is the deliberate part. A warning is
+# exactly what the failure mode consists of nobody reading: the attach still
+# succeeds, the orphan still exists, and it is found weeks later by `zh doctor`
+# or by hand. Refusal costs one retry with --allow-closed-parent when the
+# attach really is intended, and prevents the orphan when it is not.
+#
+# CLOSED from EITHER source wins. GitHub is authoritative but reachable only
+# when gh is authenticated; ZenHub's copy is always present but can be stale.
+# Taking the union means a disagreement resolves toward refusing, which is the
+# recoverable direction: a wrong refusal costs one flag, a wrong allow costs a
+# silent orphan.
+#
+# Fail-soft on an unknown state: when NEITHER source says CLOSED (including
+# when both lookups failed) the attach proceeds, so a transient outage cannot
+# block every attach in the workspace.
+#
+# `retry_hint` is the caller's own command line, echoed back so the override is
+# copy-pasteable rather than something the operator has to reconstruct.
+# Returns 0 when the attach may proceed; calls error() (exit 1) otherwise.
+zh_closed_parent_guard() {
+    local owner_repo="$1"
+    local parent_num="$2"
+    local zenhub_state="$3"
+    local allow_closed="$4"
+    local retry_hint="$5"
+
+    local gh_state
+    gh_state=$(zh_github_issue_state "$owner_repo" "$parent_num")
+
+    # MERGED counts as closed. Issues and PRs share one number namespace, so a
+    # PR number passed as a parent resolves through `gh issue view` and reports
+    # MERGED rather than CLOSED. A merged PR is not a container live work can
+    # roll up into, and mistyping a PR number for an issue number is exactly
+    # the slip this guard should catch.
+    local parent_state=""
+    if [[ "$gh_state" == "CLOSED" ]] || [[ "$gh_state" == "MERGED" ]] \
+        || [[ "$zenhub_state" == "CLOSED" ]]; then
+        parent_state="CLOSED"
+    fi
+
+    # A closed-on-GitHub parent that ZenHub still calls OPEN means the mirror
+    # has lapsed. Say so once, here: the operator is about to wonder why the
+    # board disagrees with the refusal, and the fix is re-authorization rather
+    # than anything about this command.
+    if [[ "$gh_state" == "CLOSED" ]] && [[ "$zenhub_state" == "OPEN" ]]; then
+        warn "#${parent_num} is closed on GitHub but ZenHub still reports it OPEN. The ZenHub↔GitHub sync for this workspace has lapsed. Re-authorize GitHub at app.zenhub.com; board-level counts are stale until you do."
+    fi
+
+    [[ "$parent_state" != "CLOSED" ]] && return 0
+
+    if [[ "$allow_closed" == "true" ]]; then
+        warn "Parent #${parent_num} is CLOSED. Children attached to a closed parent roll up to nothing. Proceeding because --allow-closed-parent was given."
+        return 0
+    fi
+
+    # Machine-readable refusal marker, mirroring the __ZH_OUTCOME__ sentinel
+    # cmd_subissue_add emits. The MCP wrappers shell out to this script and
+    # need to distinguish "refused: closed parent" from any other non-zero
+    # exit without pattern-matching prose that will be reworded eventually.
+    echo "__ZH_BLOCKED__:closed_parent" >&2
+
+    error "Parent #${parent_num} is CLOSED.
+  Children of a closed parent roll up to nothing: they drop out of every
+  container-level count while each still looks healthy on its own.
+  Choose an open parent, reopen it ('zh reopen ${parent_num}'), or re-run
+  with the override if this is deliberate:
+    ${retry_hint} --allow-closed-parent"
+}
+
 # Move sub-issues from wherever they currently live to a new parent.
 #
 # ZenHub has no reparent mutation — only addSubIssues / removeSubIssues — and a
@@ -6618,19 +7031,24 @@ cmd_reparent() {
 
     local new_parent=""
     local dry_run=false
+    local allow_closed=false
     local -a child_nums=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run|-n) dry_run=true; shift ;;
+            --allow-closed-parent) allow_closed=true; shift ;;
             -h|--help)
-                error "Usage: zh reparent <new_parent#> <child#> [<child#> ...] [--dry-run]
+                error "Usage: zh reparent <new_parent#> <child#> [<child#> ...] [--dry-run] [--allow-closed-parent]
 
 Move sub-issues to a new parent, detaching them from their current one.
 
 Examples:
   zh reparent 586 60 72 73        # move #60,#72,#73 under #586
-  zh reparent 586 60 --dry-run    # show the plan, change nothing"
+  zh reparent 586 60 --dry-run    # show the plan, change nothing
+
+A CLOSED destination is refused: its children would roll up to nothing.
+Pass --allow-closed-parent to override."
                 ;;
             *)
                 if [[ -z "$new_parent" ]]; then new_parent="${1#\#}"; else child_nums+=("${1#\#}"); fi
@@ -6670,8 +7088,11 @@ Example: zh reparent 586 60 72 73"
     owner_repo=$(get_repo_info)
     repo_id=$(get_repo_id "$owner_repo")
 
-    # Destination must exist. A closed destination is legal but almost always a
-    # mistake, so say so rather than silently parenting live work to it.
+    # Destination must exist, and must not be closed. Reparenting is the verb
+    # `zh doctor` points at for FIXING closed-parent orphans, so moving children
+    # onto another closed parent just relocates the defect (#92). The guard runs
+    # before the plan is built, and before --dry-run prints it, so a bad
+    # destination is rejected without any output implying it would have worked.
     local parent_info
     parent_info=$(zh_issue_with_parent "$repo_id" "$new_parent")
     if [[ "$parent_info" == "null" ]]; then
@@ -6680,9 +7101,8 @@ Example: zh reparent 586 60 72 73"
     local parent_title parent_state
     parent_title=$(echo "$parent_info" | jq -r '.title')
     parent_state=$(echo "$parent_info" | jq -r '.state')
-    if [[ "$parent_state" == "CLOSED" ]]; then
-        warn "Destination parent #${new_parent} is CLOSED — children attached to a closed parent roll up to nothing."
-    fi
+    zh_closed_parent_guard "$owner_repo" "$new_parent" "$parent_state" "$allow_closed" \
+        "zh reparent ${new_parent} ${uniq_children[*]}"
 
     # Build the plan: for each child, where it is now and what we will do.
     local detach_ids="[]" attach_ids="[]"
@@ -6798,11 +7218,27 @@ Example: zh reparent 586 60 72 73"
 }
 
 cmd_subissue_add() {
+    # Strip --allow-closed-parent from anywhere in the arg list before the
+    # positional parse below claims $1 as the parent. Position-independent
+    # because every planning noun routes its own "$@" straight here
+    # (cmd_hierarchy_dispatch's `add` arm), so the flag can arrive after the
+    # child numbers just as easily as before them.
+    local allow_closed=false
+    local -a _passthru=()
+    local _arg
+    for _arg in "$@"; do
+        case "$_arg" in
+            --allow-closed-parent) allow_closed=true ;;
+            *) _passthru+=("$_arg") ;;
+        esac
+    done
+    set -- ${_passthru[@]+"${_passthru[@]}"}
+
     local parent_num="${1:-}"
     shift || true
 
     if [[ -z "$parent_num" ]] || [[ $# -eq 0 ]]; then
-        error "Usage: zh subissue add <parent#> <child#> [<child#> ...]
+        error "Usage: zh subissue add <parent#> <child#> [<child#> ...] [--allow-closed-parent]
 Example: zh subissue add 42 100 101"
     fi
 
@@ -6846,12 +7282,35 @@ Example: zh subissue add 42 100 101"
     local repo_id
     repo_id=$(get_repo_id "$owner_repo")
 
+    # Parent-state guard BEFORE the "Adding..." line, so a refusal never
+    # announces work it is about to decline (#92). This lookup also carries the
+    # parent's id, so it replaces the zh_resolve_issue_id round-trip on the
+    # happy path rather than adding one.
+    local parent_info parent_id="" parent_state=""
+    parent_info=$(zh_issue_with_parent "$repo_id" "$stripped_parent")
+    if [[ "$parent_info" != "null" ]]; then
+        parent_state=$(echo "$parent_info" | jq -r '.state // empty')
+        parent_id=$(echo "$parent_info" | jq -r '.id // empty')
+    fi
+    # Called unconditionally: the guard's GitHub check stands on its own, so a
+    # failed ZenHub lookup must not take the whole guard down with it. That is
+    # the case where the guard matters MOST: a lapsed mirror is exactly when
+    # ZenHub's own state is least trustworthy.
+    zh_closed_parent_guard "$owner_repo" "$stripped_parent" "$parent_state" "$allow_closed" \
+        "zh subissue add ${stripped_parent} ${child_nums[*]}"
+
     info "Adding ${#child_nums[@]} sub-issue(s) to parent #${stripped_parent}..."
 
     # Resolve parent and children separately. The parent ID goes into parentId
     # (scalar); the child IDs go into childIssueIds (list).
-    local parent_id
-    parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
+    #
+    # Fall back to zh_resolve_issue_id when the guard lookup came back empty (a
+    # parent that does not exist here, or a transient API failure): it owns the
+    # canonical "not found in this repository" diagnostic and the cause hint,
+    # and zh_issue_with_parent deliberately swallows both.
+    if [[ -z "$parent_id" ]]; then
+        parent_id=$(zh_resolve_issue_id "$repo_id" "$parent_num")
+    fi
 
     local child_ids_json
     child_ids_json=$(zh_resolve_issue_ids "$repo_id" ${child_nums[@]+"${child_nums[@]}"})
@@ -7469,6 +7928,7 @@ zh_subissue_fetch_all() {
     local all_nodes="[]"
     local total_count=0
     local parent_title=""
+    local parent_state=""
     local first_page=true
 
     while :; do
@@ -7507,6 +7967,7 @@ zh_subissue_fetch_all() {
 
         if [[ "$first_page" == "true" ]]; then
             parent_title=$(echo "$issue_json" | jq -r '.title // ""')
+            parent_state=$(echo "$issue_json" | jq -r '.state // ""')
             total_count=$(echo "$issue_json" | jq -r '.githubChildIssues.totalCount // 0')
             first_page=false
         fi
@@ -7544,7 +8005,8 @@ zh_subissue_fetch_all() {
         --argjson nodes "$all_nodes" \
         --argjson total "$total_count" \
         --arg title "$parent_title" \
-        '{totalCount: $total, parentTitle: $title, nodes: $nodes}'
+        --arg pstate "$parent_state" \
+        '{totalCount: $total, parentTitle: $title, parentState: $pstate, nodes: $nodes}'
 }
 
 # Lightweight variant of zh_subissue_fetch_all that returns only
@@ -7710,8 +8172,9 @@ Example: zh subissue list 42"
         error "Issue #${parent_num} not found in this repository"
     fi
 
-    local parent_title child_count fetched_count
+    local parent_title parent_state child_count fetched_count
     parent_title=$(echo "$children_json" | jq -r '.parentTitle')
+    parent_state=$(echo "$children_json" | jq -r '.parentState // ""')
     child_count=$(echo "$children_json" | jq -r '.totalCount // 0')
 
     # Normalize once: strip any null page entries up-front so the
@@ -7725,9 +8188,19 @@ Example: zh subissue list 42"
     fetched_count=$(echo "$children_clean" | jq -r 'length')
 
     echo ""
-    echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
+    if [[ "$parent_state" == "CLOSED" ]]; then
+        # Every child listed below rolls up to nothing while this parent stays
+        # closed (#92). Saying so in the header means the operator learns it
+        # from the listing itself rather than from `zh doctor` weeks later.
+        echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${YELLOW}(CLOSED)${NC} ${parent_title}"
+    else
+        echo -e "${BOLD}Sub-issues of #${parent_num}${NC} ${parent_title}"
+    fi
     echo ""
     echo -e "  ${CYAN}Children:${NC} ${child_count}"
+    if [[ "$parent_state" == "CLOSED" ]]; then
+        echo -e "  ${YELLOW}Parent is closed. Any open child below rolls up to nothing.${NC}"
+    fi
     echo ""
 
     # Gate the empty-parent early-return on `fetched_count`, not `child_count`.
@@ -8079,7 +8552,9 @@ USAGE:
 
 SUBCOMMANDS:
     add <parent#> <child#> [...]      Link one or more issues as sub-issues
-                                      of a parent (single API call)
+                                      of a parent (single API call).
+                                      A CLOSED parent is refused; pass
+                                      --allow-closed-parent to override
     remove <parent#> <child#> [...]   Unlink one or more sub-issues from a parent
                                       (aliases: rm)
     list <parent#>                    List sub-issues of a parent

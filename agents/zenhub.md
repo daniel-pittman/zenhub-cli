@@ -39,7 +39,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 ### Read operations (safe, fire-and-forget)
 - `zh board` — overview: per-pipeline counts
 - `zh count [pipeline] [-q] [--json]` — **exact** issue counts, taken from the API's own totalCount. Use this whenever the answer is a number: a listing's length can be a truncated page, and a count that is quietly short is indistinguishable from a correct one. `-q` prints a bare number for scripting.
-- `zh doctor [--json]` — hierarchy health check: open issues whose parent is CLOSED (they roll up to nothing and are invisible in normal listings), plus parent cycles. Exits 1 when it finds problems. Run it after any bulk restructure or container close.
+- `zh doctor [--json] [--no-verify]` — hierarchy health check: open issues whose parent is CLOSED (they roll up to nothing and are invisible in normal listings), plus parent cycles. **Exit 0 healthy / 1 problems found / 2 inconclusive.** It cross-checks ZenHub's issue states against GitHub, because a lapsed ZenHub<->GitHub sync reports closed issues as open and would make the check report a health it cannot verify. On `--json`, read `conclusive` before trusting `ok`: `ok: true, conclusive: false` means "found nothing, and could not have found it either". Report that as UNKNOWN, never as passing. `mirror_check.disagreements` names the stale issues; the remedy is re-authorizing GitHub at app.zenhub.com. `outcome` distinguishes four states: `ok` (verified clean), `problems`, `inconclusive` (stale, exit 2), and `unverified` (no gh / auth failure / rate limit / `--no-verify` / truncated walk; exit 0, since inability to check must not break a gate). In `mirror_check`, trust `covered` rather than `attempted`: a lookup that was issued and failed is attempted-but-not-covered. Run it in every survey, not just after a restructure.
 - `zh pipelines` — list pipeline names for the workspace
 - `zh pipeline "<name>"` — list issues in a pipeline (order matters; top = highest priority)
 - `zh issue <N>` — full ticket detail (title, state, body, pipeline, priority, estimate, assignee, ZH + GH URLs)
@@ -57,7 +57,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
 
 ### Write operations (issue lifecycle)
-- `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`. Optional `--priority <name>` sets a configured priority at create time (same name-resolution path as `zh priority`; discover names with `zh priorities`). Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent, priority, priority_requested) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number. `priority_requested` carries the requested priority name even when `priority` is null (post-create mutation did not confirm; safe to retry via `zh priority`); compare the two fields to detect a partial apply.
+- `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`; a CLOSED `<issue#>` is REFUSED before the issue is created (nothing is left behind), overridable with `--allow-closed-parent`. Optional `--priority <name>` sets a configured priority at create time (same name-resolution path as `zh priority`; discover names with `zh priorities`). Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent, priority, priority_requested) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number. `priority_requested` carries the requested priority name even when `priority` is null (post-create mutation did not confirm; safe to retry via `zh priority`); compare the two fields to detect a partial apply.
 - `zh type <issue#> <type-name>`: change an existing issue's type (aliases: `set-type`, `retype`). Resolves the name via `zh types`; works for both ZenhubIssueType (Epic/Initiative/Project/Sub-task) and GithubIssueType (Bug/Feature/Task) via the unified type id.
 - `zh comment <issue#> -m "<text>" | -f <file> | --stdin` — add comment
 - `zh close <issue#> [comment]` — close (moves to Closed pipeline; optional closing comment)
@@ -78,7 +78,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 ZenHub removed Legacy Epics and ZenhubEpics in June 2025 ("Epics and Projects have been replaced with Issue Types and Sub-Issues"). An **epic is now a normal issue whose issue-type is Epic** (level 3), with an ordinary `#number` and issue URL; children are attached via Sub-Issues. The same command surface exists for every ZenHub-managed level: `zh initiative` (level 1), `zh project` (level 2), `zh epic` (level 3), `zh subtask` (level 5). Board-level Bug/Feature/Task use `zh create -t <type>`.
 - `zh epic create "<title>" [-d desc] [-l labels] [-p pipeline] [--json|-q]`: create an Epic-typed issue
 - `zh epic update <issue#> [-t title] [-d body]`: edit title/description (aliases: `edit`, `modify`)
-- `zh epic add <parent#> <issue#> [<issue#> ...]`: attach one or more sub-issues (single `addSubIssues` call)
+- `zh epic add <parent#> <issue#> [<issue#> ...]`: attach one or more sub-issues (single `addSubIssues` call). A CLOSED parent is refused; `--allow-closed-parent` overrides
 - `zh epic remove <parent#> <issue#> [...]`: detach sub-issues
 - `zh epic close <issue#> [comment]` / `zh epic reopen <issue#>`: close/reopen the issue
 - To delete an epic, delete the issue: `zh delete <issue#>` (DANGER, propose-first ALWAYS; prefer close)
@@ -86,11 +86,11 @@ ZenHub removed Legacy Epics and ZenhubEpics in June 2025 ("Epics and Projects ha
 
 ### Write operations (sub-issues — 3rd hierarchy tier)
 Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue is a regular Issue whose `parentIssue` points to another Issue. Use this when an issue is too large for a single ticket but doesn't justify its own epic.
-- `zh subissue add <parent#> <child#> [<child#> ...]` — link one or more issues as sub-issues of a parent (single API call)
+- `zh subissue add <parent#> <child#> [<child#> ...]` — link one or more issues as sub-issues of a parent (single API call). A CLOSED parent is refused; `--allow-closed-parent` overrides (the flag may appear anywhere in the argument list)
 - `zh subissue remove <parent#> <child#> [...]` — unlink sub-issues from a parent (aliases: `rm`)
 - `zh subissue list <parent#>` — list a parent's sub-issues with the same format `zh epic show` uses (aliases: `ls`)
 - `zh subissue reorder <child#> <top|bottom|after <sib#>|before <sib#>>` — reorder a sub-issue among its siblings. **Different positioning model from `zh reorder`**: ZenHub's `reprioritizeSubIssue` mutation uses sibling-anchored positioning, not integer positions. (aliases: `order`, `pos`)
-- `zh reparent <new_parent#> <child#> [...] [--dry-run]` — **move** children to a new parent. Use this instead of `subissue add` / `<noun> add` whenever a child might already have a parent: a child may have only ONE parent, so a bulk add returns a partial success where every already-parented child fails with "Sub issue may only have one parent". `reparent` resolves each child's current parent and detaches it first, so you only specify the destination. `--dry-run` prints the plan (including which current parents are CLOSED) without changing anything. (alias: `move-parent`)
+- `zh reparent <new_parent#> <child#> [...] [--dry-run]` — **move** children to a new parent. Use this instead of `subissue add` / `<noun> add` whenever a child might already have a parent: a child may have only ONE parent, so a bulk add returns a partial success where every already-parented child fails with "Sub issue may only have one parent". `reparent` resolves each child's current parent and detaches it first, so you only specify the destination. `--dry-run` prints the plan (including which current parents are CLOSED) without changing anything. A CLOSED DESTINATION is refused (that would just relocate the defect); `--allow-closed-parent` overrides. (alias: `move-parent`)
 
 ### Write operations (sprint membership)
 - `zh sprint add <name|current|active> <issue#> [<issue#> ...]` — add one or more issues to a sprint (single API call). Top-level alias: `zh sa <name> <issue#> [...]`.
@@ -224,6 +224,25 @@ The motivating case for this rule: a "Users randomly logged out around 5pm" tick
 
 **Structural relatives don't block (v1.9.6):** when you create a child under a parent (`parent=N`), a hard match against that parent is expected, not a duplicate: a parent whose body enumerates its children scores high against each child you wire under it. The pre-flight now tags such a match `match_kind="structural_relative"` and downgrades it from block to warn (`duplicate_check.downgraded_structural=True`), so a child-under-parent create is no longer hard-blocked by its own parent. Prefer passing `parent=N` at create time over `confirm_create=True` for this case. When bulk-loading a structured backlog where siblings or dependencies also cross-match, pass `related_issues=[...]` with their numbers so those matches downgrade too (see "Structured-plan bulk-load" under Operation patterns for the `depends_on`-forwarding pattern). Genuine (non-structural) hard matches still block and must be surfaced as above.
 
+### 6. Never attach work to a CLOSED parent
+
+Closing a parent does not detach its children. Anything wired to a closed container drops out of every container-level rollup while each issue still looks perfectly healthy on its own, and nothing surfaces the condition afterwards, because every listing that would reveal it is one the closed parent is absent from. An agent is the likeliest party to cause this: it files a ticket under a container it was told about earlier and has no reason to re-check whether that container is still open.
+
+Since v2.0.0 the tool refuses instead of letting it happen. Every verb that sets a parent (`zh subissue add`, `zh <noun> add`, `zh create --parent`, `zh reparent`, and their MCP equivalents `subissue_add_children`, `epic_add_children` and its siblings, `create_issue`, the `*_create` tools, `move_children`) fails with `blocked_closed_parent=True` and mutates nothing. The check reads GitHub as the authority, not only ZenHub's mirror: a lapsed ZenHub↔GitHub authorization reports closed issues as OPEN, so CLOSED from either source refuses and a disagreement is named.
+
+**Handling a `blocked_closed_parent` response:**
+
+1. Do NOT retry verbatim, and do NOT reach for `allow_closed_parent=True` as a way past the error. This is not a transient failure: a verbatim retry refuses again, and the override recreates the exact defect the refusal exists to prevent.
+2. Read the parent's state (`zh issue <parent#>`, or the `parent_state` field). A closed container almost always means the work belongs somewhere else.
+3. Present the choice to the orchestrator: attach to a different, open parent; reopen the container (`zh reopen <parent#>`) if it was closed prematurely; or file with no parent and reparent once the right container exists.
+4. Use `allow_closed_parent=True` ONLY after the orchestrator has explicitly confirmed the closed parent is the intended destination. Log that decision in the batch audit YAML.
+
+**On read, treat `(CLOSED)` on a parent line as a finding, not decoration.** `zh issue <n>` renders `Parent: #<n> (CLOSED)`, and `zh subissue list` marks a closed parent in its header. Encountering either during a survey means surfacing it: those children are invisible to every rollup the team actually looks at.
+
+**Include `zh doctor` in board surveys.** It is the sweep for orphans that predate the guard or were created through the ZenHub web UI, which the CLI cannot intercept. Run it after any bulk restructure or container close, and report `closed_parent_orphans` alongside the pipeline digest.
+
+**Closes that never reach the CLI are a blind spot.** The `zh close` warning only fires when the close goes through `zh close`. A parent closed in the GitHub web UI, by a merged PR's `Closes #N`, or by bare `gh issue close` produces no warning at all, and `zh` cannot intercept any of them. This is the real reason `zh doctor` stays in the survey: it is the only net for orphans created outside the tool. And when `doctor` returns `conclusive: false` (exit 2), it has no net either: the states it reads are stale, so escalate the lapsed sync rather than reporting a clean board.
+
 ---
 
 ## Project-specific conventions
@@ -266,9 +285,12 @@ zh mine                           # what's assigned to current user
 zh epic list                      # all epics + state
 zh issue <N>                      # also surfaces parent/child issue counts
 zh subissue list <parent#>        # drill into a parent's sub-issues
+zh doctor                         # orphans under a closed parent, parent cycles
 ```
 
 Report the digest, not the raw output. Surface: total open, pipeline distribution, anything that looks stuck (assigned & old without movement, blocked items, anything in In Progress with no recent commits). For 3-tier-using projects, also surface: epics with parent-issues that have unstarted sub-issues, and any orphan sub-issues whose parent has been closed.
+
+`zh doctor` belongs in every survey, not just post-restructure ones. Its `closed_parent_orphans` finding is the one class of problem no other command in the list can show you: an orphan is absent from its container's rollup and looks healthy everywhere else, so a survey built only from pipelines and epic listings reports a clean board while the orphan sits in it.
 
 ### Sprint planning
 
@@ -308,7 +330,7 @@ For routine operations:
 ### Epic management
 
 - **Create** an epic: `zh epic create "Title" -d "body"` (it becomes an issue typed Epic). Convention: prefix epic titles with a project tag for visibility in the workspace-wide epic list (the team's project should document the prefix in project conventions).
-- **Add children**: `zh epic add <parent#> <issue#> [<issue#> ...]` (batch in a single call; attaches sub-issues).
+- **Add children**: `zh epic add <parent#> <issue#> [<issue#> ...]` (batch in a single call; attaches sub-issues). A closed epic is refused: reopen it, pick an open parent, or pass `--allow-closed-parent` if orphaning the children is genuinely intended.
 - **Restructure** (move children between epics): propose-first. Restructuring epic boundaries affects how the team views grouped work.
 - **Close**: propose-first. Closing an epic doesn't close its children, but it does change board visibility.
 - **Delete**: NEVER without explicit confirmation. An epic is an issue, so deletion is `zh delete <issue#>`, which is irreversible. Prefer close.
