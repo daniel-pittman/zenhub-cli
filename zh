@@ -6592,17 +6592,36 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
     # direction that hides orphans: an issue ZenHub calls open, whose parent
     # ZenHub also calls open, is invisible to the orphan check even when the
     # parent is closed on GitHub.
-    local verify_attempted=false verified_count=0
+    local verify_attempted=false verify_covered=false
+    local verified_count=0 candidate_count=0 verify_truncated=false
     local disagreements="[]" mirror_stale=false
     if [[ "$skip_verify" != "true" ]]; then
+        # `.repo == ""` (the API omitted `repository`) is matched against the
+        # current repo. If such an issue really lived in another repo sharing
+        # the number, that invents a spurious disagreement, which gates rather
+        # than hides (the safe direction), and the projection above populates
+        # `repository` so it should not arise in practice.
         local candidates
         candidates=$(echo "$data" | jq -c --arg repo "$owner_repo" \
             '[.nodes[] | select(.state != "CLOSED") | select(.repo == "" or .repo == $repo) | .number]')
-        if [[ "$(echo "$candidates" | jq 'length')" -gt 0 ]]; then
+        candidate_count=$(echo "$candidates" | jq 'length')
+        if [[ "$candidate_count" -gt 0 ]]; then
             verify_attempted=true
-            local gh_states
-            gh_states=$(zh_github_issue_states_batch "$owner_repo" "$candidates")
-            verified_count=$(echo "$gh_states" | jq 'length')
+            local batch gh_states batch_ok
+            batch=$(zh_github_issue_states_batch "$owner_repo" "$candidates")
+            batch_ok=$(echo "$batch" | jq -r '.ok // false')
+            verify_truncated=$(echo "$batch" | jq -r '.truncated // false')
+            verified_count=$(echo "$batch" | jq -r '.queried // 0')
+            gh_states=$(echo "$batch" | jq -c '.states // []')
+            # Coverage, not merely "no disagreement found". Every number asked
+            # about must have been answered for: a failed batch, a truncated
+            # walk, or a short answer all mean the checks above are unverified,
+            # and reporting them as agreement would be the same reassuring
+            # failure this whole check exists to remove, one level down.
+            if [[ "$batch_ok" == "true" ]] && [[ "$verify_truncated" != "true" ]] \
+                && [[ "$verified_count" -ge "$candidate_count" ]]; then
+                verify_covered=true
+            fi
             # A disagreement is: ZenHub did not say CLOSED, GitHub did.
             disagreements=$(jq -n --argjson zh "$data" --argjson gh "$gh_states" --arg repo "$owner_repo" '
                 ($gh | map(select(.state == "CLOSED") | .number)) as $closed
@@ -6621,11 +6640,23 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
     # finding outranks an inconclusive result. Orphans found against a stale
     # mirror are still real (ZenHub-says-CLOSED is the trustworthy direction);
     # the list is simply not known to be complete.
+    local conclusive=false
+    if [[ "$verify_covered" == "true" ]] && [[ "$disagreement_count" -eq 0 ]]; then
+        conclusive=true
+    fi
+
+    # Four states, because three cannot carry the difference between "the
+    # mirror is stale" and "the mirror was never read". Only DETECTED staleness
+    # gates (exit 2); being unable to verify is honest-but-not-a-failure
+    # (exit 0), or `--no-verify` and every un-authenticated CI run would newly
+    # break a gate that was fine.
     local outcome="ok"
     if [[ "$orphan_count" -gt 0 ]] || [[ "$cycle_count" -gt 0 ]]; then
         outcome="problems"
     elif [[ "$mirror_stale" == "true" ]]; then
         outcome="inconclusive"
+    elif [[ "$conclusive" != "true" ]]; then
+        outcome="unverified"
     fi
 
     if [[ "$as_json" == "true" ]]; then
@@ -6638,23 +6669,30 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
             --argjson orphans "$orphans" --argjson cycles "$cycles" --argjson complete "$complete" \
             --argjson disagreements "$disagreements" \
             --argjson verified "$verified_count" \
+            --argjson candidates "$candidate_count" \
             --argjson attempted "$verify_attempted" \
+            --argjson covered "$verify_covered" \
+            --argjson truncated "$verify_truncated" \
+            --argjson conclusive "$conclusive" \
             --arg outcome "$outcome" \
             '{checked: $checked, open: $open, complete: $complete,
               closed_parent_orphans: $orphans, parent_cycles: $cycles,
               ok: (($orphans|length) == 0 and ($cycles|length) == 0),
               outcome: $outcome,
-              conclusive: (($disagreements|length) == 0),
+              conclusive: $conclusive,
               mirror_check: {
                 attempted: $attempted,
+                covered: $covered,
+                truncated: $truncated,
+                candidates: $candidates,
                 verified: $verified,
                 stale: (($disagreements|length) > 0),
                 disagreements: $disagreements
               }}'
         case "$outcome" in
-            ok) return 0 ;;
             problems) return 1 ;;
-            *) return 2 ;;
+            inconclusive) return 2 ;;
+            *) return 0 ;;
         esac
     fi
 
@@ -6689,10 +6727,16 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
         echo -e "      The ZenHub<->GitHub sync for this workspace has lapsed, so the"
         echo -e "      checks above were computed from wrong data. Re-authorize GitHub at"
         echo -e "      ${BOLD}https://app.zenhub.com${NC} (Settings -> Integrations), then re-run."
-    elif [[ "$verify_attempted" == "true" ]]; then
+    elif [[ "$verify_covered" == "true" ]]; then
         echo -e "  ${GREEN}✓${NC} ZenHub's issue states agree with GitHub (${verified_count} verified)"
+    elif [[ "$skip_verify" == "true" ]]; then
+        echo -e "  ${CYAN}-${NC} ZenHub's issue states not cross-checked against GitHub (--no-verify)"
+    elif [[ "$verify_truncated" == "true" ]]; then
+        echo -e "  ${YELLOW}!${NC} ZenHub's issue states only PARTLY cross-checked (${verified_count} of ${candidate_count}); the rest are unverified"
+    elif [[ "$verify_attempted" == "true" ]]; then
+        echo -e "  ${YELLOW}!${NC} ZenHub's issue states not cross-checked against GitHub (the GitHub lookup failed: check 'gh auth status' and rate limits)"
     else
-        echo -e "  ${CYAN}-${NC} ZenHub's issue states not cross-checked against GitHub"
+        echo -e "  ${CYAN}-${NC} ZenHub's issue states not cross-checked against GitHub (nothing to check)"
     fi
     echo ""
 
@@ -6713,7 +6757,16 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
             "no problems found, but the data they were read from is stale, so this is not a clean bill of health. Fix the sync and re-run." >&2
         return 2
     fi
-    success "Hierarchy is healthy"
+    if [[ "$outcome" == "unverified" ]]; then
+        # Nothing found, and the states were not confirmed against GitHub. Exit
+        # 0, because inability to verify must not break a gate that was fine.
+        # But do not call it healthy either: the honest claim is the narrower
+        # one, and saying "healthy" one line after "not cross-checked" would
+        # contradict itself.
+        success "No problems found (issue states not verified against GitHub)"
+        return 0
+    fi
+    success "Hierarchy is healthy (issue states verified against GitHub)"
 }
 
 # Look up one issue plus its CURRENT parent, for reparenting and diagnostics.
@@ -6792,7 +6845,20 @@ zh_github_issue_state() {
 }
 
 # Read GitHub's state for MANY issue numbers at once, for the doctor mirror
-# cross-check (#94). Echoes JSON: [{number, state}], or [] on any failure.
+# cross-check (#94).
+#
+# Echoes JSON: { ok, truncated, queried, states: [{number, state}] }
+#
+# A bare array would not be enough. "No disagreement found" and "nothing was
+# checked" produce the SAME empty array, and a caller that cannot tell them
+# apart reports agreement it never verified. That is the very failure this
+# check exists to remove, so the coverage has to be reported alongside the
+# answer:
+#   ok=false        no usable answer at all (auth, transport, rate limit)
+#   truncated=true  the chunk cap stopped the walk short of every number
+#   queried         how many numbers were actually asked about and answered for
+# `queried` counts numbers ASKED, not rows returned: a PR or deleted issue
+# resolves to null and yields no row, yet it WAS checked.
 #
 # One aliased GraphQL query per chunk of up to 100 numbers, rather than one REST
 # call per issue. That distinction is the whole reason this check is affordable:
@@ -6818,15 +6884,19 @@ zh_github_issue_states_batch() {
 
     local total
     total=$(echo "$numbers_json" | jq 'length')
-    if [[ "$total" -eq 0 ]]; then printf '[]'; return 0; fi
+    if [[ "$total" -eq 0 ]]; then
+        printf '{"ok":true,"truncated":false,"queried":0,"states":[]}'
+        return 0
+    fi
 
-    local out="[]" offset=0 chunks=0
+    local out="[]" offset=0 chunks=0 queried=0 truncated=false
     while [[ "$offset" -lt "$total" ]]; do
         chunks=$((chunks + 1))
         # Cap the walk so a pathologically large workspace degrades to a
         # partial verification instead of a long stall. 20 chunks = 2000
-        # issues; the caller reports how many it actually verified.
-        if [[ "$chunks" -gt 20 ]]; then break; fi
+        # issues. `truncated` is reported so the caller can refuse to call a
+        # partial verification conclusive.
+        if [[ "$chunks" -gt 20 ]]; then truncated=true; break; fi
 
         local chunk fields query response
         chunk=$(echo "$numbers_json" | jq -c --argjson o "$offset" '.[$o:($o+100)]')
@@ -6848,7 +6918,10 @@ zh_github_issue_states_batch() {
         fi
         # No usable data at all (auth failure, transport error, rate limit) is
         # the one case that must NOT look like "verified, no disagreements".
-        if [[ -z "$repo_obj" ]] || [[ "$repo_obj" == "null" ]]; then printf '[]'; return 0; fi
+        if [[ -z "$repo_obj" ]] || [[ "$repo_obj" == "null" ]]; then
+            printf '{"ok":false,"truncated":false,"queried":0,"states":[]}'
+            return 0
+        fi
 
         local page
         page=$(echo "$repo_obj" | jq -c '
@@ -6858,10 +6931,13 @@ zh_github_issue_states_batch() {
              | {number: .value.number, state: .value.state}]' 2>/dev/null) || page="[]"
         out=$(jq -cn --argjson a "$out" --argjson b "$page" '$a + $b')
 
+        queried=$((queried + $(echo "$chunk" | jq 'length')))
         offset=$((offset + 100))
     done
 
-    printf '%s' "$out"
+    jq -cn --argjson states "$out" --argjson queried "$queried" \
+        --argjson truncated "$truncated" \
+        '{ok: true, truncated: $truncated, queried: $queried, states: $states}'
 }
 
 # Refuse to attach work to a CLOSED parent unless the caller opts in.

@@ -1350,7 +1350,8 @@ def doctor(repo_path: str = "", verify_mirror: bool = True) -> dict:
         repo_path: Optional absolute path of a git checkout to run zh from.
         verify_mirror: cross-check ZenHub's states against GitHub (default
             True). False skips it, which is faster but makes a clean result
-            unverifiable, so `conclusive` is then reported False.
+            unverifiable, so `conclusive` is then False and `outcome` is
+            "unverified".
 
     Returns:
         dict with: ok, healthy, conclusive, outcome, mirror_check, checked,
@@ -1358,10 +1359,20 @@ def doctor(repo_path: str = "", verify_mirror: bool = True) -> dict:
 
         `ok` reports whether the CHECK ran; `healthy` whether the hierarchy
         passed it; `conclusive` whether the data it read can be trusted.
-        `outcome` is "ok" | "problems" | "inconclusive", the single field
-        to branch on if you only read one. `mirror_check` carries
-        {attempted, verified, stale, disagreements}, where each disagreement
-        is {number, title, zenhub_state, github_state}.
+        `outcome` is the single field to branch on if you only read one:
+          "ok"           verified against GitHub, nothing wrong
+          "problems"     findings (real; the list is a floor if also stale)
+          "inconclusive" mirror is stale, so the answer cannot be trusted
+          "unverified"   states were not confirmed (no gh / auth failure /
+                         rate limit / --no-verify / truncated walk). Nothing
+                         was found, and nothing could have been confirmed.
+                         NOT a failure, but not a pass either.
+
+        `mirror_check` carries {attempted, covered, truncated, candidates,
+        verified, stale, disagreements}. `covered` is the one to trust:
+        "attempted" only means a lookup was issued, while `covered` means
+        every candidate was actually answered for. Each disagreement is
+        {number, title, zenhub_state, github_state}.
     """
     args = ["doctor", "--json"]
     if not verify_mirror:
@@ -1373,6 +1384,9 @@ def doctor(repo_path: str = "", verify_mirror: bool = True) -> dict:
     # Only treat it as failure if no payload came back.
     ran = bool(data)
     mirror = data.get("mirror_check") or {}
+    # `covered` gates trust, not `attempted`: a lookup that was issued and
+    # failed is attempted-but-uncovered, and treating that as agreement is the
+    # defect this whole check exists to prevent, one level down.
     # Default `conclusive` to False, not True, when the key is absent: an
     # older `zh` in a mixed-version install predates the cross-check and
     # genuinely cannot vouch for its own inputs. Defaulting True there would
@@ -1384,11 +1398,16 @@ def doctor(repo_path: str = "", verify_mirror: bool = True) -> dict:
         "conclusive": conclusive,
         "outcome": data.get(
             "outcome",
-            # Synthesize for an older zh that emits no `outcome`.
-            ("ok" if data.get("ok") else "problems") if ran else "fail",
+            # Synthesize for an older zh that emits no `outcome`. A clean
+            # result from a zh that never cross-checked is "unverified", not
+            # "ok": the same reasoning as defaulting `conclusive` to False.
+            ("unverified" if data.get("ok") else "problems") if ran else "fail",
         ),
         "mirror_check": {
             "attempted": bool(mirror.get("attempted", False)),
+            "covered": bool(mirror.get("covered", False)),
+            "truncated": bool(mirror.get("truncated", False)),
+            "candidates": mirror.get("candidates", 0),
             "verified": mirror.get("verified", 0),
             "stale": bool(mirror.get("stale", False)),
             "disagreements": mirror.get("disagreements", []),

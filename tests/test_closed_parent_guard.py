@@ -962,12 +962,25 @@ _MIRROR_STUBS = r"""
             {"number":2,"title":"live work","state":"OPEN","repository":{"ownerName":"acme","name":"widgets"},"parentIssue":{"number":1,"title":"container","state":"OPEN"}}
         ]}}}}'
     }
-    zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-[]}"; }
+    zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-$_ZH_TEST_BATCH_FAIL}"; }
+    _ZH_TEST_BATCH_FAIL='{"ok":false,"truncated":false,"queried":0,"states":[]}'
 """
 
+# The helper reports COVERAGE alongside the answer, because "no disagreement
+# found" and "nothing was checked" are otherwise indistinguishable. Review of
+# the first cut caught the code claiming "agree with GitHub (0 verified)" on an
+# auth failure, which is this bug one level down.
+#
 # GitHub's answer: #1 is actually CLOSED. ZenHub says OPEN. That is the lapse.
-_GH_SAYS_ONE_CLOSED = '[{"number":1,"state":"CLOSED"},{"number":2,"state":"OPEN"}]'
-_GH_AGREES = '[{"number":1,"state":"OPEN"},{"number":2,"state":"OPEN"}]'
+_GH_SAYS_ONE_CLOSED = ('{"ok":true,"truncated":false,"queried":2,"states":'
+                       '[{"number":1,"state":"CLOSED"},{"number":2,"state":"OPEN"}]}')
+_GH_AGREES = ('{"ok":true,"truncated":false,"queried":2,"states":'
+              '[{"number":1,"state":"OPEN"},{"number":2,"state":"OPEN"}]}')
+# Lookup failed outright (no gh, unauthenticated, rate-limited).
+_GH_UNREACHABLE = '{"ok":false,"truncated":false,"queried":0,"states":[]}'
+# Chunk cap stopped the walk short: a PARTIAL verification.
+_GH_TRUNCATED = ('{"ok":true,"truncated":true,"queried":1,"states":'
+                 '[{"number":1,"state":"OPEN"}]}')
 
 
 def _doctor(gh_batch: str, args: str = ""):
@@ -1063,9 +1076,65 @@ def test_doctor_unverifiable_mirror_does_not_become_a_failure() -> None:
     Detected staleness is actionable and gates. Inability to check is not a
     new failure, or every user without gh auth would suddenly see exit 2.
     """
-    r = _doctor("[]")
+    r = _doctor(_GH_UNREACHABLE)
     assert r.returncode == 0, f"an unverifiable mirror is not a failure: {r.stderr!r}"
     assert "STALE" not in (r.stdout + r.stderr), "absence of evidence is not staleness"
+
+
+def test_doctor_never_claims_agreement_it_did_not_verify() -> None:
+    """The first cut of #94 printed "agree with GitHub (0 verified)" when the
+    GitHub lookup failed, and emitted `conclusive: true`. That is the same
+    reassuring-false-health polarity #94 exists to remove, one level down: "no
+    disagreement found" is not "verified".
+
+    Asserting only the exit code is what let it through the first time, so this
+    asserts the CLAIM.
+    """
+    import json as _json
+    r = _doctor(_GH_UNREACHABLE)
+    assert "agree with GitHub" not in r.stdout, (
+        f"must not claim agreement having verified nothing; got {r.stdout!r}"
+    )
+    assert "not cross-checked" in r.stdout, (
+        f"must say the states were not checked; got {r.stdout!r}"
+    )
+    j = _json.loads(_doctor(_GH_UNREACHABLE, args="--json").stdout)
+    assert j["conclusive"] is False, "an unverified run cannot be conclusive"
+    assert j["outcome"] == "unverified"
+    assert j["mirror_check"]["covered"] is False
+
+
+def test_doctor_no_verify_is_reported_unverified_not_conclusive() -> None:
+    """Opting out cannot yield `conclusive: true`.
+
+    The MCP docstring promises `--no-verify` reports conclusive False; the first
+    cut emitted True, so the documented contract and the code disagreed.
+    """
+    import json as _json
+    j = _json.loads(_doctor(_GH_AGREES, args="--json --no-verify").stdout)
+    assert j["conclusive"] is False
+    assert j["outcome"] == "unverified"
+    assert j["mirror_check"]["attempted"] is False
+
+
+def test_doctor_truncated_verification_is_not_conclusive() -> None:
+    """A partial verification must not be presented as a complete one.
+
+    The chunk cap stops the walk on very large workspaces. If none of the
+    checked portion disagrees, reporting `conclusive: true` would be a sample
+    that missed, the exact thing the batched design avoids elsewhere.
+    """
+    import json as _json
+    r = _doctor(_GH_TRUNCATED, args="--json")
+    j = _json.loads(r.stdout)
+    assert j["conclusive"] is False, "a truncated walk cannot be conclusive"
+    assert j["outcome"] == "unverified"
+    assert j["mirror_check"]["truncated"] is True
+    assert r.returncode == 0, "partial coverage is not a failure, just not a pass"
+    human = _doctor(_GH_TRUNCATED)
+    assert "PARTLY cross-checked" in human.stdout, (
+        f"partial coverage must be stated; got {human.stdout!r}"
+    )
 
 
 def test_doctor_no_verify_opts_out_and_says_so() -> None:
@@ -1195,17 +1264,30 @@ def test_github_states_batch_tolerates_partial_graphql_errors() -> None:
     )
     import json as _json
     assert r.returncode == 0, r.stderr
-    rows = _json.loads(r.stdout)
-    assert rows == [{"number": 86, "state": "CLOSED"}], (
-        f"a partial response must yield its usable rows and drop the nulls; got {rows!r}"
+    out = _json.loads(r.stdout)
+    assert out["ok"] is True
+    assert out["states"] == [{"number": 86, "state": "CLOSED"}], (
+        f"a partial response must yield its usable rows and drop the nulls; got {out!r}"
+    )
+    assert out["queried"] == 2, (
+        "both numbers WERE checked; #91 simply resolved to null as a PR. "
+        "Counting rows instead of numbers-asked would understate coverage and "
+        "make every workspace containing a PR look partly unverified."
     )
 
 
-def test_github_states_batch_returns_empty_on_total_failure() -> None:
-    """No usable data must NOT look like "verified, no disagreements"."""
+def test_github_states_batch_reports_failure_distinctly_from_agreement() -> None:
+    """No usable data must NOT look like "verified, no disagreements".
+
+    A bare empty array cannot carry that difference, which is why the helper
+    returns `ok` alongside `states`.
+    """
+    import json as _json
     stubs = 'gh() { return 1; }'
     r = run_zh_with_stubs(stubs, 'zh_github_issue_states_batch acme/widgets "[86]"')
-    assert r.stdout.strip() == "[]", f"got {r.stdout!r}"
+    out = _json.loads(r.stdout)
+    assert out["ok"] is False, f"a failed lookup must say so; got {out!r}"
+    assert out["states"] == [] and out["queried"] == 0
 
 
 def test_github_states_batch_is_all_or_nothing_across_chunks(tmp_path) -> None:
@@ -1242,11 +1324,95 @@ def test_github_states_batch_is_all_or_nothing_across_chunks(tmp_path) -> None:
         stubs, f'zh_github_issue_states_batch acme/widgets "{nums}"',
         extra_env={"GH_CALLS": str(counter)},
     )
+    import json as _json
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "[]", (
+    out = _json.loads(r.stdout)
+    assert out["ok"] is False, (
         "a partial verification must not be returned as if complete; got "
-        f"{r.stdout!r}"
+        f"{out!r}"
     )
+    assert out["states"] == []
     assert len(counter.read_text().strip().splitlines()) == 2, (
         "expected two chunks for 150 numbers"
     )
+
+
+def test_mcp_doctor_covered_gates_trust_not_attempted(monkeypatch) -> None:
+    """`attempted` only means a lookup was issued; `covered` means it answered.
+
+    The review of the first cut caught exactly this conflation on the bash
+    side. Pin it on the MCP side too so the wrapper cannot drift back.
+    """
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        return {"ok": True, "exit_code": 0, "stderr_plain": "", "stdout_plain":
+                '{"checked":2,"open":2,"complete":true,"ok":true,'
+                '"closed_parent_orphans":[],"parent_cycles":[],'
+                '"outcome":"unverified","conclusive":false,'
+                '"mirror_check":{"attempted":true,"covered":false,'
+                '"truncated":false,"candidates":2,"verified":0,"stale":false,'
+                '"disagreements":[]}}'}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.doctor()
+    assert out["healthy"] is True, "nothing was found"
+    assert out["conclusive"] is False, "but nothing was confirmed either"
+    assert out["outcome"] == "unverified"
+    assert out["mirror_check"]["attempted"] is True
+    assert out["mirror_check"]["covered"] is False, (
+        "a lookup that was issued and failed is not coverage"
+    )
+
+
+def test_mcp_doctor_older_zh_clean_result_is_unverified(monkeypatch) -> None:
+    """A clean result from a zh that never cross-checked is not a pass.
+
+    Synthesizing "ok" there would tell a caller the states were confirmed by a
+    version incapable of confirming them.
+    """
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        return {"ok": True, "exit_code": 0, "stderr_plain": "", "stdout_plain":
+                '{"checked":2,"open":2,"complete":true,"ok":true,'
+                '"closed_parent_orphans":[],"parent_cycles":[]}'}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.doctor()
+    assert out["outcome"] == "unverified", (
+        "an older zh cannot report a verified pass"
+    )
+    assert out["conclusive"] is False
+    assert out["mirror_check"]["covered"] is False
+
+
+# The coverage condition has two independent clauses (not truncated, and every
+# candidate answered for). A fixture that trips BOTH makes each look tested
+# when only their conjunction is; mutation testing caught exactly that. These
+# two isolate one clause each.
+
+def test_truncation_alone_blocks_coverage() -> None:
+    """Truncated walk, yet the count looks complete. Truncation must still block."""
+    import json as _json
+    batch = ('{"ok":true,"truncated":true,"queried":2,"states":'
+             '[{"number":1,"state":"OPEN"},{"number":2,"state":"OPEN"}]}')
+    j = _json.loads(_doctor(batch, args="--json").stdout)
+    assert j["mirror_check"]["covered"] is False, (
+        "a truncated walk is not coverage even when the count adds up"
+    )
+    assert j["conclusive"] is False and j["outcome"] == "unverified"
+
+
+def test_short_answer_alone_blocks_coverage() -> None:
+    """Untruncated walk that answered for fewer numbers than were asked about.
+
+    Distinct from truncation: the walk completed, but the responses did not
+    account for every candidate, so the unanswered ones are unverified.
+    """
+    import json as _json
+    batch = ('{"ok":true,"truncated":false,"queried":1,"states":'
+             '[{"number":1,"state":"OPEN"}]}')
+    j = _json.loads(_doctor(batch, args="--json").stdout)
+    assert j["mirror_check"]["covered"] is False, (
+        "answering for 1 of 2 candidates is not coverage"
+    )
+    assert j["mirror_check"]["candidates"] == 2
+    assert j["mirror_check"]["verified"] == 1
+    assert j["conclusive"] is False and j["outcome"] == "unverified"

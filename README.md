@@ -612,8 +612,16 @@ Behavior notes:
 
 - **Exit 2 is new.** A workspace with a lapsed mirror that previously exited 0 now exits 2. That is the intent, since an inconclusive result should fail a gate, but `--no-verify` restores the old behavior if a gate needs it.
 - **When findings and staleness coexist**, the exit stays 1 and the findings are labelled a floor rather than a total, because more may be hidden behind the stale states.
-- **Being unable to check is not a failure.** No `gh`, unauthenticated, or rate-limited yields "not cross-checked" and the pre-existing exit code. Only a *detected* disagreement produces exit 2.
-- **`--json` is additive.** `ok` keeps its exact meaning (no orphans, no cycles found). New alongside it: `outcome` (`"ok"` / `"problems"` / `"inconclusive"`), `conclusive`, and `mirror_check` (`{attempted, verified, stale, disagreements}`). Read `conclusive` before trusting `ok`: `ok: true, conclusive: false` means "found nothing, and could not have found it either".
+- **Being unable to check is not a failure, but it is not a pass either.** No `gh`, unauthenticated, rate-limited, `--no-verify`, or a walk truncated by the chunk cap all yield `outcome: "unverified"`, `conclusive: false`, a "not cross-checked" line, and **exit 0**. Only a *detected* disagreement produces exit 2, so an un-authenticated CI run does not newly break a gate that was fine. The final line reads "No problems found (issue states not verified against GitHub)" rather than claiming health.
+- **`--json` is additive.** `ok` keeps its exact meaning (no orphans, no cycles found). New alongside it:
+
+  | field | meaning |
+  |---|---|
+  | `outcome` | `"ok"` verified and clean, `"problems"` findings, `"inconclusive"` mirror stale, `"unverified"` states not confirmed. The one field to branch on if you read only one. |
+  | `conclusive` | whether the data `ok` was computed from can be trusted |
+  | `mirror_check` | `{attempted, covered, truncated, candidates, verified, stale, disagreements}` |
+
+  Read `conclusive` before trusting `ok`: `ok: true, conclusive: false` means "found nothing, and could not have found it either". In `mirror_check`, trust **`covered`**, not `attempted`: `attempted` only means a lookup was issued, while `covered` means every candidate was actually answered for. A lookup that was issued and failed is `attempted: true, covered: false`, and treating that as agreement would be this same defect one level down.
 - **Multi-repo workspaces**: only issues in the current repo are cross-checked, since two repos legitimately share issue numbers. The rest are left unverified rather than matched by bare number.
 
 `zh issue <N>` opportunistically surfaces parent/child info when present:
