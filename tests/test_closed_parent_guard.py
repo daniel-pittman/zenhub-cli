@@ -931,3 +931,488 @@ def test_close_survives_a_failed_sub_issue_lookup(tmp_path) -> None:
     )
     assert r.returncode == 0, f"a failed lookup must not fail the close: {r.stderr!r}"
     assert "CLOSE_FIRED" in log.read_text()
+
+
+# ==========================================================================
+# #94: doctor must not report a health it cannot verify
+# ==========================================================================
+#
+# `doctor` draws every conclusion from ZenHub's MIRROR of GitHub's issue
+# states. A lapsed ZenHub/GitHub authorization keeps serving stale values and
+# reports closed issues as OPEN, which makes the check report HEALTH rather
+# than noise. That polarity is the whole defect: a check that breaks loudly
+# gets fixed, one that quietly starts reporting health is trusted until
+# somebody counts by hand.
+#
+# THE ASSERTION THAT MATTERS: these tests check the QUALIFYING OUTPUT IS
+# PRESENT, not merely that the command exits non-zero. A test that only reads
+# the exit code passes against the bug, because the pre-#94 command exited 0
+# with a cheerful "Hierarchy is healthy" and that is precisely the failure.
+
+# A workspace with no structural problems *as ZenHub reports it*: #1 is a
+# parent ZenHub calls OPEN, #2 is its child. If #1 is actually closed on
+# GitHub, #2 is an orphan and the orphan check cannot see it.
+_MIRROR_STUBS = r"""
+    load_config() { :; }
+    get_repo_info() { printf 'acme/widgets'; }
+    get_workspace_id() { printf 'ws-gid'; }
+    zh_graphql() {
+        printf '%s' '{"data":{"workspace":{"issues":{"totalCount":2,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[
+            {"number":1,"title":"container","state":"OPEN","repository":{"ownerName":"acme","name":"widgets"},"parentIssue":null},
+            {"number":2,"title":"live work","state":"OPEN","repository":{"ownerName":"acme","name":"widgets"},"parentIssue":{"number":1,"title":"container","state":"OPEN"}}
+        ]}}}}'
+    }
+    zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-$_ZH_TEST_BATCH_FAIL}"; }
+    _ZH_TEST_BATCH_FAIL='{"ok":false,"truncated":false,"queried":0,"states":[]}'
+"""
+
+# The helper reports COVERAGE alongside the answer, because "no disagreement
+# found" and "nothing was checked" are otherwise indistinguishable. Review of
+# the first cut caught the code claiming "agree with GitHub (0 verified)" on an
+# auth failure, which is this bug one level down.
+#
+# GitHub's answer: #1 is actually CLOSED. ZenHub says OPEN. That is the lapse.
+_GH_SAYS_ONE_CLOSED = ('{"ok":true,"truncated":false,"queried":2,"states":'
+                       '[{"number":1,"state":"CLOSED"},{"number":2,"state":"OPEN"}]}')
+_GH_AGREES = ('{"ok":true,"truncated":false,"queried":2,"states":'
+              '[{"number":1,"state":"OPEN"},{"number":2,"state":"OPEN"}]}')
+# Lookup failed outright (no gh, unauthenticated, rate-limited).
+_GH_UNREACHABLE = '{"ok":false,"truncated":false,"queried":0,"states":[]}'
+# Chunk cap stopped the walk short: a PARTIAL verification.
+_GH_TRUNCATED = ('{"ok":true,"truncated":true,"queried":1,"states":'
+                 '[{"number":1,"state":"OPEN"}]}')
+
+
+def _doctor(gh_batch: str, args: str = ""):
+    return run_zh_with_stubs(
+        _MIRROR_STUBS, f"cmd_doctor {args}".strip(),
+        extra_env={"ZH_TEST_GH_BATCH": gh_batch},
+    )
+
+
+def test_doctor_refuses_to_claim_health_when_the_mirror_is_stale() -> None:
+    """THE #94 regression, asserted on OUTPUT rather than exit code.
+
+    Pre-#94 this printed "Hierarchy is healthy" and exited 0. The exit code
+    alone is the weaker claim: this asserts the reassuring line is GONE and
+    the qualification is PRESENT.
+    """
+    r = _doctor(_GH_SAYS_ONE_CLOSED)
+    combined = r.stdout + r.stderr
+    assert "healthy" not in r.stdout.lower(), (
+        f"must NOT claim health against a stale mirror; got {r.stdout!r}"
+    )
+    assert "INCONCLUSIVE" in combined, (
+        f"the qualification must be present, not merely a non-zero exit; got {combined!r}"
+    )
+    assert "STALE" in combined
+    assert r.returncode == 2, f"inconclusive is exit 2; got {r.returncode}"
+
+
+def test_doctor_names_the_disagreeing_issues() -> None:
+    """"Something is stale" is not actionable. Name what disagrees."""
+    r = _doctor(_GH_SAYS_ONE_CLOSED)
+    combined = r.stdout + r.stderr
+    assert "#1 container" in combined, f"must name the stale issue; got {combined!r}"
+    assert "#2" not in combined.split("STALE")[-1].split("The ZenHub")[0], (
+        "only the disagreeing issue belongs in the stale list"
+    )
+
+
+def test_doctor_gives_the_actionable_remedy() -> None:
+    """The fix is re-authorization, not anything about this command."""
+    r = _doctor(_GH_SAYS_ONE_CLOSED)
+    combined = r.stdout + r.stderr
+    assert "app.zenhub.com" in combined, f"must point at the remedy; got {combined!r}"
+
+
+def test_doctor_inconclusive_is_distinguishable_from_problems() -> None:
+    """A boolean cannot carry "could not tell", so the exit code must.
+
+    Exit 1 means the hierarchy is broken; exit 2 means the answer is unknown.
+    Collapsing them would make a caller "fix" a hierarchy that may be fine.
+    """
+    stale = _doctor(_GH_SAYS_ONE_CLOSED)
+    assert stale.returncode == 2
+    # Same workspace, but ZenHub genuinely reports an orphan: real finding.
+    with_orphan = _MIRROR_STUBS.replace(
+        '"parentIssue":{"number":1,"title":"container","state":"OPEN"}',
+        '"parentIssue":{"number":1,"title":"container","state":"CLOSED"}',
+    )
+    r = run_zh_with_stubs(with_orphan, "cmd_doctor",
+                          extra_env={"ZH_TEST_GH_BATCH": _GH_AGREES})
+    assert r.returncode == 1, f"real findings stay exit 1; got {r.returncode}"
+
+
+def test_doctor_findings_against_a_stale_mirror_are_labelled_a_floor() -> None:
+    """Reporting N problems from data known to be wrong, without saying the
+    count is a floor, is the same overclaim in miniature."""
+    with_orphan = _MIRROR_STUBS.replace(
+        '"parentIssue":{"number":1,"title":"container","state":"OPEN"}',
+        '"parentIssue":{"number":1,"title":"container","state":"CLOSED"}',
+    )
+    r = run_zh_with_stubs(with_orphan, "cmd_doctor",
+                          extra_env={"ZH_TEST_GH_BATCH": _GH_SAYS_ONE_CLOSED})
+    assert r.returncode == 1, "a real finding outranks inconclusive"
+    assert "FLOOR" in (r.stdout + r.stderr), (
+        f"a finding list from stale data must not read as a total; got {r.stderr!r}"
+    )
+
+
+def test_doctor_reports_health_when_the_mirror_agrees() -> None:
+    """Control: verification must not turn a healthy workspace into a warning."""
+    r = _doctor(_GH_AGREES)
+    assert r.returncode == 0, r.stderr
+    assert "healthy" in r.stdout.lower()
+    assert "verified" in r.stdout.lower(), (
+        "a verified pass should say so; silent agreement is indistinguishable "
+        "from no check having run"
+    )
+
+
+def test_doctor_unverifiable_mirror_does_not_become_a_failure() -> None:
+    """gh missing / unauthenticated / rate-limited must not fail the check.
+
+    Detected staleness is actionable and gates. Inability to check is not a
+    new failure, or every user without gh auth would suddenly see exit 2.
+    """
+    r = _doctor(_GH_UNREACHABLE)
+    assert r.returncode == 0, f"an unverifiable mirror is not a failure: {r.stderr!r}"
+    assert "STALE" not in (r.stdout + r.stderr), "absence of evidence is not staleness"
+
+
+def test_doctor_never_claims_agreement_it_did_not_verify() -> None:
+    """The first cut of #94 printed "agree with GitHub (0 verified)" when the
+    GitHub lookup failed, and emitted `conclusive: true`. That is the same
+    reassuring-false-health polarity #94 exists to remove, one level down: "no
+    disagreement found" is not "verified".
+
+    Asserting only the exit code is what let it through the first time, so this
+    asserts the CLAIM.
+    """
+    import json as _json
+    r = _doctor(_GH_UNREACHABLE)
+    assert "agree with GitHub" not in r.stdout, (
+        f"must not claim agreement having verified nothing; got {r.stdout!r}"
+    )
+    assert "not cross-checked" in r.stdout, (
+        f"must say the states were not checked; got {r.stdout!r}"
+    )
+    j = _json.loads(_doctor(_GH_UNREACHABLE, args="--json").stdout)
+    assert j["conclusive"] is False, "an unverified run cannot be conclusive"
+    assert j["outcome"] == "unverified"
+    assert j["mirror_check"]["covered"] is False
+
+
+def test_doctor_no_verify_is_reported_unverified_not_conclusive() -> None:
+    """Opting out cannot yield `conclusive: true`.
+
+    The MCP docstring promises `--no-verify` reports conclusive False; the first
+    cut emitted True, so the documented contract and the code disagreed.
+    """
+    import json as _json
+    j = _json.loads(_doctor(_GH_AGREES, args="--json --no-verify").stdout)
+    assert j["conclusive"] is False
+    assert j["outcome"] == "unverified"
+    assert j["mirror_check"]["attempted"] is False
+
+
+def test_doctor_truncated_verification_is_not_conclusive() -> None:
+    """A partial verification must not be presented as a complete one.
+
+    The chunk cap stops the walk on very large workspaces. If none of the
+    checked portion disagrees, reporting `conclusive: true` would be a sample
+    that missed, the exact thing the batched design avoids elsewhere.
+    """
+    import json as _json
+    r = _doctor(_GH_TRUNCATED, args="--json")
+    j = _json.loads(r.stdout)
+    assert j["conclusive"] is False, "a truncated walk cannot be conclusive"
+    assert j["outcome"] == "unverified"
+    assert j["mirror_check"]["truncated"] is True
+    assert r.returncode == 0, "partial coverage is not a failure, just not a pass"
+    human = _doctor(_GH_TRUNCATED)
+    assert "PARTLY cross-checked" in human.stdout, (
+        f"partial coverage must be stated; got {human.stdout!r}"
+    )
+
+
+def test_doctor_no_verify_opts_out_and_says_so() -> None:
+    """The opt-out must disclose that nothing was verified."""
+    r = _doctor(_GH_SAYS_ONE_CLOSED, args="--no-verify")
+    assert r.returncode == 0, r.stderr
+    assert "not cross-checked" in r.stdout, (
+        f"skipping verification must be stated, not silent; got {r.stdout!r}"
+    )
+
+
+def test_doctor_json_keeps_ok_meaning_and_adds_conclusive() -> None:
+    """Contract: `ok` is NOT redefined. `conclusive` carries trustworthiness.
+
+    Redefining `ok` to fold in trustworthiness would be a breaking change for
+    every machine consumer branching on it, so the honest answer goes in a new
+    key: `ok: true, conclusive: false` is "found nothing, and could not have".
+    """
+    import json as _json
+    r = _doctor(_GH_SAYS_ONE_CLOSED, args="--json")
+    parsed = _json.loads(r.stdout)  # must parse with NO stripping
+    assert parsed["ok"] is True, "no orphans/cycles were found; `ok` still means that"
+    assert parsed["conclusive"] is False, "but the data cannot be trusted"
+    assert parsed["outcome"] == "inconclusive"
+    assert parsed["mirror_check"]["stale"] is True
+    assert parsed["mirror_check"]["attempted"] is True
+    d = parsed["mirror_check"]["disagreements"]
+    assert len(d) == 1 and d[0]["number"] == 1
+    assert d[0]["zenhub_state"] == "OPEN" and d[0]["github_state"] == "CLOSED"
+    # Pre-#94 keys must all survive unchanged.
+    for key in ("checked", "open", "complete", "closed_parent_orphans", "parent_cycles"):
+        assert key in parsed, f"pre-#94 key {key} disappeared"
+    assert r.returncode == 2
+
+
+def test_doctor_multi_repo_issues_are_not_matched_by_bare_number() -> None:
+    """Two repos in one workspace legitimately share issue numbers.
+
+    Matching a bare number against one repo's states would invent a
+    disagreement for the other repo's same-numbered issue.
+    """
+    stubs = _MIRROR_STUBS.replace(
+        '{"number":1,"title":"container","state":"OPEN","repository":{"ownerName":"acme","name":"widgets"},"parentIssue":null}',
+        '{"number":1,"title":"other repo issue","state":"OPEN","repository":{"ownerName":"acme","name":"gadgets"},"parentIssue":null}',
+    )
+    r = run_zh_with_stubs(stubs, "cmd_doctor --json",
+                          extra_env={"ZH_TEST_GH_BATCH": _GH_SAYS_ONE_CLOSED})
+    import json as _json
+    parsed = _json.loads(r.stdout)
+    assert parsed["mirror_check"]["stale"] is False, (
+        "acme/gadgets#1 must not be judged against acme/widgets#1"
+    )
+    assert r.returncode == 0
+
+
+def test_mcp_doctor_surfaces_conclusive(monkeypatch) -> None:
+    """The MCP wrapper must expose the trustworthiness signal."""
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        return {"ok": False, "exit_code": 2, "stderr_plain": "", "stdout_plain":
+                '{"checked":2,"open":2,"complete":true,"ok":true,'
+                '"closed_parent_orphans":[],"parent_cycles":[],'
+                '"outcome":"inconclusive","conclusive":false,'
+                '"mirror_check":{"attempted":true,"verified":2,"stale":true,'
+                '"disagreements":[{"number":1,"title":"c","zenhub_state":"OPEN",'
+                '"github_state":"CLOSED"}]}}'}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.doctor()
+    assert out["ok"] is True, "the check ran"
+    assert out["healthy"] is True, "`healthy` keeps its meaning: nothing was found"
+    assert out["conclusive"] is False, "but it could not have been found"
+    assert out["outcome"] == "inconclusive"
+    assert out["mirror_check"]["stale"] is True
+    assert out["mirror_check"]["disagreements"][0]["number"] == 1
+
+
+def test_mcp_doctor_defaults_conclusive_false_on_older_zh(monkeypatch) -> None:
+    """Mixed-version install: an older `zh` emits no `conclusive` key.
+
+    It genuinely cannot vouch for its inputs, so the default must be False.
+    Defaulting True would reintroduce the reassuring failure this field exists
+    to prevent, on exactly the installs least able to detect it.
+    """
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        return {"ok": True, "exit_code": 0, "stderr_plain": "", "stdout_plain":
+                '{"checked":2,"open":2,"complete":true,"ok":true,'
+                '"closed_parent_orphans":[],"parent_cycles":[]}'}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.doctor()
+    assert out["healthy"] is True
+    assert out["conclusive"] is False, "an older zh cannot vouch for its inputs"
+    assert out["mirror_check"]["attempted"] is False
+
+
+def test_mcp_doctor_forwards_no_verify(monkeypatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        seen.append(args)
+        return {"ok": True, "exit_code": 0, "stderr_plain": "", "stdout_plain": "{}"}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    mcp_server.doctor(verify_mirror=False)
+    assert "--no-verify" in seen[0]
+    seen.clear()
+    mcp_server.doctor()
+    assert "--no-verify" not in seen[0], "verification is on by default"
+
+
+def test_github_states_batch_tolerates_partial_graphql_errors() -> None:
+    """A PR number or deleted issue in the set returns NOT_FOUND for its alias.
+
+    GitHub then returns a populated `data` block AND an `errors` array, and
+    `gh api graphql` exits 1. Bailing on that exit code would abandon the whole
+    chunk whenever one workspace card happened to be a PR — verified live
+    against the real API, which is how this was found.
+    """
+    stubs = r"""
+        gh() {
+            printf '%s' '{"data":{"repository":{"i86":{"number":86,"state":"CLOSED"},"i91":null}},"errors":[{"type":"NOT_FOUND","path":["repository","i91"]}]}'
+            return 1
+        }
+    """
+    r = run_zh_with_stubs(
+        stubs, 'zh_github_issue_states_batch acme/widgets "[86,91]"'
+    )
+    import json as _json
+    assert r.returncode == 0, r.stderr
+    out = _json.loads(r.stdout)
+    assert out["ok"] is True
+    assert out["states"] == [{"number": 86, "state": "CLOSED"}], (
+        f"a partial response must yield its usable rows and drop the nulls; got {out!r}"
+    )
+    assert out["queried"] == 2, (
+        "both numbers WERE checked; #91 simply resolved to null as a PR. "
+        "Counting rows instead of numbers-asked would understate coverage and "
+        "make every workspace containing a PR look partly unverified."
+    )
+
+
+def test_github_states_batch_reports_failure_distinctly_from_agreement() -> None:
+    """No usable data must NOT look like "verified, no disagreements".
+
+    A bare empty array cannot carry that difference, which is why the helper
+    returns `ok` alongside `states`.
+    """
+    import json as _json
+    stubs = 'gh() { return 1; }'
+    r = run_zh_with_stubs(stubs, 'zh_github_issue_states_batch acme/widgets "[86]"')
+    out = _json.loads(r.stdout)
+    assert out["ok"] is False, f"a failed lookup must say so; got {out!r}"
+    assert out["states"] == [] and out["queried"] == 0
+
+
+def test_github_states_batch_is_all_or_nothing_across_chunks(tmp_path) -> None:
+    """A failed chunk must discard the rows already collected, not return them.
+
+    Chunks are 100 numbers each, so a >100-issue workspace makes several calls.
+    If a later chunk fails and the helper returned the earlier chunk's rows,
+    `doctor` would receive a PARTIAL verification and present it as a complete
+    one: `mirror_check.stale=false` would then mean "no disagreement among the
+    issues I happened to reach", which is the same reassuring-failure shape #94
+    exists to remove, one level down.
+
+    Returning [] instead makes it "not verified", which `doctor` reports
+    honestly.
+    """
+    counter = tmp_path / "calls"
+    counter.write_text("")
+    stubs = r"""
+        gh() {
+            echo x >> "$GH_CALLS"
+            local n
+            n=$(wc -l < "$GH_CALLS" | tr -d ' ')
+            if [[ "$n" -eq 1 ]]; then
+                # First chunk succeeds.
+                printf '%s' '{"data":{"repository":{"i1":{"number":1,"state":"CLOSED"}}}}'
+                return 0
+            fi
+            # Second chunk fails outright (rate limit / transport error).
+            return 1
+        }
+    """
+    nums = "[" + ",".join(str(n) for n in range(1, 151)) + "]"
+    r = run_zh_with_stubs(
+        stubs, f'zh_github_issue_states_batch acme/widgets "{nums}"',
+        extra_env={"GH_CALLS": str(counter)},
+    )
+    import json as _json
+    assert r.returncode == 0, r.stderr
+    out = _json.loads(r.stdout)
+    assert out["ok"] is False, (
+        "a partial verification must not be returned as if complete; got "
+        f"{out!r}"
+    )
+    assert out["states"] == []
+    assert len(counter.read_text().strip().splitlines()) == 2, (
+        "expected two chunks for 150 numbers"
+    )
+
+
+def test_mcp_doctor_covered_gates_trust_not_attempted(monkeypatch) -> None:
+    """`attempted` only means a lookup was issued; `covered` means it answered.
+
+    The review of the first cut caught exactly this conflation on the bash
+    side. Pin it on the MCP side too so the wrapper cannot drift back.
+    """
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        return {"ok": True, "exit_code": 0, "stderr_plain": "", "stdout_plain":
+                '{"checked":2,"open":2,"complete":true,"ok":true,'
+                '"closed_parent_orphans":[],"parent_cycles":[],'
+                '"outcome":"unverified","conclusive":false,'
+                '"mirror_check":{"attempted":true,"covered":false,'
+                '"truncated":false,"candidates":2,"verified":0,"stale":false,'
+                '"disagreements":[]}}'}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.doctor()
+    assert out["healthy"] is True, "nothing was found"
+    assert out["conclusive"] is False, "but nothing was confirmed either"
+    assert out["outcome"] == "unverified"
+    assert out["mirror_check"]["attempted"] is True
+    assert out["mirror_check"]["covered"] is False, (
+        "a lookup that was issued and failed is not coverage"
+    )
+
+
+def test_mcp_doctor_older_zh_clean_result_is_unverified(monkeypatch) -> None:
+    """A clean result from a zh that never cross-checked is not a pass.
+
+    Synthesizing "ok" there would tell a caller the states were confirmed by a
+    version incapable of confirming them.
+    """
+    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+        return {"ok": True, "exit_code": 0, "stderr_plain": "", "stdout_plain":
+                '{"checked":2,"open":2,"complete":true,"ok":true,'
+                '"closed_parent_orphans":[],"parent_cycles":[]}'}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    out = mcp_server.doctor()
+    assert out["outcome"] == "unverified", (
+        "an older zh cannot report a verified pass"
+    )
+    assert out["conclusive"] is False
+    assert out["mirror_check"]["covered"] is False
+
+
+# The coverage condition has two independent clauses (not truncated, and every
+# candidate answered for). A fixture that trips BOTH makes each look tested
+# when only their conjunction is; mutation testing caught exactly that. These
+# two isolate one clause each.
+
+def test_truncation_alone_blocks_coverage() -> None:
+    """Truncated walk, yet the count looks complete. Truncation must still block."""
+    import json as _json
+    batch = ('{"ok":true,"truncated":true,"queried":2,"states":'
+             '[{"number":1,"state":"OPEN"},{"number":2,"state":"OPEN"}]}')
+    j = _json.loads(_doctor(batch, args="--json").stdout)
+    assert j["mirror_check"]["covered"] is False, (
+        "a truncated walk is not coverage even when the count adds up"
+    )
+    assert j["conclusive"] is False and j["outcome"] == "unverified"
+
+
+def test_short_answer_alone_blocks_coverage() -> None:
+    """Untruncated walk that answered for fewer numbers than were asked about.
+
+    Distinct from truncation: the walk completed, but the responses did not
+    account for every candidate, so the unanswered ones are unverified.
+    """
+    import json as _json
+    batch = ('{"ok":true,"truncated":false,"queried":1,"states":'
+             '[{"number":1,"state":"OPEN"}]}')
+    j = _json.loads(_doctor(batch, args="--json").stdout)
+    assert j["mirror_check"]["covered"] is False, (
+        "answering for 1 of 2 candidates is not coverage"
+    )
+    assert j["mirror_check"]["candidates"] == 2
+    assert j["mirror_check"]["verified"] == 1
+    assert j["conclusive"] is False and j["outcome"] == "unverified"

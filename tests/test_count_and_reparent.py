@@ -272,6 +272,7 @@ _DOCTOR_STUBS = r"""
             {"number":5,"title":"cyc-b","state":"OPEN","parentIssue":{"number":4,"title":"cyc-a","state":"OPEN"}}
         ]}}}}'
     }
+    zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-{\"ok\":false,\"truncated\":false,\"queried\":0,\"states\":[]}}"; }
 """
 
 
@@ -319,10 +320,15 @@ def test_doctor_clean_workspace_passes() -> None:
                 {"number":2,"title":"child","state":"OPEN","parentIssue":{"number":1,"title":"root","state":"OPEN"}}
             ]}}}}'
         }
+        zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-{\"ok\":false,\"truncated\":false,\"queried\":0,\"states\":[]}}"; }
     """
     r = run_zh_with_stubs(stubs, "cmd_doctor")
     assert r.returncode == 0, r.stderr
-    assert "healthy" in r.stdout.lower()
+    # The stub's mirror lookup fails, so the honest claim is the narrower one:
+    # no problems found, states unverified. Claiming "healthy" here would
+    # contradict the "not cross-checked" line printed just above it (#94).
+    assert "No problems found" in r.stdout
+    assert "not cross-checked" in r.stdout
 
 
 # --------------------------------------------------------------------------

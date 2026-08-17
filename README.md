@@ -150,7 +150,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `mine [user]` | `my` | List issues assigned to you (or specified user) |
 | `board [--all]` | `b`, `overview` | Show board overview with issue counts |
 | `count [pipeline] [--all] [-q] [--json]` | `n` | **Exact** issue counts (from the API's own totalCount — never a truncated page) |
-| `doctor [--json]` | `check`, `health` | Hierarchy health check: open issues under a CLOSED parent, parent cycles. Exits 1 on findings |
+| `doctor [--json] [--no-verify]` | `check`, `health` | Hierarchy health check: open issues under a CLOSED parent, parent cycles. Cross-checks ZenHub's states against GitHub. Exits 0 healthy / 1 findings / 2 inconclusive |
 | `pipeline <name> [--all]` | `pipe`, `col` | List issues in a specific pipeline |
 | `pipelines [repo]` | `pipes`, `p` | List pipeline names for a workspace |
 | `move <issue> <pipeline>` | `mv`, `m` | Move an issue to a pipeline |
@@ -569,11 +569,60 @@ Sub-issues of #593 (CLOSED) Retired container
 `zh doctor` is the after-the-fact check, for orphans that predate the guard above or that were created through the ZenHub web UI:
 
 ```bash
-zh doctor          # exits 1 if it finds problems (usable as a CI gate)
-zh doctor --json   # machine-readable
+zh doctor              # 0 healthy, 1 problems found, 2 inconclusive (CI-gateable)
+zh doctor --json       # machine-readable
+zh doctor --no-verify  # skip the GitHub cross-check (faster, proves less)
 ```
 
 It reports open issues whose parent is CLOSED (with the `zh reparent` command to fix them) and any parent cycles.
+
+#### It will not report a health it cannot verify
+
+Every conclusion `doctor` draws comes from ZenHub's **mirror** of GitHub's issue states. That mirror can lapse, and a lapsed mirror reports closed issues as `OPEN`. The orphan check then cannot see an orphan at all: an issue ZenHub calls open, whose parent ZenHub also calls open, looks fine even when that parent is closed on GitHub.
+
+The dangerous part is the direction of the failure. A check that breaks loudly gets fixed; one that quietly starts reporting health is trusted until somebody counts by hand. So `doctor` cross-checks its own inputs against GitHub and, on disagreement, refuses to claim health:
+
+```
+$ zh doctor
+
+Hierarchy check — 24 issue(s) scanned, 24 open
+
+  ✓ No open issue has a closed parent
+  ✓ No parent cycles
+
+  ✗ ZenHub's issue states are STALE. 21 issue(s) are closed on GitHub but reported open here:
+      #92 Attaching an issue to a CLOSED parent is silent
+      #86 Silent truncation: gh issue list defaults to 30
+      ... and 19 more
+
+      The ZenHub<->GitHub sync for this workspace has lapsed, so the
+      checks above were computed from wrong data. Re-authorize GitHub at
+      https://app.zenhub.com (Settings -> Integrations), then re-run.
+
+INCONCLUSIVE: no problems found, but the data they were read from is stale,
+so this is not a clean bill of health. Fix the sync and re-run.
+
+$ echo $?
+2
+```
+
+The cross-check is **one batched GraphQL query per 100 issues**, not one call per issue, so a 2000-issue workspace costs 20 calls rather than 2000. It answers for exactly the issues `doctor` holds rather than sampling, because a sample that misses would reintroduce a smaller version of the same bug.
+
+Behavior notes:
+
+- **Exit 2 is new.** A workspace with a lapsed mirror that previously exited 0 now exits 2. That is the intent, since an inconclusive result should fail a gate, but `--no-verify` restores the old behavior if a gate needs it.
+- **When findings and staleness coexist**, the exit stays 1 and the findings are labelled a floor rather than a total, because more may be hidden behind the stale states.
+- **Being unable to check is not a failure, but it is not a pass either.** No `gh`, unauthenticated, rate-limited, `--no-verify`, or a walk truncated by the chunk cap all yield `outcome: "unverified"`, `conclusive: false`, a "not cross-checked" line, and **exit 0**. Only a *detected* disagreement produces exit 2, so an un-authenticated CI run does not newly break a gate that was fine. The final line reads "No problems found (issue states not verified against GitHub)" rather than claiming health.
+- **`--json` is additive.** `ok` keeps its exact meaning (no orphans, no cycles found). New alongside it:
+
+  | field | meaning |
+  |---|---|
+  | `outcome` | `"ok"` verified and clean, `"problems"` findings, `"inconclusive"` mirror stale, `"unverified"` states not confirmed. The one field to branch on if you read only one. |
+  | `conclusive` | whether the data `ok` was computed from can be trusted |
+  | `mirror_check` | `{attempted, covered, truncated, candidates, verified, stale, disagreements}` |
+
+  Read `conclusive` before trusting `ok`: `ok: true, conclusive: false` means "found nothing, and could not have found it either". In `mirror_check`, trust **`covered`**, not `attempted`: `attempted` only means a lookup was issued, while `covered` means every candidate was actually answered for. A lookup that was issued and failed is `attempted: true, covered: false`, and treating that as agreement would be this same defect one level down.
+- **Multi-repo workspaces**: only issues in the current repo are cross-checked, since two repos legitimately share issue numbers. The rest are left unverified rather than matched by bare number.
 
 `zh issue <N>` opportunistically surfaces parent/child info when present:
 
@@ -821,7 +870,7 @@ Roughly 35 tools covering the same surface as `zh`:
 | Category | Tools |
 |---|---|
 | Read | `board`, `pipeline`, `pipelines`, `issue`, `mine`, `epic_list`, `epic_show`, `subissue_list`, `sprint_list`, `sprint_show`, `sprint_current`, `list_users`, `list_labels`, `list_types` |
-| Counting & health | `count` (exact totals, never a truncated page), `doctor` (hierarchy health) |
+| Counting & health | `count` (exact totals, never a truncated page), `doctor` (hierarchy health; read `conclusive` before trusting `healthy`) |
 | Reparenting | `move_children` (move sub-issues to a new parent, detaching from the current one) |
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
 | Dependencies | `block_issue` |

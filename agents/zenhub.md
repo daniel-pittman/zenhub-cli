@@ -39,7 +39,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 ### Read operations (safe, fire-and-forget)
 - `zh board` — overview: per-pipeline counts
 - `zh count [pipeline] [-q] [--json]` — **exact** issue counts, taken from the API's own totalCount. Use this whenever the answer is a number: a listing's length can be a truncated page, and a count that is quietly short is indistinguishable from a correct one. `-q` prints a bare number for scripting.
-- `zh doctor [--json]` — hierarchy health check: open issues whose parent is CLOSED (they roll up to nothing and are invisible in normal listings), plus parent cycles. Exits 1 when it finds problems. Run it after any bulk restructure or container close.
+- `zh doctor [--json] [--no-verify]` — hierarchy health check: open issues whose parent is CLOSED (they roll up to nothing and are invisible in normal listings), plus parent cycles. **Exit 0 healthy / 1 problems found / 2 inconclusive.** It cross-checks ZenHub's issue states against GitHub, because a lapsed ZenHub<->GitHub sync reports closed issues as open and would make the check report a health it cannot verify. On `--json`, read `conclusive` before trusting `ok`: `ok: true, conclusive: false` means "found nothing, and could not have found it either". Report that as UNKNOWN, never as passing. `mirror_check.disagreements` names the stale issues; the remedy is re-authorizing GitHub at app.zenhub.com. `outcome` distinguishes four states: `ok` (verified clean), `problems`, `inconclusive` (stale, exit 2), and `unverified` (no gh / auth failure / rate limit / `--no-verify` / truncated walk; exit 0, since inability to check must not break a gate). In `mirror_check`, trust `covered` rather than `attempted`: a lookup that was issued and failed is attempted-but-not-covered. Run it in every survey, not just after a restructure.
 - `zh pipelines` — list pipeline names for the workspace
 - `zh pipeline "<name>"` — list issues in a pipeline (order matters; top = highest priority)
 - `zh issue <N>` — full ticket detail (title, state, body, pipeline, priority, estimate, assignee, ZH + GH URLs)
@@ -241,7 +241,7 @@ Since v2.0.0 the tool refuses instead of letting it happen. Every verb that sets
 
 **Include `zh doctor` in board surveys.** It is the sweep for orphans that predate the guard or were created through the ZenHub web UI, which the CLI cannot intercept. Run it after any bulk restructure or container close, and report `closed_parent_orphans` alongside the pipeline digest.
 
-**Closes that never reach the CLI are a blind spot.** The `zh close` warning only fires when the close goes through `zh close`. A parent closed in the GitHub web UI, by a merged PR's `Closes #N`, or by bare `gh issue close` produces no warning at all, and `zh` cannot intercept any of them. This is the real reason `zh doctor` stays in the survey: it is the only net for orphans created outside the tool.
+**Closes that never reach the CLI are a blind spot.** The `zh close` warning only fires when the close goes through `zh close`. A parent closed in the GitHub web UI, by a merged PR's `Closes #N`, or by bare `gh issue close` produces no warning at all, and `zh` cannot intercept any of them. This is the real reason `zh doctor` stays in the survey: it is the only net for orphans created outside the tool. And when `doctor` returns `conclusive: false` (exit 2), it has no net either: the states it reads are stale, so escalate the lapsed sync rather than reporting a clean board.
 
 ---
 
