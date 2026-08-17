@@ -272,6 +272,7 @@ _DOCTOR_STUBS = r"""
             {"number":5,"title":"cyc-b","state":"OPEN","parentIssue":{"number":4,"title":"cyc-a","state":"OPEN"}}
         ]}}}}'
     }
+    zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-[]}"; }
 """
 
 
@@ -319,6 +320,7 @@ def test_doctor_clean_workspace_passes() -> None:
                 {"number":2,"title":"child","state":"OPEN","parentIssue":{"number":1,"title":"root","state":"OPEN"}}
             ]}}}}'
         }
+        zh_github_issue_states_batch() { printf '%s' "${ZH_TEST_GH_BATCH:-[]}"; }
     """
     r = run_zh_with_stubs(stubs, "cmd_doctor")
     assert r.returncode == 0, r.stderr

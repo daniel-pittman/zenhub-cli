@@ -29,6 +29,8 @@ zh board                # Board overview
 zh count                # EXACT issue counts per pipeline (never a truncated page)
 zh count "Backlog" -q   # Bare exact number for one pipeline (scripting)
 zh doctor               # Hierarchy health: open issues under a CLOSED parent, parent cycles
+                        # 0 healthy / 1 findings / 2 inconclusive (ZenHub states stale vs GitHub)
+zh doctor --no-verify   # Skip the GitHub cross-check (faster, proves less)
 zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 
 # Manage issues

@@ -6416,7 +6416,13 @@ zh_resolve_issue_id() {
 }
 
 # Walk EVERY issue in the workspace with its parent link, for `zh doctor`.
-# Echoes JSON: { totalCount: N, nodes: [{number,title,state,parent}], complete: bool }
+# Echoes JSON:
+#   { totalCount: N, nodes: [{number,title,state,repo,parent}], complete: bool }
+#
+# `repo` ("owner/name", or "" when the API omits it) exists for the mirror
+# cross-check (#94): a workspace can span several GitHub repos, where two issues
+# legitimately share a number, so a number alone cannot be matched against one
+# repo's issue states without producing false disagreements.
 zh_doctor_fetch_issues() {
     local workspace_id="$1"
 
@@ -6430,6 +6436,7 @@ zh_doctor_fetch_issues() {
                     number
                     title
                     state
+                    repository { ownerName name }
                     parentIssue { number title state }
                 }
             }
@@ -6462,6 +6469,8 @@ zh_doctor_fetch_issues() {
         local page_nodes
         page_nodes=$(echo "$conn" | jq -c '[(.nodes // [])[] | select(. != null) | {
             number, title, state,
+            repo: (if (.repository // null) == null then ""
+                   else "\(.repository.ownerName)/\(.repository.name)" end),
             parent: (if (.parentIssue // null) == null then null
                      else {number: .parentIssue.number, title: .parentIssue.title, state: .parentIssue.state} end)
         }]')
@@ -6493,22 +6502,39 @@ zh_doctor_fetch_issues() {
 # absent from the listings you would naturally consult (#85). This is the check
 # that would have caught it immediately.
 #
-# Exits 1 when problems are found so scripts and CI can gate on it.
+# Every conclusion here is drawn from ZenHub's MIRROR of GitHub's issue states,
+# which can lapse and keep serving stale values (#94). A stale mirror makes this
+# check report HEALTH rather than noise, which is the dangerous polarity: a check
+# that breaks loudly gets fixed, one that quietly starts reporting health is
+# trusted until somebody counts by hand. So the check cross-checks its own inputs
+# against GitHub and, on disagreement, refuses to claim health instead of
+# reporting a clean bill it has no basis for.
+#
+# Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale, so the
+# answer cannot be trusted either way). A CI gate that treats any non-zero as
+# failure therefore gates on inconclusive too, which is the intent.
 cmd_doctor() {
     load_config
 
     local as_json=false
+    local skip_verify=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --json) as_json=true; shift ;;
+            --no-verify) skip_verify=true; shift ;;
             -h|--help)
-                error "Usage: zh doctor [--json]
+                error "Usage: zh doctor [--json] [--no-verify]
 
 Check the planning hierarchy for structural problems:
   - open issues whose parent is CLOSED (they roll up to nothing)
   - parent cycles
 
-Exits 1 if problems are found."
+Cross-checks ZenHub's issue states against GitHub, because a lapsed
+ZenHub<->GitHub sync reports closed issues as open and would make this
+check report a health it cannot verify. --no-verify skips that step
+(faster, but a clean result then proves nothing).
+
+Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
                 ;;
             *) shift ;;
         esac
@@ -6554,13 +6580,82 @@ Exits 1 if problems are found."
     orphan_count=$(echo "$orphans" | jq 'length')
     cycle_count=$(echo "$cycles" | jq 'length')
 
+    # ---- Mirror cross-check (#94) -------------------------------------------
+    #
+    # Verify the states the conclusions above were drawn from. Only issues in
+    # the CURRENT repo are checkable: `zh` resolves numbers through one repo, so
+    # in a multi-repo workspace the other repos' issues are left unverified
+    # rather than matched by bare number (two repos legitimately share numbers).
+    #
+    # Only ZenHub-says-not-CLOSED is worth checking. That is the direction the
+    # staleness runs (a lapsed mirror has not caught up with closures) and the
+    # direction that hides orphans: an issue ZenHub calls open, whose parent
+    # ZenHub also calls open, is invisible to the orphan check even when the
+    # parent is closed on GitHub.
+    local verify_attempted=false verified_count=0
+    local disagreements="[]" mirror_stale=false
+    if [[ "$skip_verify" != "true" ]]; then
+        local candidates
+        candidates=$(echo "$data" | jq -c --arg repo "$owner_repo" \
+            '[.nodes[] | select(.state != "CLOSED") | select(.repo == "" or .repo == $repo) | .number]')
+        if [[ "$(echo "$candidates" | jq 'length')" -gt 0 ]]; then
+            verify_attempted=true
+            local gh_states
+            gh_states=$(zh_github_issue_states_batch "$owner_repo" "$candidates")
+            verified_count=$(echo "$gh_states" | jq 'length')
+            # A disagreement is: ZenHub did not say CLOSED, GitHub did.
+            disagreements=$(jq -n --argjson zh "$data" --argjson gh "$gh_states" --arg repo "$owner_repo" '
+                ($gh | map(select(.state == "CLOSED") | .number)) as $closed
+                | [$zh.nodes[]
+                   | select(.state != "CLOSED")
+                   | select(.repo == "" or .repo == $repo)
+                   | select([.number] | inside($closed))
+                   | {number, title, zenhub_state: .state, github_state: "CLOSED"}]')
+            [[ "$(echo "$disagreements" | jq 'length')" -gt 0 ]] && mirror_stale=true
+        fi
+    fi
+    local disagreement_count
+    disagreement_count=$(echo "$disagreements" | jq 'length')
+
+    # Precedence, matching the convention the sub-issue verbs use: a real
+    # finding outranks an inconclusive result. Orphans found against a stale
+    # mirror are still real (ZenHub-says-CLOSED is the trustworthy direction);
+    # the list is simply not known to be complete.
+    local outcome="ok"
+    if [[ "$orphan_count" -gt 0 ]] || [[ "$cycle_count" -gt 0 ]]; then
+        outcome="problems"
+    elif [[ "$mirror_stale" == "true" ]]; then
+        outcome="inconclusive"
+    fi
+
     if [[ "$as_json" == "true" ]]; then
+        # `ok` keeps its exact pre-#94 meaning: no orphans and no cycles were
+        # found. It is deliberately NOT redefined to fold in trustworthiness,
+        # because machine consumers branch on it. Read `conclusive` alongside
+        # it: `ok: true, conclusive: false` is "found nothing, and could not
+        # have found it either" — not a clean bill of health.
         jq -n --argjson checked "$checked" --argjson open "$open_count" \
             --argjson orphans "$orphans" --argjson cycles "$cycles" --argjson complete "$complete" \
+            --argjson disagreements "$disagreements" \
+            --argjson verified "$verified_count" \
+            --argjson attempted "$verify_attempted" \
+            --arg outcome "$outcome" \
             '{checked: $checked, open: $open, complete: $complete,
               closed_parent_orphans: $orphans, parent_cycles: $cycles,
-              ok: (($orphans|length) == 0 and ($cycles|length) == 0)}'
-        [[ "$orphan_count" -eq 0 && "$cycle_count" -eq 0 ]] && return 0 || return 1
+              ok: (($orphans|length) == 0 and ($cycles|length) == 0),
+              outcome: $outcome,
+              conclusive: (($disagreements|length) == 0),
+              mirror_check: {
+                attempted: $attempted,
+                verified: $verified,
+                stale: (($disagreements|length) > 0),
+                disagreements: $disagreements
+              }}'
+        case "$outcome" in
+            ok) return 0 ;;
+            problems) return 1 ;;
+            *) return 2 ;;
+        esac
     fi
 
     echo ""
@@ -6583,10 +6678,40 @@ Exits 1 if problems are found."
     else
         echo -e "  ${GREEN}✓${NC} No parent cycles"
     fi
+
+    # Report what the conclusions above are actually worth.
+    if [[ "$mirror_stale" == "true" ]]; then
+        echo ""
+        echo -e "  ${RED}✗${NC} ZenHub's issue states are STALE. ${disagreement_count} issue(s) are closed on GitHub but reported open here:"
+        echo "$disagreements" | jq -r '.[] | "      #\(.number) \(.title)"' | head -10
+        [[ "$disagreement_count" -gt 10 ]] && echo "      ... and $((disagreement_count - 10)) more"
+        echo ""
+        echo -e "      The ZenHub<->GitHub sync for this workspace has lapsed, so the"
+        echo -e "      checks above were computed from wrong data. Re-authorize GitHub at"
+        echo -e "      ${BOLD}https://app.zenhub.com${NC} (Settings -> Integrations), then re-run."
+    elif [[ "$verify_attempted" == "true" ]]; then
+        echo -e "  ${GREEN}✓${NC} ZenHub's issue states agree with GitHub (${verified_count} verified)"
+    else
+        echo -e "  ${CYAN}-${NC} ZenHub's issue states not cross-checked against GitHub"
+    fi
     echo ""
 
-    if [[ "$orphan_count" -gt 0 ]] || [[ "$cycle_count" -gt 0 ]]; then
+    if [[ "$outcome" == "problems" ]]; then
+        # Say so explicitly: the findings are real, but a stale mirror means the
+        # LIST may be short. Reporting N problems from data known to be wrong,
+        # without saying the count is a floor, is the same overclaim in miniature.
+        [[ "$mirror_stale" == "true" ]] && \
+            warn "Findings above are a FLOOR, not a total: the mirror is stale, so more may be hidden."
         return 1
+    fi
+    if [[ "$outcome" == "inconclusive" ]]; then
+        # Deliberately not `success`, and deliberately not `error` either:
+        # `error` exits 1, which would be indistinguishable from "problems
+        # found". Inconclusive is its own exit code so a caller can tell
+        # "the hierarchy is broken" from "I cannot tell you".
+        printf "${RED}INCONCLUSIVE:${NC} %s\n" \
+            "no problems found, but the data they were read from is stale, so this is not a clean bill of health. Fix the sync and re-run." >&2
+        return 2
     fi
     success "Hierarchy is healthy"
 }
@@ -6664,6 +6789,79 @@ zh_github_issue_state() {
     state=$(gh issue view "$issue_num" --repo "$owner_repo" --json state \
         --jq '.state' 2>/dev/null) || state=""
     printf '%s' "$state"
+}
+
+# Read GitHub's state for MANY issue numbers at once, for the doctor mirror
+# cross-check (#94). Echoes JSON: [{number, state}], or [] on any failure.
+#
+# One aliased GraphQL query per chunk of up to 100 numbers, rather than one REST
+# call per issue. That distinction is the whole reason this check is affordable:
+# a per-issue cross-check over a real workspace is hundreds or thousands of
+# round-trips, which would discourage the routine use `doctor` exists for, while
+# 100-at-a-time makes a 2000-issue workspace 20 calls.
+#
+# It answers for EXACTLY the numbers asked about rather than sampling. A sampled
+# cross-check would reintroduce a smaller version of the bug being fixed: a
+# sample that misses is still a check that quietly returns the wrong answer.
+#
+# `repository.issue(number:)` returns null for a number that is a PR or does not
+# exist; those are dropped rather than guessed at.
+#
+# Fail-soft: gh absent, unauthenticated, or rate-limited yields [] so the caller
+# reports "not verified" instead of inventing a disagreement.
+zh_github_issue_states_batch() {
+    local owner_repo="$1"
+    local numbers_json="$2"
+
+    local owner="${owner_repo%%/*}"
+    local name="${owner_repo##*/}"
+
+    local total
+    total=$(echo "$numbers_json" | jq 'length')
+    if [[ "$total" -eq 0 ]]; then printf '[]'; return 0; fi
+
+    local out="[]" offset=0 chunks=0
+    while [[ "$offset" -lt "$total" ]]; do
+        chunks=$((chunks + 1))
+        # Cap the walk so a pathologically large workspace degrades to a
+        # partial verification instead of a long stall. 20 chunks = 2000
+        # issues; the caller reports how many it actually verified.
+        if [[ "$chunks" -gt 20 ]]; then break; fi
+
+        local chunk fields query response
+        chunk=$(echo "$numbers_json" | jq -c --argjson o "$offset" '.[$o:($o+100)]')
+        # Aliased fields: i86: issue(number: 86) { number state }
+        fields=$(echo "$chunk" | jq -r '.[] | "i\(.): issue(number: \(.)) { number state }"' | tr '\n' ' ')
+        query="query { repository(owner: \"${owner}\", name: \"${name}\") { ${fields} } }"
+
+        # A partial-success response is the NORMAL case, not an error: any PR
+        # number or deleted issue in the set resolves to a NOT_FOUND for its
+        # alias, so GitHub returns a populated `data` block AND an `errors`
+        # array, and `gh api graphql` exits 1. Bailing on the exit code would
+        # therefore abandon the whole chunk whenever a single workspace card
+        # happened to be a PR. Keep stdout, ignore the status, and decide based
+        # on whether a `.data.repository` object actually came back.
+        response=$(gh api graphql -f query="$query" 2>/dev/null) || true
+        local repo_obj=""
+        if [[ -n "$response" ]]; then
+            repo_obj=$(echo "$response" | jq -c '.data.repository // empty' 2>/dev/null) || repo_obj=""
+        fi
+        # No usable data at all (auth failure, transport error, rate limit) is
+        # the one case that must NOT look like "verified, no disagreements".
+        if [[ -z "$repo_obj" ]] || [[ "$repo_obj" == "null" ]]; then printf '[]'; return 0; fi
+
+        local page
+        page=$(echo "$repo_obj" | jq -c '
+            [(to_entries[])
+             | select(.value != null)
+             | select((.value.number | type) == "number")
+             | {number: .value.number, state: .value.state}]' 2>/dev/null) || page="[]"
+        out=$(jq -cn --argjson a "$out" --argjson b "$page" '$a + $b')
+
+        offset=$((offset + 100))
+    done
+
+    printf '%s' "$out"
 }
 
 # Refuse to attach work to a CLOSED parent unless the caller opts in.
