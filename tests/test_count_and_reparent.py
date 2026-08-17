@@ -145,6 +145,7 @@ _REPARENT_STUBS = r"""
     get_repo_info() { printf 'acme/widgets'; }
     get_repo_id() { printf 'repo-gid'; }
     get_workspace_id() { printf 'ws-gid'; }
+    zh_github_issue_state() { printf '%s' "${ZH_TEST_GH_STATE:-}"; }
     zh_graphql() {
         local q="$1" v="$2"
         if [[ "$q" == *removeSubIssues* ]]; then
@@ -211,14 +212,48 @@ def test_reparent_unknown_destination_errors_before_mutating() -> None:
     assert "DETACHED=" not in r.stderr
 
 
-def test_reparent_warns_when_destination_is_closed() -> None:
-    stubs = _REPARENT_STUBS.replace(
-        '"id":"gid-586","number":586,"title":"Initiative","state":"OPEN"',
-        '"id":"gid-586","number":586,"title":"Initiative","state":"CLOSED"',
-    )
-    r = run_zh_with_stubs(stubs, "cmd_reparent 586 73 --dry-run")
-    assert r.returncode == 0, r.stderr
+_CLOSED_DESTINATION_STUBS = _REPARENT_STUBS.replace(
+    '"id":"gid-586","number":586,"title":"Initiative","state":"OPEN","parentIssue":null',
+    '"id":"gid-586","number":586,"title":"Initiative","state":"CLOSED","parentIssue":null',
+)
+
+
+def test_reparent_refuses_closed_destination() -> None:
+    """#92: reparent is the verb `zh doctor` points at for FIXING closed-parent
+    orphans, so moving children onto another closed parent just relocates the
+    defect. Refusal replaced the pre-#92 warn because the warn let the attach
+    succeed, which is the entire failure mode: nobody reads a warning attached
+    to a successful command.
+    """
+    r = run_zh_with_stubs(_CLOSED_DESTINATION_STUBS, "cmd_reparent 586 73 --dry-run")
+    assert r.returncode != 0, f"a closed destination must be refused; got rc=0\n{r.stdout}"
     assert "CLOSED" in r.stderr and "roll up to nothing" in r.stderr
+    # The guard fires BEFORE the plan is built, so nothing implies the move
+    # would have worked and no mutation is reachable.
+    assert "DETACHED=" not in r.stderr and "ATTACHED=" not in r.stderr
+
+
+def test_reparent_closed_destination_hint_is_copy_pasteable() -> None:
+    """The override the refusal suggests must run as-is (cf. the #85 hint bug)."""
+    r = run_zh_with_stubs(_CLOSED_DESTINATION_STUBS, "cmd_reparent 586 73 60 --dry-run")
+    hint = next(
+        (ln.strip() for ln in r.stderr.splitlines() if "--allow-closed-parent" in ln), ""
+    )
+    assert hint == "zh reparent 586 73 60 --allow-closed-parent", (
+        f"override hint must be runnable as-is; got {hint!r}"
+    )
+
+
+def test_reparent_allow_closed_parent_overrides_and_warns() -> None:
+    """The override proceeds, but must still say what it is doing."""
+    r = run_zh_with_stubs(
+        _CLOSED_DESTINATION_STUBS,
+        "cmd_reparent 586 73 --dry-run --allow-closed-parent",
+    )
+    assert r.returncode == 0, r.stderr
+    assert "roll up to nothing" in r.stderr, "override must still warn"
+    assert "__ZH_BLOCKED__" not in r.stderr, "an override is not a refusal"
+    assert "attach to #586" in r.stdout, f"the plan must still be produced; got {r.stdout!r}"
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +366,7 @@ def test_one_parent_error_hint_is_copy_pasteable() -> None:
         get_repo_id() { printf 'repo-gid'; }
         get_workspace_id() { printf 'ws-gid'; }
         zh_resolve_issue_ids() { printf '%s' '["gid-60","gid-72"]'; }
+        zh_github_issue_state() { printf '%s' "${ZH_TEST_GH_STATE:-}"; }
         zh_graphql() {
             local q="$1"
             if [[ "$q" == *addSubIssues* ]]; then

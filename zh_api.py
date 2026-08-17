@@ -288,6 +288,59 @@ def get_gh_repo_id(owner_repo: str, *, gh_token: str | None = None) -> int:
     return repo_id
 
 
+def get_gh_issue_state(
+    owner_repo: str, issue_number: int, *, gh_token: str | None = None
+) -> str | None:
+    """Read an issue's open/closed state from GitHub. "OPEN"/"CLOSED"/None.
+
+    GitHub is the authority for whether an issue is closed; ZenHub mirrors it.
+    That mirror can lapse (the expired ZenHub<->GitHub authorization
+    `zh_repo_access_hint` documents), and a lapsed mirror reports the ZenHub
+    `state` field as OPEN for an issue closed on GitHub. Any check trusting
+    only the ZenHub field therefore fails OPEN precisely when the workspace is
+    degraded, and silently. Verified live 2026-08-17 against a lapsed
+    workspace: four GitHub-closed issues all reported OPEN with a null
+    closedAt.
+
+    Fail-soft: returns None on ANY failure (no gh CLI, unauthenticated, HTTP
+    error, rate limit, unexpected body). Callers treat None as "unknown" and
+    fall back to the ZenHub state rather than blocking work on an outage.
+
+    Normalizes GitHub's lowercase REST values to ZenHub's uppercase spelling so
+    the two sources are directly comparable without a per-caller conversion.
+    """
+    if not isinstance(issue_number, int) or isinstance(issue_number, bool):
+        return None
+    if gh_token is None:
+        try:
+            gh_token = subprocess.check_output(
+                ["gh", "auth", "token"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return None
+    if not gh_token:
+        return None
+
+    url = f"https://api.github.com/repos/{owner_repo}/issues/{issue_number}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"token {gh_token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as resp:  # noqa: S310
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 (fail-soft by contract, see docstring)
+        return None
+
+    state = body.get("state")
+    if not isinstance(state, str) or not state:
+        return None
+    return state.upper()
+
+
 _REPO_ID_QUERY = """
 query($ghIds: [Int!]!) {
   repositoriesByGhId(ghIds: $ghIds) {

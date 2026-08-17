@@ -164,7 +164,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `close <issue> [comment]` | | Close an issue |
 | `reopen <issue>` | | Reopen a closed issue |
 | `delete <issue> [-y]` | | **Permanently delete** a GitHub issue (via `gh`; needs admin/triage). Prompts to confirm when interactive; `-y`/`--yes` skips. Prefer `close`. |
-| `create <title> [options]` | `new` | Create a new issue (`--json` / `-q` for machine output, `--parent` to nest) |
+| `create <title> [options]` | `new` | Create a new issue (`--json` / `-q` for machine output, `--parent` to nest; a CLOSED `--parent` is refused) |
 | `block <issue> <blocker>` | `blocked-by`, `depends` | Set issue as blocked by another |
 | `unblock <issue> <blocker>` | | Remove a blocking dependency |
 | `priority <issue> [name]` | `prio` | Set or view issue priority by name (workspace-defined; see [Priorities](#priorities)) |
@@ -175,7 +175,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `project <subcommand>` | `projects` | Manage Project issues (level 2) |
 | `subtask <subcommand>` | `subtasks` | Manage Sub-task issues (level 5) |
 | `subissue <subcommand>` | `subissues`, `sub`, `child`, `children` | Manage sub-issues, the parent/child wiring (see [Sub-issues](#sub-issues)) |
-| `reparent <new_parent> <child...> [--dry-run]` | `move-parent` | Move sub-issues to a new parent, detaching them from their current one |
+| `reparent <new_parent> <child...> [--dry-run]` | `move-parent` | Move sub-issues to a new parent, detaching them from their current one. A CLOSED destination is refused |
 | `sprints [--all]` | `sp` | List sprints in workspace (see [Sprints](#sprints)) |
 | `sprint <name>` | | View sprint details and issues |
 | `sprint add <name> <issue#> [...]` | `sa` (top-level) | Add one or more issues to a sprint |
@@ -470,6 +470,9 @@ ZenHub supports a 3rd hierarchy tier below Epic → Issue: **sub-issues**. A sub
 # Link one or more issues as sub-issues of a parent (single API call)
 zh subissue add 42 100 101 102
 
+# Attaching to a CLOSED parent is refused (see "Closed parents" below)
+zh subissue add 42 100 --allow-closed-parent
+
 # List a parent's sub-issues (same format as 'zh epic show' children)
 zh subissue list 42
 
@@ -501,18 +504,76 @@ zh reparent 586 60 72 73 --dry-run
   #73  no current parent -> attach to #586
 ```
 
-Children already under the destination are skipped, and a closed destination is called out (attaching live work to a closed parent means it rolls up to nothing).
+Children already under the destination are skipped, and a **closed destination is refused** (see [Closed parents](#closed-parents-are-refused-on-attach) below).
+
+### Closed parents are refused on attach
+
+Closing a parent does **not** detach its children. Anything wired to a closed container drops out of every container-level rollup while each issue still looks perfectly healthy on its own, and no listing surfaces the condition afterwards, because every listing that would reveal it is one the closed parent is absent from.
+
+Every verb that sets a parent therefore refuses a closed one:
+
+```bash
+$ zh subissue add 42 100
+Error: Parent #42 is CLOSED.
+  Children of a closed parent roll up to nothing: they drop out of every
+  container-level count while each still looks healthy on its own.
+  Choose an open parent, reopen it ('zh reopen 42'), or re-run
+  with the override if this is deliberate:
+    zh subissue add 42 100 --allow-closed-parent
+```
+
+The rule covers `zh subissue add`, `zh <noun> add` (epic / initiative / project / subtask), `zh create --parent`, and `zh reparent`. Nothing is mutated on a refusal, and for `zh create` the check runs before the issue exists, so a refusal leaves nothing behind.
+
+**The check consults GitHub, not just ZenHub.** GitHub is the authority for whether an issue is closed; ZenHub mirrors it, and that mirror can lapse (the same expired ZenHub↔GitHub authorization covered under [Troubleshooting](#zenhub-cant-see-this-repository--lapsed-zenhubgithub-authorization)). A lapsed mirror reports a closed issue as `OPEN`, so a guard reading only ZenHub would fail open precisely when the workspace is degraded. CLOSED from **either** source refuses, and a disagreement is named:
+
+```
+Warning: #42 is closed on GitHub but ZenHub still reports it OPEN. The
+ZenHub↔GitHub sync for this workspace has lapsed. Re-authorize GitHub at
+app.zenhub.com; board-level counts are stale until you do.
+```
+
+If neither source can be read (no `gh`, unauthenticated, rate-limited), the attach proceeds: an outage must not block every attach in the workspace. A merged PR number passed as a parent is also refused, since issues and PRs share one number namespace.
+
+`--allow-closed-parent` proceeds and warns instead of refusing. Refusal is the default rather than a warning because the failure mode being closed here *is* the unread warning: the attach succeeds, the orphan exists, and it surfaces weeks later.
+
+`zh close` is the deliberate exception and only warns, naming the open sub-issues it is about to orphan:
+
+```
+$ zh close 593
+Warning: #593 still has open sub-issue(s): #997, #1013
+  They will keep pointing at this closed issue and roll up to nothing.
+  Move them first if they should stay tracked: zh reparent <new_parent#> 997 1013
+```
+
+Blocking a close would be the wrong trade, and those children stay findable.
+
+> **Blind spot worth knowing: closes that never reach the CLI.** That warning is the highest-value one here, because closing a parent with open children is what *creates* orphans, while attaching to an already-closed parent is the rarer follow-on mistake. But it only fires when the close goes through `zh close`. A parent closed in the **GitHub web UI**, by a merged PR's **`Closes #N`**, or by bare **`gh issue close`** never touches this code path and produces no warning at all. That is not fixable from the CLI, since `zh` is not in the loop for any of them. **`zh doctor` is the only net for those**, which is the argument for running it on a schedule or as a CI gate rather than only after a restructure.
+
+Both read paths mark the state:
+
+```bash
+$ zh issue 997
+  ...
+  Parent:    #593 (CLOSED) Retired container
+             This issue rolls up to a closed parent. Fix: zh reparent <new_parent#> 997
+
+$ zh subissue list 593
+Sub-issues of #593 (CLOSED) Retired container
+
+  Children: 1
+  Parent is closed. Any open child below rolls up to nothing.
+```
 
 ### Hierarchy health (`zh doctor`)
 
-Closing a parent does **not** detach its children: they keep pointing at the closed issue and roll up to nothing, disappearing from every container-level count while each still looks healthy on its own. Nothing in a normal listing reveals it. `zh doctor` is the check:
+`zh doctor` is the after-the-fact check, for orphans that predate the guard above or that were created through the ZenHub web UI:
 
 ```bash
 zh doctor          # exits 1 if it finds problems (usable as a CI gate)
 zh doctor --json   # machine-readable
 ```
 
-It reports open issues whose parent is CLOSED (with the `zh reparent` command to fix them) and any parent cycles. `zh close` also warns when the issue being closed still has open sub-issues, naming them.
+It reports open issues whose parent is CLOSED (with the `zh reparent` command to fix them) and any parent cycles.
 
 `zh issue <N>` opportunistically surfaces parent/child info when present:
 
@@ -770,6 +831,8 @@ Roughly 35 tools covering the same surface as `zh`:
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
+
+**Closed-parent refusal on the MCP surface.** Every tool that sets a parent (`subissue_add_children`, `epic_add_children` and its initiative / project / subtask siblings, `create_issue`, the `*_create` tools, `move_children`) refuses a CLOSED parent and returns `blocked_closed_parent=True` with nothing mutated. Branch on that key before treating `ok=False` as transient: a verbatim retry will refuse again. Pass `allow_closed_parent=True` to proceed deliberately. `subissue_add_children` additionally returns `parent_state` and, on an override, `closed_parent_warning`.
 
 > **v1.6.0 architecture note:** the sub-issue family (`subissue_list`, `subissue_add_children`, `subissue_remove_children`, `subissue_reorder`) and the sprint family (`sprint_list`, `sprint_show`, `sprint_current`, `sprint_add_issues`, `sprint_remove_issues`) talk to ZenHub's GraphQL API directly from Python via `zh_api.py` + `zh_graphql_ops.py`, returning untruncated structured data with no text-parsing layer. Earlier versions (v1.5.x) shelled out to `zh --machine` and parsed TAB-separated streams; that contract was retired after four rounds of release-review findings caught a class of drift bugs (titles containing the visual separator, em-dash sentinel collisions, etc.). The remaining MCP tools still wrap `zh` because human-facing rendering already gives them everything they need.
 
