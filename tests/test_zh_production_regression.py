@@ -1235,6 +1235,7 @@ _SUBISSUE_GATE_COMMON_STUBS = r"""
     get_repo_id() { printf 'repo-gid-acme-widgets'; }
     get_workspace_id() { printf 'ws-gid-backend'; }
     zh_resolve_issue_id() { printf 'issue-gid-%s' "$2"; }
+    zh_github_issue_state() { printf '%s' "${ZH_TEST_GH_STATE:-}"; }
     zh_resolve_issue_ids() {
         # Args: repo_id, num1, num2, ...
         # Emit a JSON array of fake child issue ids.

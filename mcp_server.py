@@ -1357,7 +1357,8 @@ def doctor(repo_path: str = "") -> dict:
 
 @mcp.tool()
 def move_children(to: int, issue_numbers: list[int], dry_run: bool = False,
-                  repo_path: str = "") -> dict:
+                  repo_path: str = "",
+                  allow_closed_parent: bool = False) -> dict:
     """Move sub-issues to a new parent, detaching them from their current one.
 
     A child may have only one parent, so plain `*_add_children` fails with
@@ -1366,26 +1367,36 @@ def move_children(to: int, issue_numbers: list[int], dry_run: bool = False,
     This resolves each child's current parent and does the detach itself, so
     the caller only has to say where the children should END UP.
 
+    A CLOSED destination is REFUSED (`blocked_closed_parent=True`, nothing
+    detached or attached). This is the verb `doctor` recommends for FIXING
+    closed-parent orphans, so moving children onto another closed parent
+    would just relocate the defect (#92).
+
     Args:
         to: Destination parent issue number.
         issue_numbers: Children to move.
         dry_run: Report the plan (which child detaches from which parent)
             without changing anything.
         repo_path: Optional absolute path of a git checkout to run zh from.
+        allow_closed_parent: move onto a CLOSED destination anyway.
 
     Returns:
-        dict with: ok, partial_applied, to, issue_numbers, dry_run, raw, stderr.
+        dict with: ok, partial_applied, blocked_closed_parent, to,
+        issue_numbers, dry_run, raw, stderr.
     """
     nums = [int(n) for n in (issue_numbers or [])]
     if not nums:
         return {
-            "ok": False, "partial_applied": False, "to": to,
+            "ok": False, "partial_applied": False,
+            "blocked_closed_parent": False, "to": to,
             "issue_numbers": [], "dry_run": dry_run, "raw": "",
             "stderr": "No issue_numbers given: pass the children to move.",
         }
     args = ["reparent", str(to), *[str(n) for n in nums]]
     if dry_run:
         args.append("--dry-run")
+    if allow_closed_parent:
+        args.append("--allow-closed-parent")
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # Exit 1 from the attach step means some children did not land; the detach
     # may already have happened, so surface that as partial rather than clean.
@@ -1393,9 +1404,17 @@ def move_children(to: int, issue_numbers: list[int], dry_run: bool = False,
     # stdout only ever carries "Attaching …" (present tense) and "Moved …", so
     # matching stdout here made this flag dead code.
     stderr_text = _stderr_plain(r)
+    blocked = _blocked_closed_parent(stderr_text)
     return {
         "ok": r["ok"],
-        "partial_applied": (not r["ok"]) and "Attached" in (stderr_text or ""),
+        # A closed-destination refusal happens before the detach, so it can
+        # never be a partial. Keeping the two signals mutually exclusive
+        # stops a caller reading `partial_applied` from concluding some
+        # children moved when none did.
+        "partial_applied": (
+            (not r["ok"]) and not blocked and "Attached" in (stderr_text or "")
+        ),
+        "blocked_closed_parent": blocked,
         "to": to,
         "issue_numbers": nums,
         "dry_run": dry_run,
@@ -1776,7 +1795,8 @@ def create_issue(title: str, body: str, type: str = "Task",
                  priority: str = "", repo_path: str = "",
                  confirm_create: bool = False,
                  skip_duplicate_check: bool = False,
-                 related_issues: list[int] | None = None) -> dict:
+                 related_issues: list[int] | None = None,
+                 allow_closed_parent: bool = False) -> dict:
     """Create a new ZenHub issue.
 
     Runs a pre-flight similarity check against existing open issues
@@ -1802,7 +1822,12 @@ def create_issue(title: str, body: str, type: str = "Task",
         parent: Optional parent issue number. When > 0 the new issue is
             wired as a sub-issue of that parent (ZenHub-native
             addSubIssues, so it shows up under epic_show / subissue
-            reads).
+            reads). A CLOSED parent is refused BEFORE the issue is
+            created, so nothing is left behind: the response carries
+            `blocked_closed_parent=True` and `number=None` (#92).
+        allow_closed_parent: create and wire under a CLOSED parent
+            anyway. The children of a closed parent roll up to nothing,
+            so this is for the deliberate case only.
         priority: Optional priority name (resolved case-insensitively
             against the workspace's configured priorities; discover
             names with list_priorities). Round-6 finding #6: same
@@ -1872,6 +1897,10 @@ def create_issue(title: str, body: str, type: str = "Task",
         "priority": None,
         "priority_requested": None,
         "raw": "",
+        # #92: uniform-key parity. Only the closed-parent refusal sets this
+        # True; every other bail leaves it False so a caller can branch on
+        # it unconditionally.
+        "blocked_closed_parent": False,
     }
     # v1.9.3 pattern-sweep finding #5: shape-drift parity. The blocked
     # / success / soft-warn paths all include `duplicate_check`; the
@@ -1943,6 +1972,7 @@ def create_issue(title: str, body: str, type: str = "Task",
                 "priority": None,
                 "priority_requested": None,
                 "raw": "",
+                "blocked_closed_parent": False,
                 "stderr": (
                     "Refused: a similar open issue already exists "
                     "(cosine similarity >= "
@@ -1961,6 +1991,8 @@ def create_issue(title: str, body: str, type: str = "Task",
         args.extend(["-l", labels])
     if parent and parent > 0:
         args.extend(["--parent", str(parent)])
+        if allow_closed_parent:
+            args.append("--allow-closed-parent")
     if priority:
         args.extend(["--priority", priority])
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
@@ -2005,6 +2037,11 @@ def create_issue(title: str, body: str, type: str = "Task",
             created.get("priority_requested") if created else None
         ),
         "raw": r["stdout_plain"],
+        # #92: the closed-parent guard runs in cmd_create's PRE-create block,
+        # so a refusal means no issue exists. That is unlike the duplicate
+        # block, which is also pre-create, and unlike a parent-wire failure,
+        # which leaves an orphaned issue behind (partial_applied).
+        "blocked_closed_parent": _blocked_closed_parent(_stderr_plain(r)),
         "stderr": _stderr_plain(r),
     }
     # v1.9.2 round-4 (PR #27) finding #9: always set duplicate_check
@@ -2452,7 +2489,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
                      confirm_create: bool = False,
                      skip_duplicate_check: bool = False,
                      related_issues: list[int] | None = None,
-                     priority: str = "") -> dict:
+                     priority: str = "",
+                     allow_closed_parent: bool = False) -> dict:
     """Shared `zh <noun> create --json` wrapper for the planning nouns.
 
     Forwards every meaningful create-time flag the bash side exposes:
@@ -2467,7 +2505,10 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         title: issue title.
         description: optional body / description.
         labels, pipeline, assignee, estimate: optional create-time flags.
-        parent: optional parent issue number (0 = none).
+        parent: optional parent issue number (0 = none). A CLOSED parent
+            is refused before the issue is created, so nothing is left
+            behind (`blocked_closed_parent=True`, `number=None`; #92).
+        allow_closed_parent: create and wire under a CLOSED parent anyway.
         repo_path: optional absolute path of a git checkout.
         confirm_create: pass True to bypass a duplicate-check block.
         skip_duplicate_check: pass True to skip the pre-flight entirely.
@@ -2509,6 +2550,7 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             "priority": None,
             "priority_requested": None,
             "raw": "",
+            "blocked_closed_parent": False,
             "stderr": "title must be non-empty",
             "duplicate_check": {"recommendation": "skipped", "matches": []},
         }
@@ -2589,6 +2631,7 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
                 "priority": None,
                 "priority_requested": None,
                 "raw": "",
+                "blocked_closed_parent": False,
                 "stderr": (
                     "Refused: a similar open issue already exists "
                     "(cosine similarity >= "
@@ -2612,6 +2655,8 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
         args.extend(["-e", estimate])
     if parent and parent > 0:
         args.extend(["--parent", str(parent)])
+        if allow_closed_parent:
+            args.append("--allow-closed-parent")
     # v1.9.9 (#61): forward --priority to the bash noun-create (which
     # already accepts it and delegates to cmd_create's post-create
     # priority step), mirroring create_issue. The --json output carries
@@ -2670,6 +2715,10 @@ def _planning_create(noun: str, title: str, description: str, labels: str,
             created.get("priority_requested") if created else None
         ),
         "raw": r["stdout_plain"],
+        # #92: mirrors create_issue. The guard is pre-create, so a refusal
+        # means no issue exists, distinct from parent_wire_failed above,
+        # which leaves the issue created but orphaned.
+        "blocked_closed_parent": _blocked_closed_parent(_stderr_plain(r)),
         "stderr": _stderr_plain(r),
     }
     # v1.9.2 round-4 (PR #27) finding #9: always set the key. When the
@@ -2759,6 +2808,15 @@ _OUTCOME_SENTINEL_RE = re.compile(
     r"^__ZH_OUTCOME__:([a-z][a-z_-]*)\s*$",
     re.MULTILINE,
 )
+# Companion sentinel for pre-flight REFUSALS, emitted by
+# `zh_closed_parent_guard` right before it errors out (#92). A refusal is a
+# plain exit 1, indistinguishable from every other bash failure, so the
+# wrappers need this to report `blocked_closed_parent` without matching on
+# prose that will eventually be reworded.
+_BLOCKED_SENTINEL_RE = re.compile(
+    r"^__ZH_BLOCKED__:([a-z][a-z_-]*)\s*$",
+    re.MULTILINE,
+)
 # Values the bash sentinel may carry. Validated in _parse_outcome_sentinel.
 _SENTINEL_OUTCOMES = frozenset({"ok", "noop", "partial", "fail"})
 # Public surface — every outcome string a caller may observe in the
@@ -2837,8 +2895,24 @@ def _parse_outcome_sentinel(stderr_plain: str) -> str | None:
     return None
 
 
+def _blocked_closed_parent(stderr_plain: str) -> bool:
+    """True when bash refused the op because the parent is CLOSED (#92).
+
+    Same line-anchoring and CR-normalization discipline as
+    `_parse_outcome_sentinel`, and for the same reason: `warn` lines above
+    the sentinel can echo user-controllable text (issue titles, raw
+    GraphQL error envelopes), so an unanchored substring search would let
+    a crafted payload fake a refusal.
+    """
+    if not stderr_plain:
+        return False
+    normalized = stderr_plain.replace("\r\n", "\n").replace("\r", "\n")
+    return "closed_parent" in _BLOCKED_SENTINEL_RE.findall(normalized)
+
+
 def _planning_add_children(noun: str, parent: int, children: list[int],
-                           repo_path: str) -> dict:
+                           repo_path: str,
+                           allow_closed_parent: bool = False) -> dict:
     if not children:
         # v1.9.2 round-1 (PR #27) finding #9: include `raw` for shape
         # parity with the success / partial paths.
@@ -2851,8 +2925,11 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
         # drift in the wrong direction.
         return {"ok": False, "stderr": "issue_numbers must be non-empty",
                 "parent": parent, "added": [], "added_requested": [],
-                "partial_applied": False, "outcome": "fail", "raw": ""}
+                "partial_applied": False, "outcome": "fail", "raw": "",
+                "blocked_closed_parent": False}
     args = [noun, "add", str(parent)] + [str(n) for n in children]
+    if allow_closed_parent:
+        args.append("--allow-closed-parent")
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     # v1.9.2 round-7 finding #10: cmd_subissue_add exits 2 on a
     # divergence-only partial (some children attached, others didn't).
@@ -2931,6 +3008,10 @@ def _planning_add_children(noun: str, parent: int, children: list[int],
         "parent": parent,
         "added": children if is_landed else [],
         "added_requested": children,
+        # #92: a closed-parent refusal is a pre-flight bail. Nothing was
+        # attempted, so `added` is empty and a verbatim retry will refuse
+        # again. Branch on this before treating ok=False as transient.
+        "blocked_closed_parent": _blocked_closed_parent(_stderr_plain(r)),
         "raw": r["stdout_plain"],
         # v1.9.3 pattern-sweep: ANSI-clean stderr. The pre-fix surfaced
         # the raw `stderr` field; MCP clients then had to strip escape
@@ -3065,7 +3146,8 @@ def epic_create(title: str, description: str = "", labels: str = "",
                 confirm_create: bool = False,
                 skip_duplicate_check: bool = False,
                 related_issues: list[int] | None = None,
-                priority: str = "") -> dict:
+                priority: str = "",
+                allow_closed_parent: bool = False) -> dict:
     """Create an Epic (an issue with issue-type Epic).
 
     v1.9.0: an epic is a normal issue typed Epic, with a normal issue
@@ -3104,9 +3186,14 @@ def epic_create(title: str, description: str = "", labels: str = "",
             confirmed value); priority_requested=<name> with priority=null
             means the mutation did not confirm (retry) — this does NOT
             flip partial_applied, which stays the parent-wire signal.
+        allow_closed_parent: create and wire under a CLOSED `parent`
+            anyway. A closed parent is otherwise refused BEFORE the
+            issue is created, so a refusal leaves nothing behind
+            (blocked_closed_parent=True, number=None; #92).
 
     Returns:
-        dict with: ok, partial_applied, number, epic_number (back-compat
+        dict with: ok, partial_applied, blocked_closed_parent, number,
+        epic_number (back-compat
         alias for number), url, type, pipeline, parent, estimate,
         estimate_requested, priority, priority_requested, raw, stderr,
         duplicate_check (when the pre-flight ran). v1.9.8: partial_applied
@@ -3125,6 +3212,7 @@ def epic_create(title: str, description: str = "", labels: str = "",
         skip_duplicate_check=skip_duplicate_check,
         related_issues=related_issues,
         priority=priority,
+        allow_closed_parent=allow_closed_parent,
     ))
 
 
@@ -3149,11 +3237,20 @@ def epic_update(epic_number: int, title: str = "", description: str = "",
 
 @mcp.tool()
 def epic_add_children(epic_number: int, issue_numbers: list[int],
-                      repo_path: str = "") -> dict:
+                      repo_path: str = "",
+                      allow_closed_parent: bool = False) -> dict:
     """Attach one or more issues as sub-issues of an epic (addSubIssues).
 
+    A CLOSED epic is REFUSED (`ok=False`, `blocked_closed_parent=True`,
+    nothing attached). Closing an epic does not detach its children, so
+    anything wired to a closed one drops out of every rollup while still
+    looking healthy on its own, and no listing surfaces it afterwards
+    (#92). Do not retry a refusal verbatim: pick an open parent, reopen
+    the epic, or pass `allow_closed_parent=True`.
+
     Returns: dict with ok, partial_applied, outcome, parent, epic_number
-    (back-compat alias for parent), added, added_requested, raw, stderr.
+    (back-compat alias for parent), added, added_requested,
+    blocked_closed_parent, raw, stderr.
 
     `outcome` is one of:
       - "ok"            — confirmed full success (sentinel observed)
@@ -3171,8 +3268,9 @@ def epic_add_children(epic_number: int, issue_numbers: list[int],
     callers consult subissue_list to verify in those states.
     `added_requested` is the input list, always.
 
-    The correct branching idiom (v1.9.4 round-3):
-        if r["partial_applied"]: re-verify via subissue_list
+    The correct branching idiom (v1.9.4 round-3, extended by #92):
+        if r["blocked_closed_parent"]: refused, nothing attached
+        elif r["partial_applied"]: re-verify via subissue_list
         elif r["outcome"] in ("noop", "ok_unverified"):
             already-attached or unverified → consult subissue_list
         elif r["ok"]: trust r["added"]
@@ -3180,6 +3278,7 @@ def epic_add_children(epic_number: int, issue_numbers: list[int],
     """
     return _with_epic_number_alias(_planning_add_children(
         "epic", epic_number, issue_numbers, repo_path,
+        allow_closed_parent=allow_closed_parent,
     ))
 
 
@@ -3247,7 +3346,8 @@ def initiative_create(title: str, description: str = "", labels: str = "",
                       confirm_create: bool = False,
                       skip_duplicate_check: bool = False,
                       related_issues: list[int] | None = None,
-                      priority: str = "") -> dict:
+                      priority: str = "",
+                      allow_closed_parent: bool = False) -> dict:
     """Create an Initiative (issue-type Initiative, level 1).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3261,7 +3361,12 @@ def initiative_create(title: str, description: str = "", labels: str = "",
     with the same three-state contract (priority_requested set + priority
     null = mutation did not confirm; partial_applied is unaffected).
 
-    Returns: dict with ok, partial_applied, number, url, type, pipeline,
+    A CLOSED `parent` is refused BEFORE the issue is created, so nothing
+    is left behind: `blocked_closed_parent=True`, `number=None`. Pass
+    `allow_closed_parent=True` only when that is deliberate (#92).
+
+    Returns: dict with ok, partial_applied, blocked_closed_parent, number,
+    url, type, pipeline,
     parent, estimate, estimate_requested, priority, priority_requested,
     raw, stderr, duplicate_check (when the pre-flight ran). v1.9.8:
     partial_applied is True when the issue was created but never wired
@@ -3277,7 +3382,8 @@ def initiative_create(title: str, description: str = "", labels: str = "",
                             confirm_create=confirm_create,
                             skip_duplicate_check=skip_duplicate_check,
                             related_issues=related_issues,
-                            priority=priority)
+                            priority=priority,
+                            allow_closed_parent=allow_closed_parent)
 
 
 @mcp.tool()
@@ -3305,18 +3411,21 @@ def initiative_update(number: int, title: str = "", description: str = "",
 
 @mcp.tool()
 def initiative_add_children(number: int, issue_numbers: list[int],
-                            repo_path: str = "") -> dict:
+                            repo_path: str = "",
+                            allow_closed_parent: bool = False) -> dict:
     """Attach issues (typically Projects/Epics) under an Initiative.
 
     Returns: dict with ok, partial_applied, outcome, parent, added,
-    added_requested, raw, stderr. Return shape and the
-    outcome / added / added_requested semantics mirror
-    `epic_add_children` exactly; see that docstring for the full
-    enumeration of `outcome` values (ok, noop, partial, fail,
-    ok_unverified) and the canonical branching idiom.
+    added_requested, blocked_closed_parent, raw, stderr. Return shape,
+    the outcome / added / added_requested semantics, and the
+    closed-parent refusal (#92) mirror `epic_add_children` exactly; see
+    that docstring for the full enumeration of `outcome` values (ok,
+    noop, partial, fail, ok_unverified) and the canonical branching
+    idiom.
     """
     return _planning_add_children("initiative", number, issue_numbers,
-                                  repo_path)
+                                  repo_path,
+                                  allow_closed_parent=allow_closed_parent)
 
 
 @mcp.tool()
@@ -3369,7 +3478,8 @@ def project_create(title: str, description: str = "", labels: str = "",
                    confirm_create: bool = False,
                    skip_duplicate_check: bool = False,
                    related_issues: list[int] | None = None,
-                   priority: str = "") -> dict:
+                   priority: str = "",
+                   allow_closed_parent: bool = False) -> dict:
     """Create a Project (issue-type Project, level 2).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3383,7 +3493,12 @@ def project_create(title: str, description: str = "", labels: str = "",
     with the same three-state contract (priority_requested set + priority
     null = mutation did not confirm; partial_applied is unaffected).
 
-    Returns: dict with ok, partial_applied, number, url, type, pipeline,
+    A CLOSED `parent` is refused BEFORE the issue is created, so nothing
+    is left behind: `blocked_closed_parent=True`, `number=None`. Pass
+    `allow_closed_parent=True` only when that is deliberate (#92).
+
+    Returns: dict with ok, partial_applied, blocked_closed_parent, number,
+    url, type, pipeline,
     parent, estimate, estimate_requested, priority, priority_requested,
     raw, stderr, duplicate_check (when the pre-flight ran). v1.9.8:
     partial_applied is True when the issue was created but never wired
@@ -3399,7 +3514,8 @@ def project_create(title: str, description: str = "", labels: str = "",
                             confirm_create=confirm_create,
                             skip_duplicate_check=skip_duplicate_check,
                             related_issues=related_issues,
-                            priority=priority)
+                            priority=priority,
+                            allow_closed_parent=allow_closed_parent)
 
 
 @mcp.tool()
@@ -3426,15 +3542,18 @@ def project_update(number: int, title: str = "", description: str = "",
 
 @mcp.tool()
 def project_add_children(number: int, issue_numbers: list[int],
-                         repo_path: str = "") -> dict:
+                         repo_path: str = "",
+                         allow_closed_parent: bool = False) -> dict:
     """Attach issues (typically Epics) under a Project.
 
     Returns: dict with ok, partial_applied, outcome, parent, added,
-    added_requested, raw, stderr. Shape and `outcome` / added
-    semantics mirror `epic_add_children`; see that docstring for the
-    full enumeration and branching idiom.
+    added_requested, blocked_closed_parent, raw, stderr. Shape,
+    `outcome` / added semantics, and the closed-parent refusal (#92)
+    mirror `epic_add_children`; see that docstring for the full
+    enumeration and branching idiom.
     """
-    return _planning_add_children("project", number, issue_numbers, repo_path)
+    return _planning_add_children("project", number, issue_numbers, repo_path,
+                                  allow_closed_parent=allow_closed_parent)
 
 
 @mcp.tool()
@@ -3487,7 +3606,8 @@ def subtask_create(title: str, description: str = "", labels: str = "",
                    confirm_create: bool = False,
                    skip_duplicate_check: bool = False,
                    related_issues: list[int] | None = None,
-                   priority: str = "") -> dict:
+                   priority: str = "",
+                   allow_closed_parent: bool = False) -> dict:
     """Create a Sub-task (issue-type Sub-task, level 5).
 
     v1.9.1 item #5: runs the same duplicate-check pre-flight as
@@ -3501,7 +3621,12 @@ def subtask_create(title: str, description: str = "", labels: str = "",
     with the same three-state contract (priority_requested set + priority
     null = mutation did not confirm; partial_applied is unaffected).
 
-    Returns: dict with ok, partial_applied, number, url, type, pipeline,
+    A CLOSED `parent` is refused BEFORE the issue is created, so nothing
+    is left behind: `blocked_closed_parent=True`, `number=None`. Pass
+    `allow_closed_parent=True` only when that is deliberate (#92).
+
+    Returns: dict with ok, partial_applied, blocked_closed_parent, number,
+    url, type, pipeline,
     parent, estimate, estimate_requested, priority, priority_requested,
     raw, stderr, duplicate_check (when the pre-flight ran). v1.9.8:
     partial_applied is True when the issue was created but never wired
@@ -3517,7 +3642,8 @@ def subtask_create(title: str, description: str = "", labels: str = "",
                             confirm_create=confirm_create,
                             skip_duplicate_check=skip_duplicate_check,
                             related_issues=related_issues,
-                            priority=priority)
+                            priority=priority,
+                            allow_closed_parent=allow_closed_parent)
 
 
 @mcp.tool()
@@ -3547,15 +3673,18 @@ def subtask_update(number: int, title: str = "", description: str = "",
 
 @mcp.tool()
 def subtask_add_children(number: int, issue_numbers: list[int],
-                         repo_path: str = "") -> dict:
+                         repo_path: str = "",
+                         allow_closed_parent: bool = False) -> dict:
     """Attach further sub-issues under a Sub-task.
 
     Returns: dict with ok, partial_applied, outcome, parent, added,
-    added_requested, raw, stderr. Shape and `outcome` / added
-    semantics mirror `epic_add_children`; see that docstring for the
-    full enumeration and branching idiom.
+    added_requested, blocked_closed_parent, raw, stderr. Shape,
+    `outcome` / added semantics, and the closed-parent refusal (#92)
+    mirror `epic_add_children`; see that docstring for the full
+    enumeration and branching idiom.
     """
-    return _planning_add_children("subtask", number, issue_numbers, repo_path)
+    return _planning_add_children("subtask", number, issue_numbers, repo_path,
+                                  allow_closed_parent=allow_closed_parent)
 
 
 @mcp.tool()
@@ -3706,7 +3835,8 @@ def subissue_list(parent_number: int, repo_path: str = "") -> dict:
 
 @mcp.tool()
 def subissue_add_children(parent_number: int, child_numbers: list[int],
-                          repo_path: str = "") -> dict:
+                          repo_path: str = "",
+                          allow_closed_parent: bool = False) -> dict:
     """Add one or more issues as sub-issues of a parent.
 
     Calls ZenHub's `addSubIssues` mutation directly. The API's
@@ -3724,10 +3854,21 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
     already-linked: agents that care about side effects (e.g. announcing
     "linked N children") should check `outcome == "ok"`, not just `ok`.
 
+    A CLOSED parent is REFUSED (`ok=False`, `blocked_closed_parent=True`,
+    nothing mutated). Closing a parent does not detach its children, so an
+    issue attached to a closed one drops out of every container-level
+    rollup while still looking healthy on its own, and no listing surfaces
+    it afterwards (#92). Do not retry a `blocked_closed_parent` verbatim:
+    either pick an open parent, reopen the parent, or pass
+    `allow_closed_parent=True` if the attach really is intended.
+
     Args:
         parent_number: Issue number of the parent.
         child_numbers: List of issue numbers to link (single API call).
         repo_path: Optional absolute path of a git checkout.
+        allow_closed_parent: attach even when the parent is CLOSED. The
+            response then carries `closed_parent_warning` instead of
+            blocking.
 
     Returns:
         dict with:
@@ -3756,6 +3897,15 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
                 portable code that switches between subissue_* and the
                 planning-noun children wrappers; parent_number stays
                 for back-compat.
+            parent_state: str|None — "OPEN"/"CLOSED" when the parent
+                resolved, None when it did not (parent-not-found, or a
+                pre-flight bail before the lookup).
+            blocked_closed_parent: bool — true only on the closed-parent
+                refusal, which distinguishes "we declined to attach"
+                from every other ok=False. Nothing was mutated.
+            closed_parent_warning: str|None — set instead of blocking
+                when allow_closed_parent=True carried the attach through
+                against a closed parent.
             outcome: "ok" | "partial" | "fail" | "noop"
             success_count: int — API-reported successCount
             failed_count: int — API-reported failedIssues length
@@ -3817,6 +3967,9 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
             "failed_unknown_count": 0,
             "github_errors": None,
             "partial_success_warning": None,
+            "parent_state": None,
+            "blocked_closed_parent": False,
+            "closed_parent_warning": None,
             "stderr": "child_numbers must be non-empty",
         }
     ctx, err = _resolve_ctx(repo_path)
@@ -3827,17 +3980,26 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
                 "succeeded": [], "failed": [], "unaccounted": [],
                 "failed_unknown_count": 0,
                 "github_errors": None,
-                "partial_success_warning": None}
+                "partial_success_warning": None,
+                "parent_state": None,
+                "blocked_closed_parent": False,
+                "closed_parent_warning": None}
     from zh_graphql_ops import add_sub_issues  # noqa: PLC0415
     from zh_api import ZhApiError  # noqa: PLC0415
     try:
-        result = add_sub_issues(ctx, parent_number, list(child_numbers))
+        result = add_sub_issues(
+            ctx, parent_number, list(child_numbers),
+            allow_closed_parent=allow_closed_parent,
+        )
     except ZhApiError as e:
         return {
             "ok": False,
             "partial_applied": False,
             "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
             "parent_number": parent_number,
+            "parent_state": None,
+            "blocked_closed_parent": False,
+            "closed_parent_warning": None,
             "outcome": "fail",
             "success_count": 0,
             "failed_count": 0,
@@ -3863,6 +4025,9 @@ def subissue_add_children(parent_number: int, child_numbers: list[int],
         "partial_applied": partial_applied,
         "parent": parent_number,  # v1.9.2 round-4 #2 alias for parent_number
         "parent_number": parent_number,
+        "parent_state": result.get("parent_state"),
+        "blocked_closed_parent": bool(result.get("blocked_closed_parent")),
+        "closed_parent_warning": result.get("closed_parent_warning"),
         "outcome": outcome,
         "success_count": result.get("success_count", 0),
         "failed_count": result.get("failed_count", 0),
