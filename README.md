@@ -583,7 +583,6 @@ It also reports the **connection state** — whether ZenHub is actually receivin
 ```
 
 This matters because a repo that was **never added as a source** is indistinguishable from a healthy one on read: the board renders, counts look plausible, and every state change made on GitHub is silently discarded. It is also the check that fires *first* — a repo can pass the mirror cross-check (no drift yet) and still be disconnected, so this catches the break before the board starts lying. `connection.state` is `connected`, `not_registered`, or `unknown`; reading webhooks needs repo admin, and a 403 reports `unknown`, never healthy.
-```
 
 It reports open issues whose parent is CLOSED (with the `zh reparent` command to fix them) and any parent cycles.
 

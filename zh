@@ -6563,10 +6563,9 @@ zh_connection_check() {
         return 0
     fi
 
-    local healthy rejected pending total
+    local healthy rejected total
     healthy=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code != null and .code >= 200 and .code < 300)] | length')
     rejected=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code != null and (.code < 200 or .code >= 300))] | length')
-    pending=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code == null)] | length')
     total=$(printf '%s' "$zh_hooks" | jq 'length')
 
     local state reason
