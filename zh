@@ -2779,7 +2779,12 @@ Examples:
         if [[ -n "$comment" ]]; then
             echo -e "  Comment: ${comment}"
         fi
-        echo -e "  ${CYAN}Note:${NC} Issue moved to Closed pipeline in ZenHub"
+        # Do not assert a ZenHub-side effect we never verified. The close goes
+        # to GitHub; ZenHub learns about it only when it receives the webhook,
+        # and against an unregistered repo that never happens — this line read
+        # "moved to Closed pipeline in ZenHub" while the issue sat OPEN on the
+        # board (#99). State the dependency instead of the outcome.
+        echo -e "  ${CYAN}Note:${NC} ZenHub moves it to Closed when it syncs this change ('zh doctor' checks the connection)"
     else
         error "Failed to close issue #${issue_num}"
     fi
@@ -6513,6 +6518,74 @@ zh_doctor_fetch_issues() {
 # Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale, so the
 # answer cannot be trusted either way). A CI gate that treats any non-zero as
 # failure therefore gates on inconclusive too, which is the intent.
+# Classify the ZenHub<->GitHub CONNECTION for a repo, so a stale board can name
+# its own cause instead of leaving the operator to guess.
+#
+# A repo that was never registered with ZenHub and one whose authorization
+# lapsed present IDENTICALLY through the API: reads succeed, the board renders,
+# counts look plausible, and every state change made on GitHub is silently
+# discarded. The one signal that separates them is whether GitHub can actually
+# deliver events to ZenHub, which is visible on the repo's webhooks:
+#
+#   * a hook whose last delivery was 2xx  -> ZenHub is registered and receiving
+#   * hooks that all return non-2xx (422) -> ZenHub rejects them; the repo was
+#                                            never added as a source (or was
+#                                            removed), so the board is frozen
+#   * no ZenHub hook at all               -> never connected
+#
+# Hook AGE says nothing (a Feb hook was healthy while a May hook was dead), so
+# this judges `last_response` only.
+#
+# Reading webhooks needs admin on the repo; a non-admin gets 403. That reports
+# `unknown`, NEVER `connected` — the v2.1.0 rule that this check must not claim
+# a health it cannot verify applies here too.
+#
+# Echoes JSON: {checked, state, reason, healthy, rejected, hooks}
+#   state: "connected" | "not_registered" | "unknown"
+zh_connection_check() {
+    local owner_repo="$1"
+
+    local raw="" zh_hooks=""
+    raw=$(gh api "repos/${owner_repo}/hooks" 2>/dev/null) || raw=""
+    if [[ -n "$raw" ]]; then
+        zh_hooks=$(printf '%s' "$raw" | jq -c '
+            [ .[]? | select((.config.url // "") | test("zenhub"; "i"))
+              | {id, created: (.created_at // "")[0:10],
+                 code: (.last_response.code // null),
+                 status: (.last_response.status // "")} ]' 2>/dev/null) || zh_hooks=""
+    fi
+
+    # Could not read the hook list at all (no gh, no admin, network) -> unknown.
+    if [[ -z "$zh_hooks" ]]; then
+        jq -n '{checked: false, state: "unknown",
+                reason: "could not read repository webhooks (needs admin on the repo)",
+                healthy: 0, rejected: 0, hooks: []}'
+        return 0
+    fi
+
+    local healthy rejected total
+    healthy=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code != null and .code >= 200 and .code < 300)] | length')
+    rejected=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code != null and (.code < 200 or .code >= 300))] | length')
+    total=$(printf '%s' "$zh_hooks" | jq 'length')
+
+    local state reason
+    if [[ "$healthy" -gt 0 ]]; then
+        state="connected"; reason="ZenHub is receiving GitHub events"
+    elif [[ "$total" -eq 0 ]]; then
+        state="not_registered"; reason="no ZenHub webhook on this repository"
+    elif [[ "$rejected" -gt 0 ]]; then
+        state="not_registered"; reason="ZenHub rejects this repository's GitHub events (no webhook delivering successfully)"
+    else
+        # Hooks exist but none has delivered yet — genuinely unknown, not broken.
+        state="unknown"; reason="ZenHub webhook present but has not delivered yet"
+    fi
+
+    jq -n --arg state "$state" --arg reason "$reason" \
+        --argjson healthy "$healthy" --argjson rejected "$rejected" --argjson hooks "$zh_hooks" \
+        '{checked: true, state: $state, reason: $reason,
+          healthy: $healthy, rejected: $rejected, hooks: $hooks}'
+}
+
 cmd_doctor() {
     load_config
 
@@ -6547,6 +6620,13 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
     # info() writes to stdout, so it would corrupt --json. warn() already goes
     # to stderr, so pagination warnings are safe to leave on either path.
     [[ "$as_json" != "true" ]] && info "Checking hierarchy health..."
+
+    # Connection state first: when the board turns out to be stale, this is what
+    # tells the operator WHY, so the stale finding can name a cause instead of
+    # guessing at re-authorization (#99).
+    local connection connection_state
+    connection=$(zh_connection_check "$owner_repo")
+    connection_state=$(echo "$connection" | jq -r '.state')
 
     local data
     data=$(zh_doctor_fetch_issues "$workspace_id")
@@ -6674,12 +6754,14 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
             --argjson covered "$verify_covered" \
             --argjson truncated "$verify_truncated" \
             --argjson conclusive "$conclusive" \
+            --argjson connection "$connection" \
             --arg outcome "$outcome" \
             '{checked: $checked, open: $open, complete: $complete,
               closed_parent_orphans: $orphans, parent_cycles: $cycles,
               ok: (($orphans|length) == 0 and ($cycles|length) == 0),
               outcome: $outcome,
               conclusive: $conclusive,
+              connection: $connection,
               mirror_check: {
                 attempted: $attempted,
                 covered: $covered,
@@ -6717,6 +6799,23 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
         echo -e "  ${GREEN}✓${NC} No parent cycles"
     fi
 
+    # Connection state: reported always, because "the board is fine" and "the
+    # board cannot receive updates" are different facts and the second one is
+    # invisible until something is already wrong.
+    case "$connection_state" in
+        connected)
+            echo -e "  ${GREEN}✓${NC} ZenHub is receiving GitHub events for ${owner_repo}"
+            ;;
+        not_registered)
+            echo -e "  ${RED}✗${NC} ZenHub is NOT receiving GitHub events for ${owner_repo}"
+            echo -e "      $(echo "$connection" | jq -r '.reason')."
+            echo -e "      Board state will not update. Add it as a source in ZenHub -> Manage Repositories."
+            ;;
+        *)
+            echo -e "  ${YELLOW}?${NC} Connection state unknown — $(echo "$connection" | jq -r '.reason')"
+            ;;
+    esac
+
     # Report what the conclusions above are actually worth.
     if [[ "$mirror_stale" == "true" ]]; then
         echo ""
@@ -6724,9 +6823,32 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
         echo "$disagreements" | jq -r '.[] | "      #\(.number) \(.title)"' | head -10
         [[ "$disagreement_count" -gt 10 ]] && echo "      ... and $((disagreement_count - 10)) more"
         echo ""
-        echo -e "      The ZenHub<->GitHub sync for this workspace has lapsed, so the"
-        echo -e "      checks above were computed from wrong data. Re-authorize GitHub at"
-        echo -e "      ${BOLD}https://app.zenhub.com${NC} (Settings -> Integrations), then re-run."
+        echo -e "      The checks above were computed from wrong data."
+        # Name the cause instead of assuming expiry. A repo that was never
+        # registered and one whose auth lapsed look identical from the API, and
+        # sending an operator to "re-authorize" when the repo simply was never
+        # added as a source costs an hour of dead-end debugging (#99).
+        case "$connection_state" in
+            not_registered)
+                echo -e "      ${BOLD}Cause:${NC} $(echo "$connection" | jq -r '.reason')."
+                echo -e "      GitHub cannot deliver events to ZenHub for this repository, so"
+                echo -e "      nothing you do on GitHub reaches the board."
+                echo -e "      Fix: add ${BOLD}${owner_repo}${NC} as a source in ZenHub ->"
+                echo -e "      workspace -> ${BOLD}Manage Repositories${NC}, then re-run."
+                ;;
+            connected)
+                echo -e "      ZenHub IS receiving GitHub events for this repository, so this"
+                echo -e "      is most likely a sync lag rather than a broken connection."
+                echo -e "      Re-run in a moment; if it persists, re-authorize GitHub at"
+                echo -e "      ${BOLD}https://app.zenhub.com${NC} (Settings -> Integrations)."
+                ;;
+            *)
+                echo -e "      Could not determine the connection state ($(echo "$connection" | jq -r '.reason'))."
+                echo -e "      Check that ${BOLD}${owner_repo}${NC} is added as a source in ZenHub ->"
+                echo -e "      Manage Repositories, and that GitHub authorization is current at"
+                echo -e "      ${BOLD}https://app.zenhub.com${NC}."
+                ;;
+        esac
     elif [[ "$verify_covered" == "true" ]]; then
         echo -e "  ${GREEN}✓${NC} ZenHub's issue states agree with GitHub (${verified_count} verified)"
     elif [[ "$skip_verify" == "true" ]]; then
