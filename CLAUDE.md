@@ -28,7 +28,10 @@ zh users                # List assignable users
 zh board                # Board overview
 zh count                # EXACT issue counts per pipeline (never a truncated page)
 zh count "Backlog" -q   # Bare exact number for one pipeline (scripting)
-zh doctor               # Hierarchy health: open issues under a CLOSED parent, parent cycles
+zh doctor               # Hierarchy health + CONNECTION state: open issues under a CLOSED
+                        # parent, parent cycles, and whether ZenHub is actually receiving
+                        # GitHub events for this repo (a repo never added as a source looks
+                        # identical to healthy on read, but silently discards every change)
                         # 0 healthy or unverified / 1 findings / 2 inconclusive (states stale vs GitHub)
                         # --json: read `conclusive` before `ok`; trust mirror_check.covered, not .attempted
 zh doctor --no-verify   # Skip the GitHub cross-check (faster, proves less)
