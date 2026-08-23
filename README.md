@@ -598,7 +598,7 @@ Each now cross-checks with one asymmetric comparison: **ZenHub cannot hold more 
     Run zh doctor for the connection state.
 ```
 
-ZenHub reporting *fewer* is normal and stays silent (plenty of issues are never added to a board). The comparison covers every repository in the workspace, so it is sound on multi-repo workspaces, and costs one extra GitHub call regardless of how many repos that is. `--no-verify` skips it.
+ZenHub reporting *fewer* is normal and stays silent (plenty of issues are never added to a board). The comparison covers every repository in the workspace, so it is sound on multi-repo workspaces. GitHub caps a search query at 256 characters, so the repositories are batched across as few requests as fit (one for a small workspace, a handful for a large one) and the per-batch totals summed. If any batch fails the whole check reports *not checked* rather than a partial sum, since an understated GitHub total would manufacture a false disagreement. `--no-verify` skips it.
 
 For `count --json` the change is additive: `exact` keeps its meaning (not a truncated page), and new `trustworthy` / `mirror_check` keys carry the verdict. **Read `trustworthy` before `total`** — `false` means the mirror disagrees with GitHub, and `null` means the check could not run, which is not the same as agreement.
 

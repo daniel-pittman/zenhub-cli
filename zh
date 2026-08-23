@@ -1756,7 +1756,7 @@ zh_count_plausibility_check() {
     local repo_vars repo_resp repo_list
     repo_vars=$(jq -n --arg w "$workspace_id" '{workspaceId: $w}')
     repo_resp=$(zh_graphql "$repo_query" "$repo_vars" 2>/dev/null) || repo_resp=""
-    repo_list=$(printf '%s' "$repo_resp" | jq -r '[.data.workspace.repositoriesConnection.nodes[]? | "\(.ownerName)/\(.name)"] | .[]' 2>/dev/null)
+    repo_list=$(printf '%s' "$repo_resp" | jq -r '[.data.workspace.repositoriesConnection.nodes[]? | "\(.ownerName)/\(.name)"] | .[]' 2>/dev/null) || repo_list=""
 
     if [[ -z "$repo_list" ]]; then
         jq -n --argjson zh "$zenhub_open" \
@@ -1766,18 +1766,34 @@ zh_count_plausibility_check() {
         return 0
     fi
 
-    local repo_count qualifiers r
+    local repo_count r
     repo_count=$(printf '%s\n' "$repo_list" | grep -c .)
-    qualifiers=""
-    while IFS= read -r r; do
-        [[ -n "$r" ]] && qualifiers="${qualifiers}+repo:${r}"
-    done <<< "$repo_list"
 
-    # One search across every workspace repo. total_count is a server-side
-    # count, not a page length — the distinction #86 exists to enforce.
-    local github_open
-    github_open=$(gh api "search/issues?q=is:issue+is:open${qualifiers}&per_page=1" \
-        --jq '.total_count' 2>/dev/null) || github_open=""
+    # GitHub's search API caps the query string at 256 characters, and each
+    # `+repo:owner/name` costs ~26 of them — so a workspace past roughly ten
+    # repositories overflows, GitHub answers 422, and the check would silently
+    # stop verifying. Batch the repositories instead and sum the per-batch
+    # totals: the batches are disjoint sets of repositories, so the sum is
+    # exact. total_count is a server-side count, not a page length (#86).
+    local github_open=0 batch="" batch_total="" failed=false
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        # Flush before exceeding the cap (200 leaves headroom for the prefix
+        # and any URL-encoding expansion).
+        if [[ ${#batch} -gt 0 ]] && [[ $(( ${#batch} + ${#r} + 6 )) -gt 200 ]]; then
+            batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+            [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
+            batch=""
+        fi
+        batch="${batch}+repo:${r}"
+    done <<< "$repo_list"
+    if [[ -n "$batch" ]]; then
+        batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+        [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
+    fi
+    # A partial sum would understate GitHub's side and manufacture a false
+    # "ZenHub has more" verdict, so any failed batch invalidates the whole check.
+    [[ "$failed" == "true" ]] && github_open=""
 
     if ! [[ "$github_open" =~ ^[0-9]+$ ]]; then
         jq -n --argjson zh "$zenhub_open" --argjson n "$repo_count" \
@@ -1790,7 +1806,7 @@ zh_count_plausibility_check() {
     local plausible reason
     if [[ "$zenhub_open" -gt "$github_open" ]]; then
         plausible=false
-        reason="ZenHub reports more open issues (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — the board cannot hold more open issues than its repositories contain"
+        reason="ZenHub reports more open issues (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — a board cannot hold more open issues than its repositories contain, unless the board has ZenHub-only cards or this GitHub token cannot see every repository"
     else
         plausible=true
         reason="ZenHub's open count does not exceed GitHub's"
