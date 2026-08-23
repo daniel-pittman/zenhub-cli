@@ -1819,7 +1819,6 @@ cmd_board() {
 # count, not the length of whatever page we happened to fetch — so it cannot be
 # a truncated page presented as a total.
 cmd_count() {
-    load_config
 
     local pipeline_name=""
     local include_closed=false
@@ -1849,6 +1848,10 @@ Examples:
                 ;;
         esac
     done
+
+    # load_config runs after argument parsing so `--help` and usage errors work
+    # without credentials (see cmd_create).
+    load_config
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -2935,8 +2938,12 @@ GitHub issue behind it must be removed in the ZenHub web UI.)"
 }
 
 cmd_create() {
-    load_config
-
+    # load_config runs AFTER argument parsing, not before. It aborts when no
+    # ZH_TOKEN is configured, so calling it first made every usage/typo message
+    # unreachable without credentials: `zh create --titel x` reported "ZH_TOKEN
+    # not set" instead of naming the bad flag, and the argument guards could not
+    # be exercised in CI at all. Telling an operator they mistyped a flag does
+    # not require auth; the first call that genuinely needs config is below.
     local title=""
     local body=""
     local body_file=""
@@ -3158,6 +3165,8 @@ Examples:
   zh create \"Research OAuth options\" -t Task -p \"Product Backlog\"
   zh create \"Auth service\" -t Epic --json"
     fi
+
+    load_config
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -6647,7 +6656,6 @@ zh_connection_check() {
 }
 
 cmd_doctor() {
-    load_config
 
     local as_json=false
     local skip_verify=false
@@ -6672,6 +6680,10 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
             *) shift ;;
         esac
     done
+
+    # load_config runs after argument parsing so `--help` and usage errors work
+    # without credentials (see cmd_create).
+    load_config
 
     local owner_repo workspace_id
     owner_repo=$(get_repo_info)
@@ -7218,7 +7230,6 @@ zh_closed_parent_guard() {
 # check (#85). This does the detach-then-attach itself: the caller says where
 # the children should end up, not where they currently are.
 cmd_reparent() {
-    load_config
 
     local new_parent=""
     local dry_run=false
@@ -7274,6 +7285,10 @@ Example: zh reparent 586 60 72 73"
         done
         [[ "$dup" == "false" ]] && uniq_children+=("$n")
     done
+
+    # load_config runs after argument parsing so `--help` and usage errors work
+    # without credentials (see cmd_create).
+    load_config
 
     local owner_repo repo_id
     owner_repo=$(get_repo_info)
