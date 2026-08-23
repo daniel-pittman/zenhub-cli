@@ -149,7 +149,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `issue <number>` | `i`, `show` | View issue details |
 | `mine [user]` | `my` | List issues assigned to you (or specified user) |
 | `board [--all]` | `b`, `overview` | Show board overview with issue counts |
-| `count [pipeline] [--all] [-q] [--json]` | `n` | **Exact** issue counts (from the API's own totalCount — never a truncated page) |
+| `count [pipeline] [--all] [-q] [--json] [--no-verify]` | `n` | **Exact** issue counts (from the API's own totalCount — never a truncated page), cross-checked against GitHub |
 | `doctor [--json] [--no-verify]` | `check`, `health` | Hierarchy health check: open issues under a CLOSED parent, parent cycles. Cross-checks ZenHub's states against GitHub. Exits 0 healthy / 1 findings / 2 inconclusive |
 | `pipeline <name> [--all]` | `pipe`, `col` | List issues in a specific pipeline |
 | `pipelines [repo]` | `pipes`, `p` | List pipeline names for a workspace |
@@ -585,6 +585,22 @@ It also reports the **connection state** — whether ZenHub is actually receivin
 This matters because a repo that was **never added as a source** is indistinguishable from a healthy one on read: the board renders, counts look plausible, and every state change made on GitHub is silently discarded. It is also the check that fires *first* — a repo can pass the mirror cross-check (no drift yet) and still be disconnected, so this catches the break before the board starts lying. `connection.state` is `connected`, `not_registered`, or `unknown`; reading webhooks needs repo admin, and a 403 reports `unknown`, never healthy.
 
 It reports open issues whose parent is CLOSED (with the `zh reparent` command to fix them) and any parent cycles.
+
+### Counts are checked against GitHub
+
+`board`, `count`, and `pipeline` read ZenHub's **mirror** of GitHub issue state. When a workspace's sync lapses the mirror keeps serving stale values, so these commands return a plausible-looking number rather than an error — and nobody double-checks "24 open issues", because it reads as data rather than as a claim.
+
+Each now cross-checks with one asymmetric comparison: **ZenHub cannot hold more open issues than its repositories contain.**
+
+```
+  ✗ These counts do NOT agree with GitHub — ZenHub reports more open issues (240)
+    than GitHub has (229) across the same 4 repositories.
+    Run zh doctor for the connection state.
+```
+
+ZenHub reporting *fewer* is normal and stays silent (plenty of issues are never added to a board). The comparison covers every repository in the workspace, so it is sound on multi-repo workspaces, and costs one extra GitHub call regardless of how many repos that is. `--no-verify` skips it.
+
+For `count --json` the change is additive: `exact` keeps its meaning (not a truncated page), and new `trustworthy` / `mirror_check` keys carry the verdict. **Read `trustworthy` before `total`** — `false` means the mirror disagrees with GitHub, and `null` means the check could not run, which is not the same as agreement.
 
 #### It will not report a health it cannot verify
 
