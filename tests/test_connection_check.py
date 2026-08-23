@@ -192,3 +192,86 @@ def test_doctor_reports_unknown_connection_without_claiming_health():
     out = r.stdout + r.stderr
     assert "Connection state unknown" in out
     assert "is receiving GitHub events" not in out
+
+
+# --- #105: last_response ages out on quiet repos ----------------------------
+# GitHub CLEARS last_response when a hook has had no recent deliveries, so a
+# healthy connection reports {"code": null, "status": "unused"}. Classifying on
+# that alone flipped 7 of 16 healthy repos to `unknown` overnight. The delivery
+# history survives longer, so consult it before giving up.
+
+AGED_OUT = json.dumps([
+    {"id": 7, "created_at": "2026-05-21T00:00:00Z",
+     "config": {"url": "https://webhook.zenhub.com/webhook/github/v2"},
+     "last_response": {"code": None, "status": "unused"}},
+])
+
+
+def _gh_stub_with_deliveries(hooks: str, delivery_code) -> str:
+    """gh stub whose hooks have a null last_response but a delivery history."""
+    # gh is invoked with `--jq '.[0].status_code // empty'`, so emulate the
+    # EXTRACTED value the real command prints, not the raw array.
+    deliveries = "" if delivery_code is None else str(delivery_code)
+    return f"""
+        gh() {{
+            if [[ "$*" == *deliveries* ]]; then
+                cat <<'JSON'
+{deliveries}
+JSON
+                return 0
+            fi
+            if [[ "$*" == *hooks* ]]; then
+                cat <<'JSON'
+{hooks}
+JSON
+                return 0
+            fi
+            return 0
+        }}
+    """
+
+
+def test_aged_out_last_response_recovered_from_deliveries():
+    """A quiet-but-healthy repo must be reported connected once the delivery
+    history proves it, instead of a noisy `unknown`."""
+    r = run_zh_with_stubs(_gh_stub_with_deliveries(AGED_OUT, 202),
+                          "zh_connection_check acme/widgets")
+    out = json.loads(r.stdout)
+    assert out["state"] == "connected", out
+    assert out["healthy"] == 1
+
+
+def test_aged_out_with_rejected_delivery_is_still_not_registered():
+    """The fallback must not whitewash a real rejection."""
+    r = run_zh_with_stubs(_gh_stub_with_deliveries(AGED_OUT, 422),
+                          "zh_connection_check acme/widgets")
+    out = json.loads(r.stdout)
+    assert out["state"] == "not_registered"
+    assert out["rejected"] == 1
+
+
+def test_no_delivery_history_reports_unverified_not_broken():
+    """Genuinely quiet repo: no last_response AND no deliveries. Honest answer
+    is `unknown` — never `connected` — but it must read as normal, not as a
+    fault, or the line fires constantly and gets tuned out."""
+    r = run_zh_with_stubs(_gh_stub_with_deliveries(AGED_OUT, None),
+                          "zh_connection_check acme/widgets")
+    out = json.loads(r.stdout)
+    assert out["state"] == "unknown"
+    assert out["checked"] is True, "we DID read the hooks — distinct from the 403 case"
+    assert out["unproven"] == 1
+    assert "quiet repository" in out["reason"]
+
+
+def test_two_unknowns_are_distinguishable():
+    """`could not read the webhooks` (needs admin) and `installed but quiet`
+    are different situations and must be tellable apart by a caller."""
+    unreadable = run_zh_with_stubs(
+        'gh() { if [[ "$*" == *hooks* ]]; then return 1; fi; return 0; }',
+        "zh_connection_check acme/widgets")
+    quiet = run_zh_with_stubs(_gh_stub_with_deliveries(AGED_OUT, None),
+                              "zh_connection_check acme/widgets")
+    a, b = json.loads(unreadable.stdout), json.loads(quiet.stdout)
+    assert a["state"] == b["state"] == "unknown"
+    assert a["checked"] is False and b["checked"] is True
+    assert a["reason"] != b["reason"]

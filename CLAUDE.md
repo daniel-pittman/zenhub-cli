@@ -55,6 +55,9 @@ zh create "Title" -t Bug --priority "High"    # Set a workspace priority at crea
 zh create "Title" -t Epic --json              # Machine-readable JSON on stdout (batch callers)
 zh create "Title" -t Feature --parent 42 -q   # Nest under #42; emit only the new number
 zh type <issue> <name>                        # Change an existing issue's type
+# `zh <anything> --help` prints usage instead of being captured as a positional
+# (it used to become the issue TITLE). A flag-shaped title needs `--`:
+zh create -- "--experimental: literal dash title"
 
 # Dependencies
 zh block <blocked> <blocker>  # Set dependency
