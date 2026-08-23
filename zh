@@ -1819,7 +1819,6 @@ cmd_board() {
 # count, not the length of whatever page we happened to fetch — so it cannot be
 # a truncated page presented as a total.
 cmd_count() {
-    load_config
 
     local pipeline_name=""
     local include_closed=false
@@ -1849,6 +1848,10 @@ Examples:
                 ;;
         esac
     done
+
+    # load_config runs after argument parsing so `--help` and usage errors work
+    # without credentials (see cmd_create).
+    load_config
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -2935,8 +2938,12 @@ GitHub issue behind it must be removed in the ZenHub web UI.)"
 }
 
 cmd_create() {
-    load_config
-
+    # load_config runs AFTER argument parsing, not before. It aborts when no
+    # ZH_TOKEN is configured, so calling it first made every usage/typo message
+    # unreachable without credentials: `zh create --titel x` reported "ZH_TOKEN
+    # not set" instead of naming the bad flag, and the argument guards could not
+    # be exercised in CI at all. Telling an operator they mistyped a flag does
+    # not require auth; the first call that genuinely needs config is below.
     local title=""
     local body=""
     local body_file=""
@@ -3078,7 +3085,44 @@ cmd_create() {
                 body=$(cat)
                 shift
                 ;;
+            --)
+                # End of options: everything after this is positional, flag
+                # sigils included. This is the escape hatch that keeps a
+                # genuinely flag-shaped title reachable (`zh create -- --help`)
+                # now that bare flag-like positionals are refused below.
+                shift
+                while [[ $# -gt 0 ]]; do
+                    if [[ -z "$title" ]]; then
+                        title="$1"
+                    fi
+                    shift
+                done
+                ;;
             *)
+                # Refuse any flag-shaped positional. Unrecognized options used
+                # to fall through here and be either silently adopted as the
+                # TITLE (a help attempt or a typo like `--titel` created a real,
+                # wrongly-named issue someone then had to hunt down and close,
+                # #102) or, once the title was already bound, silently
+                # DISCARDED — so `zh create "t" --dry-run` looked like it had
+                # honored a flag that does not exist. Both are the same defect:
+                # accepting an argument we do not understand and proceeding
+                # anyway. `--` remains the escape hatch for a title that
+                # genuinely starts with a dash.
+                if [[ "$1" == -* ]] && [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+                    if [[ -z "$title" ]]; then
+                        error "Unrecognized option: $1
+
+If you meant this as the issue TITLE, pass it after -- :
+  zh create -- '$1'
+
+Run 'zh help' for the full option list."
+                    else
+                        error "Unrecognized option: $1
+
+It was ignored rather than applied. Run 'zh help' for the option list."
+                    fi
+                fi
                 if [[ -z "$title" ]]; then
                     title="$1"
                 fi
@@ -3121,6 +3165,8 @@ Examples:
   zh create \"Research OAuth options\" -t Task -p \"Product Backlog\"
   zh create \"Auth service\" -t Epic --json"
     fi
+
+    load_config
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -6558,14 +6604,33 @@ zh_connection_check() {
     # Could not read the hook list at all (no gh, no admin, network) -> unknown.
     if [[ -z "$zh_hooks" ]]; then
         jq -n '{checked: false, state: "unknown",
-                reason: "could not read repository webhooks (needs admin on the repo)",
-                healthy: 0, rejected: 0, hooks: []}'
+                reason: "could not read this repository'"'"'s webhooks (needs admin access)",
+                healthy: 0, rejected: 0, unproven: 0, hooks: []}'
         return 0
     fi
 
-    local healthy rejected total
+    # GitHub CLEARS last_response on a quiet repo: the same hook that reported
+    # 202 days ago reports {"code": null, "status": "unused"} once it has had no
+    # recent deliveries. Classifying on that alone made 7 of 16 healthy repos
+    # report "unknown" overnight (#105). Fall back to the delivery history,
+    # which survives longer, before giving up on a hook.
+    local hook_id last_code
+    for hook_id in $(printf '%s' "$zh_hooks" | jq -r '.[] | select(.code == null) | .id'); do
+        last_code=$(gh api "repos/${owner_repo}/hooks/${hook_id}/deliveries?per_page=1" \
+            --jq '.[0].status_code // empty' 2>/dev/null) || last_code=""
+        # Only adopt a plain integer. Anything else (an error body, an
+        # unexpected shape) must leave the hook unproven rather than be spliced
+        # into the payload as a bogus status.
+        if [[ "$last_code" =~ ^[0-9]+$ ]]; then
+            zh_hooks=$(printf '%s' "$zh_hooks" | jq -c --argjson id "$hook_id" --argjson c "$last_code" \
+                'map(if .id == $id then .code = $c | .status = "from-deliveries" else . end)')
+        fi
+    done
+
+    local healthy rejected total unproven
     healthy=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code != null and .code >= 200 and .code < 300)] | length')
     rejected=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code != null and (.code < 200 or .code >= 300))] | length')
+    unproven=$(printf '%s' "$zh_hooks" | jq '[.[] | select(.code == null)] | length')
     total=$(printf '%s' "$zh_hooks" | jq 'length')
 
     local state reason
@@ -6576,18 +6641,21 @@ zh_connection_check() {
     elif [[ "$rejected" -gt 0 ]]; then
         state="not_registered"; reason="ZenHub rejects this repository's GitHub events (no webhook delivering successfully)"
     else
-        # Hooks exist but none has delivered yet — genuinely unknown, not broken.
-        state="unknown"; reason="ZenHub webhook present but has not delivered yet"
+        # Hooks exist but nothing has delivered within GitHub's retention
+        # window. Genuinely unverifiable, and on a quiet repo that is the normal
+        # state — say so plainly instead of implying something is wrong.
+        state="unknown"
+        reason="ZenHub webhook is installed, but no recent deliveries to verify against (quiet repository)"
     fi
 
     jq -n --arg state "$state" --arg reason "$reason" \
         --argjson healthy "$healthy" --argjson rejected "$rejected" --argjson hooks "$zh_hooks" \
+        --argjson unproven "$unproven" \
         '{checked: true, state: $state, reason: $reason,
-          healthy: $healthy, rejected: $rejected, hooks: $hooks}'
+          healthy: $healthy, rejected: $rejected, unproven: $unproven, hooks: $hooks}'
 }
 
 cmd_doctor() {
-    load_config
 
     local as_json=false
     local skip_verify=false
@@ -6612,6 +6680,10 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
             *) shift ;;
         esac
     done
+
+    # load_config runs after argument parsing so `--help` and usage errors work
+    # without credentials (see cmd_create).
+    load_config
 
     local owner_repo workspace_id
     owner_repo=$(get_repo_info)
@@ -6812,7 +6884,16 @@ Exit codes: 0 healthy, 1 problems found, 2 inconclusive (mirror stale)."
             echo -e "      Board state will not update. Add it as a source in ZenHub -> Manage Repositories."
             ;;
         *)
-            echo -e "  ${YELLOW}?${NC} Connection state unknown — $(echo "$connection" | jq -r '.reason')"
+            # Two very different unknowns. A quiet repo with an installed
+            # webhook is the NORMAL state and must not read as a problem, or the
+            # line fires constantly across a fleet and gets tuned out — which
+            # would cost exactly the signal this check adds (#105). Not being
+            # able to READ the webhooks is the one worth a question mark.
+            if [[ "$(echo "$connection" | jq -r '.checked')" == "true" ]]; then
+                echo -e "  ${CYAN}○${NC} Connection not verified — $(echo "$connection" | jq -r '.reason')"
+            else
+                echo -e "  ${YELLOW}?${NC} Connection state unknown — $(echo "$connection" | jq -r '.reason')"
+            fi
             ;;
     esac
 
@@ -7149,7 +7230,6 @@ zh_closed_parent_guard() {
 # check (#85). This does the detach-then-attach itself: the caller says where
 # the children should end up, not where they currently are.
 cmd_reparent() {
-    load_config
 
     local new_parent=""
     local dry_run=false
@@ -7205,6 +7285,10 @@ Example: zh reparent 586 60 72 73"
         done
         [[ "$dup" == "false" ]] && uniq_children+=("$n")
     done
+
+    # load_config runs after argument parsing so `--help` and usage errors work
+    # without credentials (see cmd_create).
+    load_config
 
     local owner_repo repo_id
     owner_repo=$(get_repo_info)
@@ -8738,6 +8822,10 @@ Run 'zh subissue help' for usage information."
 # This convention is observed by: cmd_subissue_add, cmd_subissue_remove,
 # cmd_sprint_add, cmd_sprint_remove.
 
+# Set by the global `--` pre-parser: the operator explicitly ended option
+# parsing, so flag-shaped positionals after it are intentional, not typos.
+ZH_END_OF_OPTS=false
+
 main() {
     # Global flag parsing (peel off `-r` / `--repo` and `-w` /
     # `--workspace` before the subcommand). Config-file defaults are
@@ -8780,6 +8868,12 @@ main() {
                 shift 2
                 ;;
             --)
+                # The global `--` is consumed here (it ends GLOBAL flag
+                # parsing), so subcommands never see it. Record that it was
+                # used, because it also carries the operator's intent that what
+                # follows is positional — which is what makes a flag-shaped
+                # title reachable despite the guards added for #102.
+                ZH_END_OF_OPTS=true
                 shift
                 args+=("$@")
                 break
@@ -8802,6 +8896,31 @@ main() {
 
     local command="${1:-help}"
     shift || true
+
+    # Global --help guard.
+    #
+    # Several subcommands bind their first positional as free-form text (a
+    # title, a comment body), so `zh create --help` was captured as the TITLE
+    # and created a real issue named "--help" (#102). Intercepting here covers
+    # every subcommand at once — including ones added later — rather than
+    # relying on each to remember its own guard, which is what failed.
+    #
+    # Scanning stops at `--`, so `zh create -- --help` can still create an
+    # issue genuinely titled "--help".
+    #
+    # Subcommands in _ZH_SELF_HELP print their own, more specific usage; they
+    # are passed through untouched. Add a command here when you give it one.
+    local _zh_self_help=" count doctor reparent "
+    if [[ "$_zh_self_help" != *" ${command} "* ]] && [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+        local _zh_arg
+        for _zh_arg in ${@+"$@"}; do
+            [[ "$_zh_arg" == "--" ]] && break
+            if [[ "$_zh_arg" == "-h" ]] || [[ "$_zh_arg" == "--help" ]]; then
+                cmd_help
+                return 0
+            fi
+        done
+    fi
 
     case "$command" in
         help|--help|-h)

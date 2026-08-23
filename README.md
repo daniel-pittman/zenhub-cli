@@ -827,6 +827,8 @@ AI: [runs zh labels, zh types to see options]
           -b "Users report login failing when password contains & or #"]
 ```
 
+> **`--help` is safe everywhere.** `zh <subcommand> --help` prints usage. It previously bound as the first positional, so `zh create --help` created a real issue titled `--help`. Unrecognized flags are now refused rather than silently adopted as a title (or silently discarded after one). To use a title that genuinely begins with a dash, end option parsing first: `zh create -- "--like-this"`.
+
 **Sprint Review:**
 ```
 User: What's in our current sprint?
