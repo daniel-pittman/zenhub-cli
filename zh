@@ -1711,14 +1711,126 @@ cmd_mine() {
     fi
 }
 
+# Cheap plausibility check for AGGREGATE counts (board / count / pipeline).
+#
+# These commands report numbers derived from ZenHub's MIRROR of GitHub issue
+# state. When a workspace's sync lapses the mirror keeps serving stale values,
+# and the failure is reassuring rather than loud: instead of erroring, the
+# command returns a plausible-looking number. Nobody double-checks "24 open
+# issues"; it reads as data, not as a claim, so it propagates into standups,
+# capacity math, and anything consuming `--json` (#96).
+#
+# `zh doctor`'s per-issue cross-check cannot be reused here: it takes explicit
+# issue numbers, and these commands deliberately never fetch any (they read
+# totalCount precisely to avoid a full walk). But an aggregate only needs to
+# know whether its number is PLAUSIBLE, and that is one asymmetric comparison:
+#
+#   ZenHub reporting MORE open issues than GitHub has  -> implausible. A board
+#       cannot hold more open issues than its repositories contain.
+#   ZenHub reporting FEWER                             -> normal and silent.
+#       Plenty of issues are never added to a board.
+#
+# Cost is two calls total regardless of workspace size: one ZenHub query for the
+# repository list, and ONE GitHub search using several `repo:` qualifiers (they
+# OR together, so a 20-repo workspace is still a single request). Scoping to the
+# workspace's actual repositories is what makes this sound on a multi-repo
+# workspace, where comparing against a single repo would be meaningless.
+#
+# Echoes JSON: {attempted, covered, plausible, zenhub_open, github_open,
+#               repos, reason}
+# `covered` is false when the comparison could not be made (no gh, not
+# authenticated, rate-limited). Inability to check is NOT agreement — the
+# distinction #94's review caught, carried over deliberately.
+zh_count_plausibility_check() {
+    local workspace_id="$1"
+    local zenhub_open="$2"
+
+    local repo_query='
+    query($workspaceId: ID!) {
+        workspace(id: $workspaceId) {
+            repositoriesConnection(first: 100) {
+                nodes { ownerName name }
+            }
+        }
+    }'
+    local repo_vars repo_resp repo_list
+    repo_vars=$(jq -n --arg w "$workspace_id" '{workspaceId: $w}')
+    repo_resp=$(zh_graphql "$repo_query" "$repo_vars" 2>/dev/null) || repo_resp=""
+    repo_list=$(printf '%s' "$repo_resp" | jq -r '[.data.workspace.repositoriesConnection.nodes[]? | "\(.ownerName)/\(.name)"] | .[]' 2>/dev/null) || repo_list=""
+
+    if [[ -z "$repo_list" ]]; then
+        jq -n --argjson zh "$zenhub_open" \
+            '{attempted: true, covered: false, plausible: null, zenhub_open: $zh,
+              github_open: null, repos: 0,
+              reason: "could not read the workspace repository list"}'
+        return 0
+    fi
+
+    local repo_count r
+    repo_count=$(printf '%s\n' "$repo_list" | grep -c .)
+
+    # GitHub's search API caps the query string at 256 characters, and each
+    # `+repo:owner/name` costs ~26 of them — so a workspace past roughly ten
+    # repositories overflows, GitHub answers 422, and the check would silently
+    # stop verifying. Batch the repositories instead and sum the per-batch
+    # totals: the batches are disjoint sets of repositories, so the sum is
+    # exact. total_count is a server-side count, not a page length (#86).
+    local github_open=0 batch="" batch_total="" failed=false
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        # Flush before exceeding the cap (200 leaves headroom for the prefix
+        # and any URL-encoding expansion).
+        if [[ ${#batch} -gt 0 ]] && [[ $(( ${#batch} + ${#r} + 6 )) -gt 200 ]]; then
+            batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+            [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
+            batch=""
+        fi
+        batch="${batch}+repo:${r}"
+    done <<< "$repo_list"
+    if [[ -n "$batch" ]]; then
+        batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+        [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
+    fi
+    # A partial sum would understate GitHub's side and manufacture a false
+    # "ZenHub has more" verdict, so any failed batch invalidates the whole check.
+    [[ "$failed" == "true" ]] && github_open=""
+
+    if ! [[ "$github_open" =~ ^[0-9]+$ ]]; then
+        jq -n --argjson zh "$zenhub_open" --argjson n "$repo_count" \
+            '{attempted: true, covered: false, plausible: null, zenhub_open: $zh,
+              github_open: null, repos: $n,
+              reason: "could not read GitHub issue counts (gh unavailable, unauthenticated, or rate-limited)"}'
+        return 0
+    fi
+
+    local plausible reason
+    if [[ "$zenhub_open" -gt "$github_open" ]]; then
+        plausible=false
+        reason="ZenHub reports more open issues (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — a board cannot hold more open issues than its repositories contain, unless the board has ZenHub-only cards or this GitHub token cannot see every repository"
+    else
+        plausible=true
+        reason="ZenHub's open count does not exceed GitHub's"
+    fi
+
+    jq -n --argjson zh "$zenhub_open" --argjson gh "$github_open" --argjson n "$repo_count" \
+        --argjson plausible "$plausible" --arg reason "$reason" \
+        '{attempted: true, covered: true, plausible: $plausible, zenhub_open: $zh,
+          github_open: $gh, repos: $n, reason: $reason}'
+}
+
 cmd_board() {
     load_config
 
     local include_closed=false
+    local skip_verify=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --no-verify)
+                skip_verify=true
+                shift
+                ;;
             --all|-a)
                 include_closed=true
                 shift
@@ -1809,6 +1921,21 @@ cmd_board() {
     done
 
     echo ""
+
+    # The counts above are read from ZenHub's mirror, so say so when they
+    # demonstrably disagree with GitHub rather than letting a stale board pass
+    # as fact (#96). Silent when plausible or unverifiable — a board legitimately
+    # holds fewer open issues than its repos contain.
+    if [[ "$skip_verify" != "true" ]] && [[ "$include_closed" != "true" ]]; then
+        local board_check board_plausible
+        board_check=$(zh_count_plausibility_check "$workspace_id" "$total")
+        board_plausible=$(echo "$board_check" | jq -r '.plausible')
+        if [[ "$board_plausible" == "false" ]]; then
+            echo -e "  ${RED}✗${NC} These counts do NOT agree with GitHub — $(echo "$board_check" | jq -r '.reason')."
+            echo -e "      Run ${BOLD}zh doctor${NC} for the connection state."
+            echo ""
+        fi
+    fi
 }
 
 # Exact issue counts, by construction.
@@ -1824,12 +1951,14 @@ cmd_count() {
     local include_closed=false
     local as_json=false
     local quiet=false
+    local skip_verify=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all|-a) include_closed=true; shift ;;
             --json)   as_json=true; shift ;;
             -q|--quiet) quiet=true; shift ;;
+            --no-verify) skip_verify=true; shift ;;
             -h|--help)
                 error "Usage: zh count [pipeline] [--all] [--json] [-q]
 
@@ -1839,6 +1968,7 @@ Examples:
   zh count                      # every pipeline + total
   zh count \"Product Backlog\"    # one pipeline
   zh count --all                # include closed issues
+  zh count --no-verify          # skip the GitHub plausibility check (faster, proves less)
   zh count -q                   # bare number, for scripting
   zh count --json               # machine-readable"
                 ;;
@@ -1913,14 +2043,48 @@ Use the full name."
     local total
     total=$(echo "$rows" | jq '[.[].count] | add // 0')
 
+    # A count read from ZenHub's mirror is only as accurate as the mirror. Check
+    # it against GitHub before presenting it as fact (#96). Uses the workspace
+    # total, not the possibly-narrowed `rows`, because the comparison is only
+    # sound against every repository the workspace spans.
+    local plausibility workspace_open
+    workspace_open=$(echo "$response" | jq '[.data.workspace.pipelinesConnection.nodes[].issues.totalCount // 0] | add // 0')
+    if [[ "$skip_verify" == "true" ]] || [[ "$include_closed" == "true" ]]; then
+        # --all counts closed issues too, so "more open than GitHub has" is not
+        # the right invariant and the check would be meaningless.
+        plausibility=$(jq -n '{attempted: false, covered: false, plausible: null,
+                               zenhub_open: null, github_open: null, repos: 0,
+                               reason: "check skipped"}')
+    else
+        plausibility=$(zh_count_plausibility_check "$workspace_id" "$workspace_open")
+    fi
+    local is_plausible
+    is_plausible=$(echo "$plausibility" | jq -r '.plausible')
+
     if [[ "$as_json" == "true" ]]; then
+        # ADDITIVE only: `exact` keeps its original meaning — the number came
+        # from the API's own totalCount rather than a truncated page (#86) — so
+        # existing consumers are unaffected. What it never meant is "agrees with
+        # GitHub", and emitting it alone read as a blanket accuracy claim (#96).
+        # `trustworthy` is the key to branch on: it is false when the mirror is
+        # demonstrably implausible and null when we could not check, mirroring
+        # doctor's "read conclusive before ok" contract.
         jq -n --argjson pipelines "$rows" --argjson total "$total" \
             --argjson closed "$([[ "$include_closed" == "true" ]] && echo true || echo false)" \
-            '{total: $total, includes_closed: $closed, exact: true, pipelines: $pipelines}'
+            --argjson mirror "$plausibility" \
+            '{total: $total, includes_closed: $closed, exact: true,
+              trustworthy: $mirror.plausible,
+              mirror_check: $mirror,
+              pipelines: $pipelines}'
         return 0
     fi
 
     if [[ "$quiet" == "true" ]]; then
+        # stdout stays a bare number so `-q` remains usable in a pipeline; the
+        # caveat goes to stderr, where it cannot corrupt the value but is still
+        # seen by a human running this interactively.
+        [[ "$is_plausible" == "false" ]] && \
+            warn "This count comes from ZenHub's mirror and does not agree with GitHub: $(echo "$plausibility" | jq -r '.reason')"
         echo "$total"
         return 0
     fi
@@ -1932,6 +2096,25 @@ Use the full name."
     done
     echo ""
     echo -e "  ${BOLD}TOTAL (${scope})${NC}  ${total}"
+
+    # Never present the number bare when we know it disagrees with GitHub, and
+    # never imply verification we did not perform.
+    case "$is_plausible" in
+        false)
+            echo ""
+            echo -e "  ${RED}✗${NC} These counts come from ZenHub's mirror and do NOT agree with GitHub."
+            echo -e "      $(echo "$plausibility" | jq -r '.reason')."
+            echo -e "      Either the workspace's ZenHub<->GitHub sync has lapsed (run ${BOLD}zh doctor${NC}"
+            echo -e "      for the connection state) or the board holds ZenHub-only cards."
+            ;;
+        true)
+            echo -e "  ${GREEN}✓${NC} Consistent with GitHub ($(echo "$plausibility" | jq -r '.github_open') open across $(echo "$plausibility" | jq -r '.repos') repo(s))"
+            ;;
+        *)
+            [[ "$(echo "$plausibility" | jq -r '.attempted')" == "true" ]] && \
+                echo -e "  ${CYAN}○${NC} Not checked against GitHub — $(echo "$plausibility" | jq -r '.reason')"
+            ;;
+    esac
     echo ""
 }
 
@@ -1941,12 +2124,17 @@ cmd_pipeline() {
     local pipeline_name=""
     local include_closed=false
     local show_urls=true
+    local skip_verify=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all|-a)
                 include_closed=true
+                shift
+                ;;
+            --no-verify)
+                skip_verify=true
                 shift
                 ;;
             --no-urls)
@@ -2042,6 +2230,21 @@ Example: zh pipeline \"In Progress\"
         trunc_note=" — showing ${fetched} of ${api_total}, listing incomplete"
     fi
 
+    # #86 made this count exact with respect to the API. #96 is the other half:
+    # exact against a mirror that is itself stale is still wrong, and the
+    # open/closed split above is computed from those same mirrored states.
+    local pipe_check pipe_plausible="null"
+    if [[ "$skip_verify" != "true" ]] && [[ "$include_closed" != "true" ]]; then
+        local ws_open
+        ws_open=$(zh_graphql 'query($workspaceId: ID!) { workspace(id: $workspaceId) { pipelinesConnection { nodes { issues(state: OPEN) { totalCount } } } } }' \
+            "$(jq -n --arg w "$workspace_id" '{workspaceId: $w}')" 2>/dev/null \
+            | jq -r '[.data.workspace.pipelinesConnection.nodes[].issues.totalCount // 0] | add // 0' 2>/dev/null) || ws_open=""
+        if [[ "$ws_open" =~ ^[0-9]+$ ]]; then
+            pipe_check=$(zh_count_plausibility_check "$workspace_id" "$ws_open")
+            pipe_plausible=$(echo "$pipe_check" | jq -r '.plausible')
+        fi
+    fi
+
     echo ""
     if [[ "$include_closed" == "true" ]]; then
         echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues${trunc_note})"
@@ -2051,6 +2254,10 @@ Example: zh pipeline \"In Progress\"
         else
             echo -e "${BOLD}Pipeline: ${pipeline_actual_name}${NC} (${count} issues${trunc_note})"
         fi
+    fi
+    if [[ "$pipe_plausible" == "false" ]]; then
+        echo -e "  ${RED}✗${NC} Open/closed states here come from ZenHub's mirror, which does NOT agree with GitHub."
+        echo -e "      $(echo "$pipe_check" | jq -r '.reason'). Run ${BOLD}zh doctor${NC} for the connection state."
     fi
     echo ""
 
