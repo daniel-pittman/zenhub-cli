@@ -26,7 +26,12 @@ zh mine @username       # Issues assigned to user
 zh mine --no-urls       # Compact output without URLs
 zh users                # List assignable users
 zh board                # Board overview
-zh count                # EXACT issue counts per pipeline (never a truncated page)
+zh count                # EXACT issue counts per pipeline (never a truncated page),
+                        # cross-checked against GitHub. --json adds `trustworthy` +
+                        # `mirror_check`: read `trustworthy` before `total`, since a
+                        # count read from ZenHub's mirror can be exact yet stale.
+                        # `exact` keeps its old meaning (not a truncated page).
+zh count --no-verify    # skip the GitHub cross-check (faster, proves less)
 zh count "Backlog" -q   # Bare exact number for one pipeline (scripting)
 zh doctor               # Hierarchy health + CONNECTION state: open issues under a CLOSED
                         # parent, parent cycles, and whether ZenHub is actually receiving
