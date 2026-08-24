@@ -63,9 +63,9 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      # SHA-pinned actions/checkout v4.2.2 (matches ci.yml).
+      # SHA-pinned actions/checkout v7.0.1 (matches ci.yml).
       - name: Check out the repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -208,9 +208,9 @@ jobs:
       actions: read
       id-token: write
     steps:
-      # SHA-pinned actions/checkout v4.2.2
+      # SHA-pinned actions/checkout v7.0.1
       - name: Check out the repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # On a pull_request event github.ref is refs/pull/<n>/merge (the
           # default checkout target). On a manual workflow_dispatch re-run we
@@ -218,11 +218,11 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/head', github.event.inputs.pr_number) || github.ref }}
           fetch-depth: 1
 
-      # SHA-pinned anthropics/claude-code-action v1.0.133. Bump by re-resolving
+      # SHA-pinned anthropics/claude-code-action v1.0.193. Bump by re-resolving
       # the v1 tag's target commit:
       #   gh api repos/anthropics/claude-code-action/git/refs/tags/v1
       - name: Run Claude code review
-        uses: anthropics/claude-code-action@51705da45eecce209d4700538bf8377d5b5fc695 # v1.0.152
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
@@ -294,10 +294,10 @@ jobs:
     env:
       REVIEW_BOT: 'claude[bot]'
     steps:
-      # SHA-pinned actions/checkout v4.2.2 (the extractor reads ./REVIEW.md from
+      # SHA-pinned actions/checkout v7.0.1 (the extractor reads ./REVIEW.md from
       # the workspace, so the action's agent needs a checkout to read it).
       - name: Check out the repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -350,13 +350,13 @@ jobs:
           fi
 
 
-      # SHA-pinned anthropics/claude-code-action v1.0.152. Cheap model (Haiku) —
+      # SHA-pinned anthropics/claude-code-action v1.0.193. Cheap model (Haiku) —
       # this is a one-shot classification, not a review. The verdict comes back as
       # schema-validated STRUCTURED OUTPUT (the `--json-schema` claude_arg), exposed
       # as steps.extract.outputs.structured_output — no comment, no log-file parse.
       - name: Extract the merge verdict
         id: extract
-        uses: anthropics/claude-code-action@51705da45eecce209d4700538bf8377d5b5fc695 # v1.0.152
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # track_progress off: this is a data task, not a PR conversation; we read
