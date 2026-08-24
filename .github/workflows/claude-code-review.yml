@@ -63,7 +63,7 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      # SHA-pinned actions/checkout v4.2.2 (matches ci.yml).
+      # SHA-pinned actions/checkout v7.0.1 (matches ci.yml).
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -208,7 +208,7 @@ jobs:
       actions: read
       id-token: write
     steps:
-      # SHA-pinned actions/checkout v4.2.2
+      # SHA-pinned actions/checkout v7.0.1
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -218,7 +218,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/head', github.event.inputs.pr_number) || github.ref }}
           fetch-depth: 1
 
-      # SHA-pinned anthropics/claude-code-action v1.0.133. Bump by re-resolving
+      # SHA-pinned anthropics/claude-code-action v1.0.193. Bump by re-resolving
       # the v1 tag's target commit:
       #   gh api repos/anthropics/claude-code-action/git/refs/tags/v1
       - name: Run Claude code review
@@ -294,7 +294,7 @@ jobs:
     env:
       REVIEW_BOT: 'claude[bot]'
     steps:
-      # SHA-pinned actions/checkout v4.2.2 (the extractor reads ./REVIEW.md from
+      # SHA-pinned actions/checkout v7.0.1 (the extractor reads ./REVIEW.md from
       # the workspace, so the action's agent needs a checkout to read it).
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -350,7 +350,7 @@ jobs:
           fi
 
 
-      # SHA-pinned anthropics/claude-code-action v1.0.152. Cheap model (Haiku) —
+      # SHA-pinned anthropics/claude-code-action v1.0.193. Cheap model (Haiku) —
       # this is a one-shot classification, not a review. The verdict comes back as
       # schema-validated STRUCTURED OUTPUT (the `--json-schema` claude_arg), exposed
       # as steps.extract.outputs.structured_output — no comment, no log-file parse.
