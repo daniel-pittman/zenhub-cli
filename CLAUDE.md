@@ -40,6 +40,10 @@ zh doctor               # Hierarchy health + CONNECTION state: open issues under
                         # 0 healthy or unverified / 1 findings / 2 inconclusive (states stale vs GitHub)
                         # --json: read `conclusive` before `ok`; trust mirror_check.covered, not .attempted
 zh doctor --no-verify   # Skip the GitHub cross-check (faster, proves less)
+# `zh doctor` also reports the CONNECTION state: a repo that was never added as a
+# source in ZenHub looks identical to a healthy one on read while silently
+# discarding every change. `connection.state` is connected / not_registered /
+# unknown; `unknown` is never a pass.
 zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
 
 # Manage issues
