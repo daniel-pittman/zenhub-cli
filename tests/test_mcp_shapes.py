@@ -217,14 +217,15 @@ def test_run_zh_timeout_stderr_includes_captured_diagnostic(monkeypatch):
     import subprocess
 
     def fake_run(*args, **kwargs):
-        # TimeoutExpired's stdout/stderr are set as attributes after
-        # __init__, not kwargs to it.
+        # CPython hands the timeout branch BYTES even under text=True (it
+        # decodes only on normal completion). A str fixture here is a type
+        # the runtime never produces and lets the branch pass while broken.
         exc = subprocess.TimeoutExpired(
             cmd=args[0],
             timeout=kwargs.get("timeout", 60),
+            output=b"partial stdout output",
+            stderr=b"\x1b[31mfatal: about to fail\x1b[0m",
         )
-        exc.stdout = "partial stdout output"
-        exc.stderr = "\x1b[31mfatal: about to fail\x1b[0m"
         raise exc
 
     import pathlib
@@ -270,3 +271,77 @@ def test_run_zh_timeout_no_captured_stderr_keeps_synthetic_only(monkeypatch):
     )
     assert "timed out after" in result["stderr"]
     assert result["stderr"] == result["stderr_plain"]  # no ANSI to strip
+
+
+def test_run_zh_timeout_decodes_bytes_output(monkeypatch):
+    """The timeout branch must decode what CPython actually hands it.
+
+    `subprocess.run(text=True)` decodes output only on normal completion. When
+    `communicate()` times out, TimeoutExpired carries the raw BYTES read so far
+    (3.11 builds them with b"".join). `_ANSI_RE` is a str pattern, so the branch
+    raised "TypeError: cannot use a string pattern on a bytes-like object" and
+    the caller never saw the structured timeout result. Observed on `epic_show`
+    for a 54-child epic during a slow ZenHub window.
+
+    The two fixtures above used str, a type the runtime never produces on this
+    path, which is how the branch had coverage and still shipped broken. This
+    fixture is the real shape.
+
+    Production change that fails this test: not decoding e.stdout / e.stderr
+    in the TimeoutExpired branch.
+    """
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs.get("timeout", 60),
+            output=b"partial \x1b[32mok\x1b[0m",
+            stderr=b"warn",
+        )
+
+    import pathlib
+    monkeypatch.setattr(pathlib.Path, "exists", lambda self: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = mcp_server._run_zh(["epic", "show", "828"], timeout=60)
+
+    assert result["ok"] is False
+    assert isinstance(result["stdout"], str), "raw stdout must be text, not bytes"
+    assert result["stdout_plain"] == "partial ok"
+    # The captured diagnostic comes first, decoded (not a bytes repr), then the
+    # synthetic timeout suffix.
+    assert result["stderr_plain"].startswith("warn")
+    assert "b'" not in result["stderr_plain"], "bytes repr leaked into stderr"
+    assert result["stderr_plain"].endswith("(args=['epic', 'show', '828'])")
+
+
+def test_run_zh_timeout_str_output_passes_through(monkeypatch):
+    """The timeout branch must also accept already-decoded str.
+
+    On Windows, `subprocess.run` re-runs `communicate()` after `kill()` and
+    repopulates TimeoutExpired.stdout / .stderr as str under text=True, so the
+    str path of `_as_text` is a live platform branch, not a hypothetical. The
+    bytes fixtures above cannot exercise it. Pinned by mutation: replacing the
+    passthrough with `return ""` fails this test.
+    """
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=args[0],
+            timeout=kwargs.get("timeout", 60),
+            output="partial \x1b[32mok\x1b[0m",
+            stderr="warn",
+        )
+
+    import pathlib
+    monkeypatch.setattr(pathlib.Path, "exists", lambda self: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = mcp_server._run_zh(["epic", "show", "828"], timeout=60)
+
+    assert result["ok"] is False
+    assert result["stdout_plain"] == "partial ok"
+    assert result["stderr_plain"].startswith("warn")
+    assert result["stderr_plain"].endswith("(args=['epic', 'show', '828'])")

@@ -915,6 +915,26 @@ _ANSI_RE = re.compile(
     r"\x1b\[[0-9;?]*[a-zA-Z]"  # CSI: ESC [ params final-byte (any letter)
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: ESC ] text BEL or ST
 )
+
+
+def _as_text(value) -> str:
+    """Coerce a subprocess output field to str.
+
+    `subprocess.run(text=True)` decodes stdout/stderr only on normal
+    completion. When `communicate()` times out on POSIX, `TimeoutExpired.stdout`
+    and `.stderr` carry the raw bytes read so far, so anything that treats them
+    as text (the str-pattern `_ANSI_RE`, an f-string) must decode first. On
+    Windows, `run()` re-runs `communicate()` after `kill()` and repopulates the
+    fields as already-decoded str. Accepts None (nothing captured), bytes, and
+    str so the caller need not branch on the platform.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 # Matches `zh`'s per-issue header rows in mine / pipeline / etc. listings:
 # `  #645 │ owner/repo │ ...` (2-space indent). Two tightening choices
 # both implemented as `[ \t]` (horizontal whitespace only, never \n):
@@ -1040,7 +1060,10 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
         # emitted before timing out. Now both fields contain the
         # captured diagnostic (when present) AND the synthetic
         # timeout suffix.
-        captured_stderr = e.stderr or ""
+        # Decode before any str handling: on timeout these fields are bytes
+        # even under text=True (see _as_text).
+        captured_stdout = _as_text(e.stdout)
+        captured_stderr = _as_text(e.stderr)
         synthetic = (
             f"zh subprocess timed out after {timeout}s (args={args!r})"
         )
@@ -1051,9 +1074,9 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
         return {
             "ok": False,
             "exit_code": -1,
-            "stdout": e.stdout or "",
+            "stdout": captured_stdout,
             "stderr": combined_stderr,
-            "stdout_plain": _ANSI_RE.sub("", e.stdout or ""),
+            "stdout_plain": _ANSI_RE.sub("", captured_stdout),
             "stderr_plain": _ANSI_RE.sub("", combined_stderr),
         }
     return {
