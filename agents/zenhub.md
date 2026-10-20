@@ -55,6 +55,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh issue <N>` — also shows `Parent: #<N>` and `Sub-issues: <count>` when present, giving cheap 3-tier hierarchy visibility
 - `zh sprints [--all]` — list sprints in the workspace (● marks the active sprint). `--all` includes closed sprints.
 - `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
+- `zh releases [--all|--closed] [--json]` — list releases (open by default). `zh release <title|id> [--no-urls] [--json]` shows a release's dates, state and issues. Titles match case-insensitively; a shared title is refused with the ids listed.
 
 ### Write operations (issue lifecycle)
 - `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`; a CLOSED `<issue#>` is REFUSED before the issue is created (nothing is left behind), overridable with `--allow-closed-parent`. Optional `--priority <name>` sets a configured priority at create time (same name-resolution path as `zh priority`; discover names with `zh priorities`). Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent, priority, priority_requested) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number. `priority_requested` carries the requested priority name even when `priority` is null (post-create mutation did not confirm; safe to retry via `zh priority`); compare the two fields to detect a partial apply.
@@ -98,6 +99,12 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 - `zh sprint remove <name|current|active> <issue#> [<issue#> ...]` — remove issues from a sprint. Top-level alias: `zh sr <name> <issue#> [...]`. `remove` aliases: `rm`.
 
 The sprint mutations report per-issue success / failure. The ZenHub API doesn't distinguish reasons (already-in-sprint, archived, ineligible) so `zh` surfaces counts and affected numbers; if anything fails, investigate via `zh sprint <name>` and the issue's history.
+
+### Write operations (releases)
+- `zh release create "<title>" --start YYYY-MM-DD --end YYYY-MM-DD [-d <description>] [--json|-q]` — create a release attached to the current repo.
+- `zh release edit <title|id> [-t <title>] [-d <description>] [--start YYYY-MM-DD] [--end YYYY-MM-DD]` — sends only the fields given; the resulting date range is checked first.
+- `zh release close <title|id>` / `zh release reopen <title|id>` — set the release state.
+- `zh release delete` is refused: ZenHub's public API has no delete mutation. Propose `close`, or deletion in the ZenHub web app.
 
 ### Repository / workspace targeting (global flags)
 - `-r owner/repo` (alias `--repo`) before any subcommand: target a specific GitHub repo instead of the one `git remote get-url origin` resolves.

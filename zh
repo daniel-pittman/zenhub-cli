@@ -988,6 +988,29 @@ COMMANDS:
                            Example: zh sprint rm current 42 43
                            (top-level alias: sr)
 
+    releases [--all|--closed] [--json]
+                           List releases in workspace (open by default)
+                           Example: zh releases --all
+                           (aliases: rels, release list)
+
+    release <subcommand>   Manage releases (titles match case-insensitively;
+                           a release id also works)
+                           Subcommands:
+                             show <title> [--no-urls] [--json] Dates, state + issues
+                             create "Title" --start YYYY-MM-DD --end YYYY-MM-DD
+                                    [-d description] [--json|-q]
+                                                               Create for the current repo
+                             edit <title> [-t title] [-d description]
+                                  [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+                             close <title>                     Mark the release closed
+                             reopen <title>                    Mark the release open
+                             delete <title>                    Not supported by ZenHub's
+                                                               API; explains, use close
+                           Example: zh release "Spring launch"
+                           Example: zh release create "Spring launch" -s 2026-03-01 -e 2026-03-31
+                           Example: zh release edit "Spring launch" --end 2026-04-07
+                           (alias: rel)
+
     help                    Show this help message
 
 CONFIGURATION:
@@ -1018,6 +1041,8 @@ ALIASES:
     estimate: est, points
     create: new
     workspaces: ws
+    releases: rels
+    release: rel
 
 EXAMPLES:
     zh issue 42                    # View issue details
@@ -1048,6 +1073,8 @@ EXAMPLES:
     zh sprint add current 42 43    # Add issues to active sprint
     zh sprint remove "Sprint 5" 42 # Remove issue from sprint
     zh sa current 42                # Top-level alias for sprint add
+    zh releases                     # List open releases
+    zh release "Spring launch"      # View a release + its issues
 EOF
 }
 
@@ -6572,6 +6599,717 @@ Examples:
     fi
 }
 
+# =============================================================================
+# Release commands
+#
+# A ZenHub release is a dated container of issues (startOn → endOn) that is
+# attached to one or more repositories rather than to a workspace; a
+# workspace's `releases` connection lists the releases of its repositories.
+# The public GraphQL API exposes create / update (title, description, dates,
+# OPEN/CLOSED state) and issue membership, but NO delete mutation, so
+# `zh release delete` explains that and points at `zh release close`.
+# =============================================================================
+
+ZH_RELEASE_PAGINATION_CAP=50
+
+# Walk every page of `workspace.releases` and emit one combined JSON
+# document on stdout:
+#
+#   { workspace_name, nodes: [...], pagination_bailed }
+#
+# `state_filter` is "OPEN", "CLOSED", or "" for every release.
+zh_releases_fetch_all() {
+    local workspace_id="$1"
+    local state_filter="${2:-}"
+
+    local query='
+    query($workspaceId: ID!, $after: String, $state: ReleaseStateInput) {
+        workspace(id: $workspaceId) {
+            name
+            releases(first: 50, after: $after, state: $state, orderBy: { field: START_ON, direction: DESC }) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                    id
+                    title
+                    description
+                    state
+                    startOn
+                    endOn
+                    closedAt
+                    issuesCount
+                    repositories(first: 10) { nodes { ownerName name } }
+                }
+            }
+        }
+    }'
+
+    local state_json="null"
+    if [[ -n "$state_filter" ]]; then
+        state_json=$(jq -n --arg s "$state_filter" '{eq: $s}')
+    fi
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+    local workspace_name=""
+    local first_page=true
+    local pagination_bailed=""
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt "$ZH_RELEASE_PAGINATION_CAP" ]]; then
+            warn "Release pagination iteration cap (${ZH_RELEASE_PAGINATION_CAP}) reached"
+            pagination_bailed="iteration_cap"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --arg workspace_id "$workspace_id" --argjson after "$cursor" \
+            --argjson state "$state_json" \
+            '{workspaceId: $workspace_id, after: $after, state: $state}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        local workspace_kind
+        workspace_kind=$(echo "$response" | jq -r '.data.workspace | type')
+        if [[ "$workspace_kind" == "null" ]]; then
+            error "Workspace '${workspace_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
+        if [[ "$first_page" == "true" ]]; then
+            workspace_name=$(echo "$response" | jq -r '.data.workspace.name // ""')
+            first_page=false
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '[(.data.workspace.releases.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.workspace.releases.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.workspace.releases.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Release pagination cursor not advancing — bailing"
+            pagination_bailed="stuck_cursor"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n \
+        --arg workspace_name "$workspace_name" \
+        --argjson nodes "$all_nodes" \
+        --arg pagination_bailed "$pagination_bailed" \
+        '{workspace_name: $workspace_name, nodes: $nodes, pagination_bailed: $pagination_bailed}'
+}
+
+# Resolve a release by ZenHub id or by title (case-insensitive, exact).
+# Emits "<id>\t<title>" on stdout; exits non-zero when the release is
+# missing or the title matches more than one release (pass the id then).
+zh_resolve_release() {
+    local workspace_id="$1"
+    local wanted="$2"
+
+    local releases_json
+    releases_json=$(zh_releases_fetch_all "$workspace_id" "")
+
+    local matches
+    matches=$(echo "$releases_json" | jq -c --arg w "$wanted" '
+        [.nodes[] | select(.id == $w)] as $by_id
+        | if ($by_id | length) > 0 then $by_id
+          else [.nodes[] | select((.title | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($w | gsub("^\\s+|\\s+$"; "") | ascii_downcase))]
+          end')
+
+    local match_count
+    match_count=$(echo "$matches" | jq 'length')
+
+    if [[ "$match_count" -eq 0 ]]; then
+        printf "${RED}Error:${NC} Release '%s' not found.\n" "$wanted" >&2
+        local listing_bailed
+        listing_bailed=$(echo "$releases_json" | jq -r '.pagination_bailed // ""')
+        if [[ -n "$listing_bailed" ]]; then
+            echo "" >&2
+            echo "  Listing was incomplete due to: ${listing_bailed}." >&2
+            echo "  The release may exist on an unreached page; try re-running." >&2
+        fi
+        echo "" >&2
+        echo "Available releases:" >&2
+        echo "$releases_json" | jq -r '.nodes[] | "  - \(.title) (\(.state))"' >&2
+        exit 1
+    fi
+
+    if [[ "$match_count" -gt 1 ]]; then
+        printf "${RED}Error:${NC} %s releases are titled '%s'. Pass the release id instead:\n" "$match_count" "$wanted" >&2
+        echo "$matches" | jq -r '.[] | "  \(.id)  \(.title) (\(.state), \(.startOn) → \(.endOn))"' >&2
+        exit 1
+    fi
+
+    echo "$matches" | jq -r '.[0] | "\(.id)\t\(.title)"'
+}
+
+# Validate a YYYY-MM-DD date argument; `label` names the flag in errors.
+zh_release_validate_date() {
+    local label="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
+        error "Invalid ${label} date '${value}' (expected YYYY-MM-DD)"
+    fi
+    local month=$((10#${BASH_REMATCH[2]}))
+    local day=$((10#${BASH_REMATCH[3]}))
+    if [[ "$month" -lt 1 || "$month" -gt 12 || "$day" -lt 1 || "$day" -gt 31 ]]; then
+        error "Invalid ${label} date '${value}' (expected YYYY-MM-DD)"
+    fi
+}
+
+# Walk every page of a release's issues. Emits { nodes, pagination_bailed }.
+zh_release_issues_fetch_all() {
+    local release_id="$1"
+
+    local query='
+    query($releaseId: ID!, $after: String) {
+        node(id: $releaseId) {
+            ... on Release {
+                issues(first: 100, after: $after) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                        number
+                        title
+                        state
+                        htmlUrl
+                        estimate { value }
+                        assignees { nodes { login } }
+                        repository { ownerName name }
+                        pipelineIssues { nodes { pipeline { name } } }
+                    }
+                }
+            }
+        }
+    }'
+
+    local cursor="null"
+    local last_cursor=""
+    local iterations=0
+    local all_nodes="[]"
+    local pagination_bailed=""
+
+    while :; do
+        iterations=$((iterations + 1))
+        if [[ "$iterations" -gt 200 ]]; then
+            warn "Release-issues pagination iteration cap (200) reached"
+            pagination_bailed="iteration_cap"
+            break
+        fi
+
+        local variables
+        variables=$(jq -n --arg release_id "$release_id" --argjson after "$cursor" \
+            '{releaseId: $release_id, after: $after}')
+
+        local response
+        response=$(zh_graphql "$query" "$variables")
+
+        if [[ "$(echo "$response" | jq -r '.data.node | type')" == "null" ]]; then
+            error "Release '${release_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '[(.data.node.issues.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.node.issues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.node.issues.pageInfo.endCursor // ""')
+
+        if [[ "$has_next" != "true" ]]; then
+            break
+        fi
+        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
+            warn "Release-issues pagination cursor not advancing — bailing"
+            pagination_bailed="stuck_cursor"
+            break
+        fi
+        last_cursor="$end_cursor"
+        cursor=$(jq -n --arg c "$end_cursor" '$c')
+    done
+
+    jq -n --argjson nodes "$all_nodes" --arg pagination_bailed "$pagination_bailed" \
+        '{nodes: $nodes, pagination_bailed: $pagination_bailed}'
+}
+
+cmd_releases() {
+    load_config
+
+    local state_filter="OPEN"
+    local json_output=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|-a) state_filter=""; shift ;;
+            --closed) state_filter="CLOSED"; shift ;;
+            --json) json_output=true; shift ;;
+            *) error "Unknown option for releases: $1 (usage: zh releases [--all|--closed] [--json])" ;;
+        esac
+    done
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    [[ "$json_output" == "true" ]] || info "Getting releases..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local releases_json
+    releases_json=$(zh_releases_fetch_all "$workspace_id" "$state_filter")
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$releases_json" | jq '{workspace: .workspace_name, releases: .nodes, pagination_bailed: .pagination_bailed}'
+        return 0
+    fi
+
+    local workspace_name count scope
+    workspace_name=$(echo "$releases_json" | jq -r '.workspace_name')
+    count=$(echo "$releases_json" | jq '.nodes | length')
+    case "$state_filter" in
+        OPEN) scope="open" ;;
+        CLOSED) scope="closed" ;;
+        *) scope="total" ;;
+    esac
+
+    echo ""
+    printf "${BOLD}Releases in %s${NC} (%s %s)\n" "$workspace_name" "$count" "$scope"
+    echo ""
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "  No releases found"
+    else
+        echo "$releases_json" | jq -r '.nodes[] |
+            "  \(.title)\n    \(.state) │ \(.startOn // "?") → \(.endOn // "?") │ \(.issuesCount // 0) issues │ \([.repositories.nodes[].name] | join(", "))\n"'
+    fi
+
+    echo -e "${CYAN}Tip:${NC} Use 'zh release <title>' to view the issues in a release"
+    if [[ "$state_filter" == "OPEN" ]]; then
+        echo -e "${CYAN}Tip:${NC} Use --all to include closed releases"
+    fi
+    echo ""
+
+    if [[ -n "$(echo "$releases_json" | jq -r '.pagination_bailed // ""')" ]]; then
+        warn "Listing may be incomplete (pagination bailed)."
+        exit 2
+    fi
+}
+
+cmd_release_show() {
+    load_config
+
+    local wanted=""
+    local show_urls=true
+    local json_output=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-urls) show_urls=false; shift ;;
+            --json) json_output=true; shift ;;
+            *)
+                if [[ -z "$wanted" ]]; then
+                    wanted="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$wanted" ]]; then
+        error "Usage: zh release show <title|id> [--no-urls] [--json]
+
+View a release's dates, state and issues. Titles match case-insensitively.
+
+Examples:
+  zh release show \"Spring launch\"
+  zh release \"Spring launch\" --no-urls"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    [[ "$json_output" == "true" ]] || info "Getting release details..."
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local resolved release_id
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted")
+    release_id="${resolved%%	*}"
+
+    local detail_query='
+    query($releaseId: ID!) {
+        node(id: $releaseId) {
+            ... on Release {
+                id
+                title
+                description
+                state
+                startOn
+                endOn
+                closedAt
+                issuesCount
+                repositories(first: 10) { nodes { ownerName name } }
+            }
+        }
+    }'
+
+    local detail_response
+    detail_response=$(zh_graphql "$detail_query" "$(jq -n --arg id "$release_id" '{releaseId: $id}')")
+
+    local issues_json
+    issues_json=$(zh_release_issues_fetch_all "$release_id")
+
+    if [[ "$json_output" == "true" ]]; then
+        jq -n --argjson release "$(echo "$detail_response" | jq '.data.node')" \
+            --argjson issues "$issues_json" \
+            '$release + {issues: $issues.nodes, pagination_bailed: $issues.pagination_bailed}'
+        return 0
+    fi
+
+    local title state start_on end_on closed_at description repos
+    title=$(echo "$detail_response" | jq -r '.data.node.title // ""')
+    state=$(echo "$detail_response" | jq -r '.data.node.state // "UNKNOWN"')
+    start_on=$(echo "$detail_response" | jq -r '.data.node.startOn // "?"')
+    end_on=$(echo "$detail_response" | jq -r '.data.node.endOn // "?"')
+    closed_at=$(echo "$detail_response" | jq -r '.data.node.closedAt[:10] // empty')
+    description=$(echo "$detail_response" | jq -r '.data.node.description // empty')
+    repos=$(echo "$detail_response" | jq -r '[.data.node.repositories.nodes[] | "\(.ownerName)/\(.name)"] | join(", ")')
+
+    local issue_count open_count closed_count
+    issue_count=$(echo "$issues_json" | jq '.nodes | length')
+    open_count=$(echo "$issues_json" | jq '[.nodes[] | select(.state == "OPEN")] | length')
+    closed_count=$(echo "$issues_json" | jq '[.nodes[] | select(.state == "CLOSED")] | length')
+
+    echo ""
+    printf "${BOLD}Release: %s${NC}\n" "$title"
+    echo ""
+    echo -e "  ${CYAN}State:${NC}     ${state}${closed_at:+ (closed ${closed_at})}"
+    echo -e "  ${CYAN}Period:${NC}    ${start_on} → ${end_on}"
+    printf "  ${CYAN}Repos:${NC}     %s\n" "$repos"
+    echo -e "  ${CYAN}Issues:${NC}    ${open_count} open, ${closed_count} closed"
+    echo -e "  ${CYAN}ID:${NC}        ${release_id}"
+    if [[ -n "$description" ]]; then
+        # Descriptions are often several paragraphs; indent every line.
+        echo -e "  ${CYAN}Description:${NC}"
+        printf '%s\n' "$description" | sed 's/^/    /'
+    fi
+    echo ""
+    echo -e "${BOLD}Issues (${issue_count}):${NC}"
+    echo ""
+
+    if [[ "$issue_count" -eq 0 ]]; then
+        echo "  No issues in this release"
+    elif [[ "$show_urls" == "true" ]]; then
+        echo "$issues_json" | jq -r '.nodes[] |
+            "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(.pipelineIssues.nodes[0].pipeline.name // "—")\n    \(if .state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.htmlUrl)\n"'
+    else
+        echo "$issues_json" | jq -r '.nodes[] |
+            "  #\(.number)  \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(if .state == "CLOSED" then "✓ " else "  " end)\(.title)"'
+    fi
+    echo ""
+
+    local bailed
+    bailed=$(echo "$issues_json" | jq -r '.pagination_bailed // ""')
+    if [[ -n "$bailed" ]]; then
+        warn "Showing the first ${issue_count} issue(s) only — pagination incomplete: ${bailed}."
+        exit 2
+    fi
+}
+
+cmd_release_create() {
+    load_config
+
+    local title="" description="" start_on="" end_on=""
+    local output_mode="text"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--description)
+                [[ $# -ge 2 ]] || error "Option $1 requires a value"
+                description="$2"; shift 2 ;;
+            -s|--start)
+                [[ $# -ge 2 ]] || error "Option $1 requires a YYYY-MM-DD value"
+                start_on="$2"; shift 2 ;;
+            -e|--end)
+                [[ $# -ge 2 ]] || error "Option $1 requires a YYYY-MM-DD value"
+                end_on="$2"; shift 2 ;;
+            --json) output_mode="json"; shift ;;
+            -q|--quiet) output_mode="quiet"; shift ;;
+            -*)
+                if [[ -z "$title" && "${ZH_END_OF_OPTS:-false}" == "true" ]]; then
+                    title="$1"; shift
+                else
+                    error "Unknown option for release create: $1 (a title starting with '-' needs 'zh -- release create ...')"
+                fi
+                ;;
+            *)
+                if [[ -n "$title" ]]; then
+                    error "Unexpected argument: $1 (quote a multi-word title)"
+                fi
+                title="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$title" || -z "$start_on" || -z "$end_on" ]]; then
+        error "Usage: zh release create \"Title\" --start YYYY-MM-DD --end YYYY-MM-DD [-d description] [--json|-q]
+
+Create a release attached to the current repository.
+
+Examples:
+  zh release create \"Spring launch\" --start 2026-03-01 --end 2026-03-31
+  zh release create \"Hotfix 2.1\" -s 2026-04-02 -e 2026-04-02 -d \"Payment fix\" -q"
+    fi
+
+    zh_release_validate_date "--start" "$start_on"
+    zh_release_validate_date "--end" "$end_on"
+    if [[ "$start_on" > "$end_on" ]]; then
+        error "The start date (${start_on}) is after the end date (${end_on})"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local gh_id
+    gh_id=$(resolve_gh_repo_id "$owner_repo") || \
+        error "Could not get GitHub repo ID for: $owner_repo (check the repo path and 'gh auth status')"
+
+    local query='
+    mutation($input: CreateReleaseInput!) {
+        createRelease(input: $input) {
+            release {
+                id
+                title
+                description
+                state
+                startOn
+                endOn
+                repositories(first: 10) { nodes { ownerName name } }
+            }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg title "$title" --arg description "$description" \
+        --arg start "$start_on" --arg end "$end_on" --argjson gh_id "$gh_id" \
+        '{input: {release: ({title: $title, startOn: $start, endOn: $end, repositoryGhIds: [$gh_id]}
+            + (if $description == "" then {} else {description: $description} end))}}')
+
+    [[ "$output_mode" == "text" ]] && info "Creating release in ${owner_repo}..."
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    local release_id
+    release_id=$(echo "$response" | jq -r '.data.createRelease.release.id // empty')
+    if [[ -z "$release_id" ]]; then
+        error "ZenHub did not return the new release"
+    fi
+
+    case "$output_mode" in
+        json) echo "$response" | jq '.data.createRelease.release' ;;
+        quiet) echo "$release_id" ;;
+        *)
+            echo ""
+            success "Created release: ${title} (${start_on} → ${end_on})"
+            echo -e "  ${CYAN}ID:${NC} ${release_id}"
+            ;;
+    esac
+}
+
+cmd_release_edit() {
+    load_config
+
+    local wanted=""
+    local new_title="" new_description="" new_start="" new_end=""
+    local set_title=false set_description=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--title)
+                [[ $# -ge 2 ]] || error "Option $1 requires a value"
+                new_title="$2"; set_title=true; shift 2 ;;
+            -d|--description)
+                [[ $# -ge 2 ]] || error "Option $1 requires a value"
+                new_description="$2"; set_description=true; shift 2 ;;
+            -s|--start)
+                [[ $# -ge 2 ]] || error "Option $1 requires a YYYY-MM-DD value"
+                new_start="$2"; shift 2 ;;
+            -e|--end)
+                [[ $# -ge 2 ]] || error "Option $1 requires a YYYY-MM-DD value"
+                new_end="$2"; shift 2 ;;
+            -*) error "Unknown option for release edit: $1" ;;
+            *)
+                if [[ -n "$wanted" ]]; then
+                    error "Unexpected argument: $1 (quote a multi-word release title)"
+                fi
+                wanted="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$wanted" ]] || [[ "$set_title" == false && "$set_description" == false && -z "$new_start" && -z "$new_end" ]]; then
+        error "Usage: zh release edit <title|id> [-t \"New title\"] [-d \"Description\"] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+
+Change a release's title, description or dates. Pass at least one change.
+Use 'zh release close' / 'zh release reopen' to change its state.
+
+Examples:
+  zh release edit \"Spring launch\" --end 2026-04-07
+  zh release edit \"Spring launch\" -t \"Spring launch (v2)\""
+    fi
+
+    if [[ "$set_title" == true && -z "$new_title" ]]; then
+        error "A release title can't be empty"
+    fi
+    [[ -z "$new_start" ]] || zh_release_validate_date "--start" "$new_start"
+    [[ -z "$new_end" ]] || zh_release_validate_date "--end" "$new_end"
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local resolved release_id release_title
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted")
+    release_id="${resolved%%	*}"
+    release_title="${resolved#*	}"
+
+    # Check the resulting date range, filling in whichever side isn't
+    # changing from the release's current dates.
+    if [[ -n "$new_start" || -n "$new_end" ]]; then
+        local current
+        current=$(zh_graphql 'query($id: ID!) { node(id: $id) { ... on Release { startOn endOn } } }' \
+            "$(jq -n --arg id "$release_id" '{id: $id}')")
+        local check_start="${new_start:-$(echo "$current" | jq -r '.data.node.startOn // ""')}"
+        local check_end="${new_end:-$(echo "$current" | jq -r '.data.node.endOn // ""')}"
+        if [[ -n "$check_start" && -n "$check_end" && "$check_start" > "$check_end" ]]; then
+            error "The start date (${check_start}) would be after the end date (${check_end})"
+        fi
+    fi
+
+    local changes
+    changes=$(jq -n \
+        --arg title "$new_title" --argjson set_title "$set_title" \
+        --arg description "$new_description" --argjson set_description "$set_description" \
+        --arg start "$new_start" --arg end "$new_end" \
+        '{}
+         + (if $set_title then {title: $title} else {} end)
+         + (if $set_description then {description: $description} else {} end)
+         + (if $start != "" then {startOn: $start} else {} end)
+         + (if $end != "" then {endOn: $end} else {} end)')
+
+    zh_release_update "$release_id" "$changes" >/dev/null
+
+    echo ""
+    success "Updated release: ${release_title}"
+    echo "$changes" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
+}
+
+# Apply a ReleaseUpdateInput object to a release; echoes the updated release.
+zh_release_update() {
+    local release_id="$1"
+    local changes="$2"
+
+    local query='
+    mutation($input: UpdateReleaseInput!) {
+        updateRelease(input: $input) {
+            release { id title description state startOn endOn closedAt }
+        }
+    }'
+
+    local variables
+    variables=$(jq -n --arg id "$release_id" --argjson release "$changes" \
+        '{input: {releaseId: $id, release: $release}}')
+
+    local response
+    response=$(zh_graphql "$query" "$variables")
+
+    if [[ -z "$(echo "$response" | jq -r '.data.updateRelease.release.id // empty')" ]]; then
+        error "ZenHub did not confirm the release update"
+    fi
+    echo "$response" | jq '.data.updateRelease.release'
+}
+
+# Shared body for `release close` / `release reopen`.
+zh_release_set_state() {
+    local target_state="$1"
+    local verb="$2"
+    shift 2
+
+    load_config
+
+    local wanted="${1:-}"
+    if [[ -z "$wanted" ]]; then
+        error "Usage: zh release ${verb} <title|id>"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    local resolved release_id release_title
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted")
+    release_id="${resolved%%	*}"
+    release_title="${resolved#*	}"
+
+    local updated
+    updated=$(zh_release_update "$release_id" "$(jq -n --arg s "$target_state" '{state: $s}')")
+
+    local final_state
+    final_state=$(echo "$updated" | jq -r '.state // ""')
+    if [[ "$final_state" != "$target_state" ]]; then
+        error "ZenHub reported state '${final_state}' after the ${verb}, expected ${target_state}"
+    fi
+
+    echo ""
+    success "Release ${target_state}: ${release_title}"
+}
+
+cmd_release_close() { zh_release_set_state "CLOSED" "close" "$@"; }
+cmd_release_reopen() { zh_release_set_state "OPEN" "reopen" "$@"; }
+
+cmd_release_delete() {
+    error "ZenHub's public API has no way to delete a release.
+
+Close it instead, which hides it from 'zh releases' and keeps its history:
+  zh release close <title|id>
+
+To remove it completely, delete it in the ZenHub web app."
+}
+
+cmd_release() {
+    if [[ $# -eq 0 ]]; then
+        cmd_releases
+        return
+    fi
+
+    local sub="$1"
+    shift
+    case "$sub" in
+        list|ls) cmd_releases "$@" ;;
+        show|view) cmd_release_show "$@" ;;
+        create|new) cmd_release_create "$@" ;;
+        edit|update) cmd_release_edit "$@" ;;
+        close) cmd_release_close "$@" ;;
+        reopen) cmd_release_reopen "$@" ;;
+        delete|rm) cmd_release_delete "$@" ;;
+        *) cmd_release_show "$sub" "$@" ;;
+    esac
+}
+
 
 # Shared helper: resolve a list of issue numbers to ZenHub issue IDs.
 # Echoes a JSON array of IDs (one per resolved issue) on stdout; errors out
@@ -9277,6 +10015,12 @@ main() {
         sr)
             # Top-level alias for `zh sprint remove`
             cmd_sprint_remove "$@"
+            ;;
+        releases|rels)
+            cmd_releases "$@"
+            ;;
+        release|rel)
+            cmd_release "$@"
             ;;
         *)
             error "Unknown command: $command

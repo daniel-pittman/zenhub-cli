@@ -180,6 +180,11 @@ ZH_REST_TOKEN=your_rest_token_here
 | `sprint <name>` | | View sprint details and issues |
 | `sprint add <name> <issue#> [...]` | `sa` (top-level) | Add one or more issues to a sprint |
 | `sprint remove <name> <issue#> [...]` | `sr` (top-level), `rm` | Remove one or more issues from a sprint |
+| `releases [--all\|--closed] [--json]` | `rels`, `release list` | List releases in workspace (see [Releases](#releases)) |
+| `release <title\|id>` | `rel`, `release show` | View release details and issues |
+| `release create "Title" --start <date> --end <date>` | `release new` | Create a release for the current repo |
+| `release edit <title\|id> [-t] [-d] [--start] [--end]` | `release update` | Change a release's title, description or dates |
+| `release close <title\|id>` / `release reopen <title\|id>` | | Mark a release closed or open |
 | `types` | | List assignable issue types (name, level, disposition, source) |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -746,6 +751,34 @@ zh sprint add "Sprint 5" 42
 The mutations report per-issue success / failure. An issue can fail to link for several reasons the API doesn't differentiate (already in the sprint, archived, otherwise ineligible) — `zh` surfaces the count and the affected issue numbers so you can investigate.
 
 > Sprint functionality is inspired by the design proposed in [#2](https://github.com/daniel-pittman/zenhub-cli/pull/2) by [@jeremiahrose](https://github.com/jeremiahrose). The sprint queries (list / show / current) and mutations (add / remove) are credited to that design via `Co-Authored-By` trailers on the commits.
+
+### Releases
+
+A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids.
+
+```bash
+# List open releases; --all includes closed ones, --closed shows only closed
+zh releases
+zh releases --all --json
+
+# View a release's dates, state and issues
+zh release "Spring launch"
+zh release show "Spring launch" --no-urls
+
+# Create a release for the current repo (dates are YYYY-MM-DD)
+zh release create "Spring launch" --start 2026-03-01 --end 2026-03-31 -d "Notes"
+zh release create "Hotfix" -s 2026-04-02 -e 2026-04-02 -q    # print only the new id
+
+# Change the title, description or dates (only the fields you pass are sent)
+zh release edit "Spring launch" --end 2026-04-07
+zh release edit "Spring launch" -t "Spring launch (v2)"
+
+# Close or reopen
+zh release close "Spring launch"
+zh release reopen "Spring launch"
+```
+
+ZenHub's public API has no mutation for deleting a release, so `zh release delete` exits with an explanation and suggests `zh release close`. Delete a release in the ZenHub web app if it must be removed completely.
 
 ### Discovery Commands
 
