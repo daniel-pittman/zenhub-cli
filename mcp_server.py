@@ -1658,7 +1658,7 @@ def pipeline_delete(name: str, confirm: bool = False, repo_path: str = "",
     destination required by the API, reporting it even though no issues move.
 
     Args:
-        name: Exact or unambiguous partial pipeline name, case-insensitive.
+        name: Exact pipeline name, case-insensitive; a partial match is refused.
         confirm: Explicit approval to delete; only True forwards -y to zh.
         repo_path: Optional absolute path of a git checkout to run zh from.
         workspace: Optional workspace name, forwarded through zh -w.

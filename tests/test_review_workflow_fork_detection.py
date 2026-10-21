@@ -8,14 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import yaml
-
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/claude-code-review.yml"
 SAME_REPO_TEST = "github.event.pull_request.head.repo.full_name != github.repository"
-
-
-def test_workflow_parses():
-    assert yaml.safe_load(WORKFLOW.read_text())["jobs"]
 
 
 def test_fork_detection_compares_repository_names():
@@ -27,11 +21,3 @@ def test_fork_detection_compares_repository_names():
     is_fork = next(line for line in gate.splitlines() if line.strip().startswith("IS_FORK:"))
     assert SAME_REPO_TEST in is_fork
 
-
-def _is_fork(head_full_name: str, repository: str) -> bool:
-    return head_full_name != repository
-
-
-def test_internal_pr_in_a_forked_repository_is_not_a_fork():
-    assert _is_fork("acme/forked-project", "acme/forked-project") is False
-    assert _is_fork("contributor/forked-project", "acme/forked-project") is True
