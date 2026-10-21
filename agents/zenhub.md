@@ -105,6 +105,7 @@ The sprint mutations report per-issue success / failure. The ZenHub API doesn't 
 - `zh release edit <title|id> [-t <title>] [-d <description>] [--start YYYY-MM-DD] [--end YYYY-MM-DD]` — sends only the fields given; the resulting date range is checked first.
 - `zh release close <title|id>` / `zh release reopen <title|id>` — set the release state.
 - `zh release delete` is refused: ZenHub's public API has no delete mutation. Propose `close`, or deletion in the ZenHub web app.
+- MCP equivalents: `release_list`, `release_show`, `release_create`, `release_edit`, `release_close`, `release_reopen` (there is no `release_delete`). A listing flagged `incomplete` means a title can't be trusted for edit/close/reopen; pass the release id. Releases can't be deleted, so confirm title and dates before `release_create`.
 
 ### Repository / workspace targeting (global flags)
 - `-r owner/repo` (alias `--repo`) before any subcommand: target a specific GitHub repo instead of the one `git remote get-url origin` resolves.
