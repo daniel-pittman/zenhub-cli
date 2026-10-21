@@ -127,6 +127,9 @@ zh release <title>                            # Release detail + issues (also: r
 zh release create "Title" --start 2026-03-01 --end 2026-03-31 [-d desc] [--json|-q]
 zh release edit <title> [-t title] [-d desc] [--start date] [--end date]
 zh release close <title> / zh release reopen <title>
+zh release add <title> <issue#> [...] [--json]    # Add issues to a release
+zh release remove <title> <issue#> [...] [--json] # Remove issues (alias: rm)
+                                              # 0 confirmed / 1 failure / 2 re-read incomplete
 zh release delete <title>                     # Not in ZenHub's public API: explains, suggests close
 
 # Global flags (peeled off before any subcommand)
