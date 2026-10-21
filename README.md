@@ -185,6 +185,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `release create "Title" --start <date> --end <date>` | `release new` | Create a release for the current repo |
 | `release edit <title\|id> [-t] [-d] [--start] [--end]` | `release update` | Change a release's title, description or dates |
 | `release close <title\|id>` / `release reopen <title\|id>` | | Mark a release closed or open |
+| `release delete <title\|id>` | `release rm` | Always refused: ZenHub's public API has no delete mutation. Explains and suggests `release close` |
 | `types` | | List assignable issue types (name, level, disposition, source) |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -754,7 +755,7 @@ The mutations report per-issue success / failure. An issue can fail to link for 
 
 ### Releases
 
-A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids.
+A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids. A multi-word title must be quoted, and a title starting with `-` needs `zh -- release ...`. Dates must be real calendar dates. If the release listing is incomplete (exit 2), `edit`, `close` and `reopen` refuse a title and need the id.
 
 ```bash
 # List open releases; --all includes closed ones, --closed shows only closed
@@ -938,7 +939,10 @@ Roughly 35 tools covering the same surface as `zh`:
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
 | Sub-issue management | `subissue_add_children`, `subissue_remove_children`, `subissue_reorder` |
 | Sprint membership | `sprint_add_issues`, `sprint_remove_issues` |
+| Releases | `release_list`, `release_show` (read); `release_create`, `release_edit`, `release_close`, `release_reopen` (write). No `release_delete`: the API cannot delete one |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
+
+Release tools address a release by title (case-insensitive) or id. A listing that bailed mid-pagination comes back with `incomplete=true`; the mutating tools then refuse a title and need the release id.
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
 

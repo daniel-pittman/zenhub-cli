@@ -11,6 +11,9 @@ Wraps tools/zh so that:
     epic_close, epic_reopen, subissue_add_children, subissue_remove_children,
     subissue_reorder, assign, unassign, estimate) are explicit verbs
     so callers can audit which destructive operations they invoked.
+  - Release tools (release_list, release_show, release_create, release_edit,
+    release_close, release_reopen) wrap `zh release`; there is no
+    release_delete because ZenHub's API cannot delete a release.
 
 v1.9.0 model migration: ZenHub removed Legacy Epics and ZenhubEpics in June
 2025. The epic_* tools no longer hit the dead ZenhubEpic API; an epic is now a
@@ -4765,6 +4768,238 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
         "partial_success_warning": result.get("partial_success_warning"),
         "stderr": result.get("error") or "",
     }
+
+
+# =============================================================================
+# Release tools
+#
+# Thin wrappers over `zh release ...`. A release is addressed by title
+# (case-insensitive) or ZenHub id. ZenHub's public API has no delete mutation,
+# so there is deliberately no release_delete tool: close the release instead.
+# =============================================================================
+
+def _release_args(sub: str, ref: str, *rest: str) -> list[str]:
+    """Build the `zh release <sub> <ref> ...` argv.
+
+    A reference that begins with `-` would parse as a flag, so it is routed
+    through zh's global `--`, which makes it a positional.
+    """
+    args = ["release", sub, ref, *rest]
+    return (["--"] + args) if ref.startswith("-") else args
+
+
+def _release_ref_error(ref: str) -> str:
+    return "" if ref and str(ref).strip() else "release must be a non-empty title or id"
+
+
+@mcp.tool()
+def release_list(include_closed: bool = False, repo_path: str = "") -> dict:
+    """List releases in the workspace.
+
+    Args:
+        include_closed: include CLOSED releases. Defaults to OPEN only.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with:
+            ok: bool (False when the listing could not be read at all)
+            workspace: str
+            releases: list[dict] — each with id, title, description,
+                state ("OPEN" | "CLOSED"), startOn, endOn (YYYY-MM-DD),
+                closedAt, issuesCount, repositories
+            incomplete: bool — True when pagination bailed, so `releases`
+                may be missing some; the CLI exits 2 in that case
+            pagination_bailed: str ("" when complete)
+            raw: stdout, stderr: error output
+    """
+    args = ["releases", "--json"]
+    if include_closed:
+        args.append("--all")
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"])
+    data = data if isinstance(data, dict) else {}
+    bailed = data.get("pagination_bailed") or ""
+    return {
+        # Exit 2 with a payload is an incomplete listing, not a failed call.
+        "ok": bool(data),
+        "workspace": data.get("workspace", ""),
+        "releases": data.get("releases", []),
+        "incomplete": bool(bailed),
+        "pagination_bailed": bailed,
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def release_show(release: str, repo_path: str = "") -> dict:
+    """Show a release's dates, state and issues.
+
+    Args:
+        release: Release title (case-insensitive) or ZenHub release id.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with:
+            ok: bool
+            release: dict | None — id, title, description, state, startOn,
+                endOn, closedAt, issuesCount, repositories
+            issues: list[dict] — number, title, state, htmlUrl, estimate,
+                assignees, repository, pipelineIssue (pipeline in this
+                workspace)
+            incomplete: bool — True when the issue list was cut short
+            pagination_bailed: str
+            raw: stdout, stderr: error output
+    """
+    err = _release_ref_error(release)
+    if err:
+        return {"ok": False, "release": None, "issues": [], "incomplete": False,
+                "pagination_bailed": "", "raw": "", "stderr": err}
+    r = _run_zh(_release_args("show", release, "--json"), cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"])
+    data = data if isinstance(data, dict) else {}
+    bailed = data.get("pagination_bailed") or ""
+    issues = data.get("issues", [])
+    detail = {k: v for k, v in data.items() if k not in ("issues", "pagination_bailed")}
+    return {
+        "ok": bool(data),
+        "release": detail or None,
+        "issues": issues,
+        "incomplete": bool(bailed),
+        "pagination_bailed": bailed,
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def release_create(title: str, start: str, end: str, description: str = "",
+                   repo_path: str = "") -> dict:
+    """Create a release attached to the current repository.
+
+    Releases cannot be deleted through ZenHub's API, so confirm the title
+    and dates before calling.
+
+    Args:
+        title: Release title (required, non-empty).
+        start: Start date, a real calendar date as YYYY-MM-DD.
+        end: End date, YYYY-MM-DD, not before `start`.
+        description: Optional description.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, id (new release id or None), release (the created
+        release dict or None), raw, stderr.
+    """
+    if not title or not str(title).strip():
+        return {"ok": False, "id": None, "release": None, "raw": "",
+                "stderr": "title must be non-empty"}
+    if not start or not end:
+        return {"ok": False, "id": None, "release": None, "raw": "",
+                "stderr": "start and end dates (YYYY-MM-DD) are required"}
+    args = ["release", "create", title, "--start", start, "--end", end, "--json"]
+    if description:
+        args += ["--description", description]
+    if title.startswith("-"):
+        args = ["--"] + args
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"])
+    data = data if isinstance(data, dict) else None
+    return {
+        "ok": r["ok"] and data is not None,
+        "id": data.get("id") if data else None,
+        "release": data,
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def release_edit(release: str, title: str = "", description: str | None = None,
+                 start: str = "", end: str = "", repo_path: str = "") -> dict:
+    """Change a release's title, description or dates.
+
+    Only the fields you pass are sent. Use release_close / release_reopen to
+    change state. If the release listing is incomplete, a title reference is
+    refused (exit 2); pass the release id then.
+
+    Args:
+        release: Release title (case-insensitive) or ZenHub release id.
+        title: New title; empty leaves it unchanged.
+        description: New description; None leaves it unchanged, "" clears it.
+        start: New start date YYYY-MM-DD; empty leaves it unchanged.
+        end: New end date YYYY-MM-DD; empty leaves it unchanged.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, release (the reference as given), raw, stderr.
+    """
+    err = _release_ref_error(release)
+    if not err and not (title or start or end or description is not None):
+        err = "pass at least one of title, description, start, end"
+    if err:
+        return {"ok": False, "release": release, "raw": "", "stderr": err}
+    rest: list[str] = []
+    if title:
+        rest += ["--title", title]
+    if description is not None:
+        rest += ["--description", description]
+    if start:
+        rest += ["--start", start]
+    if end:
+        rest += ["--end", end]
+    r = _run_zh(_release_args("edit", release, *rest), cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "release": release,
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+def _release_set_state(sub: str, release: str, repo_path: str) -> dict:
+    err = _release_ref_error(release)
+    if err:
+        return {"ok": False, "release": release, "raw": "", "stderr": err}
+    r = _run_zh(_release_args(sub, release), cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "release": release,
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def release_close(release: str, repo_path: str = "") -> dict:
+    """Mark a release CLOSED (hides it from release_list by default).
+
+    This is the supported way to retire a release: ZenHub's API cannot
+    delete one. If the release listing is incomplete, a title reference is
+    refused (exit 2); pass the release id then.
+
+    Args:
+        release: Release title (case-insensitive) or ZenHub release id.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, release (the reference as given), raw, stderr.
+    """
+    return _release_set_state("close", release, repo_path)
+
+
+@mcp.tool()
+def release_reopen(release: str, repo_path: str = "") -> dict:
+    """Mark a closed release OPEN again.
+
+    Args:
+        release: Release title (case-insensitive) or ZenHub release id.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with: ok, release (the reference as given), raw, stderr.
+    """
+    return _release_set_state("reopen", release, repo_path)
 
 
 # =============================================================================

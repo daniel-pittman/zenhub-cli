@@ -128,6 +128,7 @@ zh release create "Title" --start 2026-03-01 --end 2026-03-31 [-d desc] [--json|
 zh release edit <title> [-t title] [-d desc] [--start date] [--end date]
 zh release close <title> / zh release reopen <title>
 zh release delete <title>                     # Not in ZenHub's public API: explains, suggests close
+# MCP: release_list, release_show, release_create, release_edit, release_close, release_reopen (no delete)
 
 # Global flags (peeled off before any subcommand)
 zh -r owner/repo <cmd>                        # Target a specific repo

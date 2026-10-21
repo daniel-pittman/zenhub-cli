@@ -53,12 +53,12 @@ def _stubs(releases: list[dict] | None = None) -> str:
              "htmlUrl": "https://github.com/acme/widgets/issues/7",
              "estimate": {"value": 2}, "assignees": {"nodes": [{"login": "alice"}]},
              "repository": {"ownerName": "acme", "name": "widgets"},
-             "pipelineIssues": {"nodes": [{"pipeline": {"name": "In Progress"}}]}},
+             "pipelineIssue": {"pipeline": {"name": "In Progress"}}},
             {"number": 8, "title": "Done thing", "state": "CLOSED",
              "htmlUrl": "https://github.com/acme/widgets/issues/8",
              "estimate": None, "assignees": {"nodes": []},
              "repository": {"ownerName": "acme", "name": "widgets"},
-             "pipelineIssues": {"nodes": []}},
+             "pipelineIssue": None},
         ],
     }}}})
     return f"""
@@ -80,6 +80,7 @@ def _stubs(releases: list[dict] | None = None) -> str:
             echo "LIST_VARS=$(printf '%s' "$v" | jq -c .)" >&2
             printf '%s' '{list_resp}'
         elif [[ "$q" == *"issues(first"* ]]; then
+            echo "ISSUES_VARS=$(printf '%s' "$v" | jq -c .)" >&2
             printf '%s' '{issues_resp}'
         else
             case "$v" in
@@ -287,3 +288,174 @@ def test_bare_release_lists_and_title_shows() -> None:
     shown = run_zh_with_stubs(_stubs(), 'main rel "Spring launch" --no-urls')
     assert shown.returncode == 0, shown.stderr
     assert "Release: Spring launch" in shown.stdout
+
+
+# --- review fixes ----------------------------------------------------------------
+
+def _stuck_stubs() -> str:
+    """Base stubs, except the release listing always reports another page
+    behind the same cursor."""
+    page = json.dumps({"data": {"workspace": {"name": "TestWS", "releases": {
+        "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+        "nodes": [_release("rel-1", "Spring launch")]}}}})
+    return (
+        _stubs()
+        + 'eval "_base_gql() $(declare -f zh_graphql | tail -n +2)"\n'
+        + "zh_graphql() {\n"
+        + '    if [[ "$1" == *"releases(first"* ]]; then\n'
+        + f"        printf '%s' '{page}'\n"
+        + "    else\n"
+        + '        _base_gql "$@"\n'
+        + "    fi\n"
+        + "}\n"
+    )
+
+
+def test_close_refuses_extra_positional_args() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_close Spring launch')
+    assert r.returncode != 0
+    assert "Unexpected argument: launch" in r.stderr
+    assert "quote" in r.stderr
+    assert _mutation(r.stderr) is None
+
+
+def test_reopen_refuses_extra_positional_args() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_reopen Old release')
+    assert r.returncode != 0
+    assert "Unexpected argument: release" in r.stderr
+    assert _mutation(r.stderr) is None
+
+
+def test_show_refuses_extra_positional_args() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_show Spring launch')
+    assert r.returncode != 0
+    assert "Unexpected argument: launch" in r.stderr
+
+
+def test_bare_release_flag_is_not_a_title() -> None:
+    r = run_zh_with_stubs(_stubs(), "main release --all")
+    assert r.returncode != 0
+    assert "Unknown option for release: --all" in r.stderr
+    assert "zh releases --all" in r.stderr
+
+
+def test_show_flag_shaped_title_needs_double_dash() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_show --bogus')
+    assert r.returncode != 0
+    assert "Unknown option for release show: --bogus" in r.stderr
+
+
+def test_dash_title_accepted_after_double_dash_for_show_edit_close() -> None:
+    dash = [_release("rel-d", "-dash release")]
+    show = run_zh_with_stubs(_stubs(dash), 'main -- release show "-dash release" --no-urls')
+    assert show.returncode == 0, show.stderr
+    assert "Release: -dash release" in show.stdout
+
+    edit = run_zh_with_stubs(_stubs(dash), 'main -- release edit "-dash release" -d x')
+    assert edit.returncode == 0, edit.stderr
+    assert _mutation(edit.stderr)["input"]["releaseId"] == "rel-d"
+
+    close = run_zh_with_stubs(_stubs(dash), 'main -- release close "-dash release"')
+    assert close.returncode == 0, close.stderr
+    assert _mutation(close.stderr)["input"]["releaseId"] == "rel-d"
+
+
+def test_dash_title_refused_without_double_dash() -> None:
+    dash = [_release("rel-d", "-dash release")]
+    r = run_zh_with_stubs(_stubs(dash), 'main release edit "-dash release" -d x')
+    assert r.returncode != 0
+    assert "needs 'zh -- release edit" in r.stderr
+    assert _mutation(r.stderr) is None
+
+
+def test_create_rejects_impossible_calendar_dates() -> None:
+    for bad in ("2026-02-31", "2025-02-29", "2026-04-31", "2026-06-31", "0000-01-01"):
+        r = run_zh_with_stubs(_stubs(), f'cmd_release_create "X" --start {bad} --end 2027-12-31')
+        assert r.returncode != 0, bad
+        assert "Invalid --start date" in r.stderr, bad
+        assert _mutation(r.stderr) is None, bad
+
+
+def test_create_accepts_leap_day() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_create "X" --start 2024-02-29 --end 2024-03-01 -q')
+    assert r.returncode == 0, r.stderr
+    assert _mutation(r.stderr)["input"]["release"]["startOn"] == "2024-02-29"
+
+
+def test_edit_rejects_impossible_calendar_date() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_edit "Spring launch" --end 2026-02-30')
+    assert r.returncode != 0
+    assert "Invalid --end date" in r.stderr
+    assert _mutation(r.stderr) is None
+
+
+def test_stuck_cursor_does_not_double_count_and_json_exits_2() -> None:
+    r = run_zh_with_stubs(_stuck_stubs(), "cmd_releases --json")
+    assert r.returncode == 2, r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["pagination_bailed"] == "stuck_cursor"
+    assert [rel["id"] for rel in doc["releases"]] == ["rel-1"]
+
+
+def test_stuck_cursor_text_mode_exits_2() -> None:
+    r = run_zh_with_stubs(_stuck_stubs(), "cmd_releases")
+    assert r.returncode == 2
+
+
+def test_mutation_refuses_title_match_when_listing_incomplete() -> None:
+    for cmd in ('cmd_release_close "Spring launch"',
+                'cmd_release_reopen "Spring launch"',
+                'cmd_release_edit "Spring launch" -d x'):
+        r = run_zh_with_stubs(_stuck_stubs(), cmd)
+        assert r.returncode == 2, (cmd, r.stderr)
+        assert "Pass the release id" in r.stderr
+        assert _mutation(r.stderr) is None
+
+
+def test_mutation_by_id_still_allowed_when_listing_incomplete() -> None:
+    r = run_zh_with_stubs(_stuck_stubs(), "cmd_release_close rel-1")
+    assert r.returncode == 0, r.stderr
+    assert _mutation(r.stderr)["input"]["releaseId"] == "rel-1"
+
+
+def test_show_by_title_warns_when_listing_incomplete() -> None:
+    r = run_zh_with_stubs(_stuck_stubs(), 'cmd_release_show "Spring launch" --no-urls')
+    assert r.returncode == 0, r.stderr
+    assert "listing was incomplete" in r.stderr
+
+
+def test_show_scopes_pipeline_to_the_workspace() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_show "Spring launch"')
+    assert r.returncode == 0, r.stderr
+    vars_line = next(l for l in r.stderr.splitlines() if l.startswith("ISSUES_VARS="))
+    assert json.loads(vars_line[len("ISSUES_VARS="):])["workspaceId"] == "ws-gid"
+    assert "In Progress" in r.stdout
+
+
+def test_truncated_repository_list_is_stated() -> None:
+    many = _release("rel-m", "Many repos")
+    many["repositories"]["totalCount"] = 3
+    listed = run_zh_with_stubs(_stubs([many]), "cmd_releases")
+    assert "widgets (+2 more)" in listed.stdout
+    shown = run_zh_with_stubs(_stubs([many]), 'cmd_release_show "Many repos"')
+    assert "acme/widgets (+2 more)" in shown.stdout
+
+
+def test_edit_header_shows_new_title_after_rename() -> None:
+    r = run_zh_with_stubs(_stubs(), 'cmd_release_edit "Spring launch" -t "Renamed"')
+    assert r.returncode == 0, r.stderr
+    assert "Updated release: Renamed" in r.stdout
+
+
+def test_unreadable_api_response_fails_cleanly_without_jq_noise() -> None:
+    stubs = _stubs() + "zh_graphql() { printf '%s' '<html>502 Bad Gateway</html>'; }\n"
+    for cmd in ("cmd_releases", 'cmd_release_show "x"', 'cmd_release_close "x"'):
+        r = run_zh_with_stubs(stubs, cmd)
+        assert r.returncode == 1, cmd
+        assert "unreadable response" in r.stderr
+        assert "jq:" not in r.stderr and "parse error" not in r.stderr
+
+
+def test_help_documents_short_date_flags() -> None:
+    r = run_zh_with_stubs(_stubs(), "cmd_help")
+    assert "-s|--start" in r.stdout and "-e|--end" in r.stdout
