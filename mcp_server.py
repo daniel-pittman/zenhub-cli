@@ -9,7 +9,8 @@ Wraps tools/zh so that:
   - Write tools (create_issue, close_issue, move_issue, reorder, comment,
     epic_create, epic_update, epic_add_children, epic_remove_children,
     epic_close, epic_reopen, subissue_add_children, subissue_remove_children,
-    subissue_reorder, assign, unassign, estimate) are explicit verbs
+    subissue_reorder, assign, unassign, estimate, pipeline_create,
+    pipeline_move, pipeline_rename, pipeline_delete) are explicit verbs
     so callers can audit which destructive operations they invoked.
 
 v1.9.0 model migration: ZenHub removed Legacy Epics and ZenhubEpics in June
@@ -1531,7 +1532,7 @@ def pipeline(name: str, repo_path: str = "") -> dict:
         dict with: ok, pipeline (name), issues (list of {number, repo,
         estimate, assignee, title}), raw, stderr.
     """
-    r = _run_zh(["pipeline", name], cwd=_resolve_cwd(repo_path))
+    r = _run_zh(["pipeline", "--", name], cwd=_resolve_cwd(repo_path))
     return {
         "ok": r["ok"],
         "pipeline": name,
@@ -1539,6 +1540,140 @@ def pipeline(name: str, repo_path: str = "") -> dict:
         "raw": r["stdout_plain"],
         "stderr": _stderr_plain(r),
     }
+
+
+def _pipeline_write(args: list[str], name: str, repo_path: str,
+                    workspace: str) -> dict:
+    """Run a pipeline mutation with the same cwd and output contract as writes."""
+    if workspace:
+        args = ["-w", workspace, *args]
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    return {
+        "ok": r["ok"],
+        "partial_applied": False,
+        "pipeline": name,
+        "raw": r["stdout_plain"],
+        "stderr": _stderr_plain(r),
+    }
+
+
+@mcp.tool()
+def pipeline_create(name: str, after: str = "", before: str = "",
+                    position: int | None = None, description: str | None = None,
+                    repo_path: str = "", workspace: str = "") -> dict:
+    """Create a pipeline, appending by default, and return its resulting order.
+
+    Args:
+        name: New name; existing case-insensitive names are refused.
+        after: Insert after this exact or unambiguous partial pipeline name.
+        before: Insert before this exact or unambiguous partial pipeline name.
+        position: Zero-based index. Use only one of after, before, position.
+        description: Optional description, including an explicit empty string.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+        workspace: Optional workspace name, forwarded through zh -w.
+
+    Returns:
+        dict with: ok, partial_applied, pipeline, id, pipelines (ordered rows
+        with changed=true on the new pipeline), raw, stderr.
+    """
+    args = ["pipeline", "create", "--json"]
+    if after:
+        args.extend(["--after", after])
+    if before:
+        args.extend(["--before", before])
+    if position is not None:
+        args.extend(["--position", str(position)])
+    if description is not None:
+        args.extend(["-d", description])
+    args.extend(["--", name])
+    result = _pipeline_write(args, name, repo_path, workspace)
+    data = _parse_create_json(result["raw"]) if result["ok"] else None
+    result.update(id=data.get("id") if data else None,
+                  pipelines=data.get("pipelines", []) if data else [])
+    return result
+
+
+@mcp.tool()
+def pipeline_move(name: str, after: str = "", before: str = "",
+                  position: int | None = None, repo_path: str = "",
+                  workspace: str = "") -> dict:
+    """Move a pipeline and print the resulting order with the target marked.
+
+    Args:
+        name: Exact or unambiguous partial pipeline name, case-insensitive.
+        after: Place after this pipeline, resolving with the source removed.
+        before: Place before this pipeline, resolving with the source removed.
+        position: Final zero-based index. Exactly one placement is required.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+        workspace: Optional workspace name, forwarded through zh -w.
+
+    Returns:
+        dict with: ok, partial_applied, pipeline, raw, stderr.
+    """
+    args = ["pipeline", "move"]
+    if after:
+        args.extend(["--after", after])
+    if before:
+        args.extend(["--before", before])
+    if position is not None:
+        args.extend(["--position", str(position)])
+    args.extend(["--", name])
+    return _pipeline_write(args, name, repo_path, workspace)
+
+
+@mcp.tool()
+def pipeline_rename(name: str, new_name: str, description: str | None = None,
+                    repo_path: str = "", workspace: str = "") -> dict:
+    """Rename a pipeline and optionally set or clear its description.
+
+    Args:
+        name: Exact or unambiguous partial pipeline name, case-insensitive.
+        new_name: New pipeline name.
+        description: Optional description; an empty string clears it.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+        workspace: Optional workspace name, forwarded through zh -w.
+
+    Returns:
+        dict with: ok, partial_applied, pipeline, raw, stderr.
+    """
+    args = ["pipeline", "rename"]
+    if description is not None:
+        args.extend(["-d", description])
+    args.extend(["--", name, new_name])
+    return _pipeline_write(args, name, repo_path, workspace)
+
+
+@mcp.tool()
+def pipeline_delete(name: str, confirm: bool = False, repo_path: str = "",
+                    workspace: str = "") -> dict:
+    """DANGER: permanently delete an empty pipeline. Propose first for approval.
+
+    Describe the target, why it should be deleted, and the resulting order to
+    the user before calling with confirm=True. With confirm=False this tool
+    refuses without invoking zh. The CLI checks the EXACT totalCount including
+    closed issues and refuses non-empty pipelines. It passes an adjacent
+    destination required by the API, reporting it even though no issues move.
+
+    Args:
+        name: Exact or unambiguous partial pipeline name, case-insensitive.
+        confirm: Explicit approval to delete; only True forwards -y to zh.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+        workspace: Optional workspace name, forwarded through zh -w.
+
+    Returns:
+        dict with: ok, partial_applied, pipeline, confirmation_required,
+        raw, stderr. A refusal mutates nothing.
+    """
+    if confirm is not True:
+        return {
+            "ok": False, "partial_applied": False, "pipeline": name,
+            "confirmation_required": True, "raw": "",
+            "stderr": "Propose the pipeline deletion first, then pass confirm=True after approval.",
+        }
+    result = _pipeline_write(["pipeline", "delete", "-y", "--", name],
+                             name, repo_path, workspace)
+    result["confirmation_required"] = False
+    return result
 
 
 @mcp.tool()
