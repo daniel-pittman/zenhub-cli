@@ -69,7 +69,7 @@ def test_release_show_splits_release_and_issues(monkeypatch):
                           "issues": [{"number": 7}], "pagination_bailed": ""})
     calls = _capture(monkeypatch, stdout=payload)
     out = mcp_server.release_show("Spring")
-    assert calls == [["release", "show", "Spring", "--json"]]
+    assert calls == [["release", "show", "--json", "--", "Spring"]]
     assert out["ok"] is True
     assert out["release"]["id"] == "r1"
     assert "issues" not in out["release"]
@@ -91,10 +91,10 @@ def test_release_show_not_found(monkeypatch):
     assert "not found" in out["stderr"]
 
 
-def test_release_show_dash_title_goes_through_double_dash(monkeypatch):
+def test_release_show_dash_title_follows_double_dash(monkeypatch):
     calls = _capture(monkeypatch, stdout="{}")
     mcp_server.release_show("-odd")
-    assert calls == [["--", "release", "show", "-odd", "--json"]]
+    assert calls == [["release", "show", "--json", "--", "-odd"]]
 
 
 def test_release_tools_reject_empty_reference_without_running_zh(monkeypatch):
@@ -111,8 +111,9 @@ def test_release_create_forwards_everything(monkeypatch):
     calls = _capture(monkeypatch, stdout=created)
     out = mcp_server.release_create("Summer", "2026-05-01", "2026-05-31",
                                     description="Notes")
-    assert calls == [["release", "create", "Summer", "--start", "2026-05-01",
-                      "--end", "2026-05-31", "--json", "--description", "Notes"]]
+    assert calls == [["release", "create", "--start", "2026-05-01",
+                      "--end", "2026-05-31", "--json", "--description", "Notes",
+                      "--", "Summer"]]
     assert out["ok"] is True and out["id"] == "r-new"
 
 
@@ -139,14 +140,14 @@ def test_release_create_failure(monkeypatch):
 def test_release_edit_sends_only_given_fields(monkeypatch):
     calls = _capture(monkeypatch, stdout="Updated release: X")
     out = mcp_server.release_edit("Spring", end="2026-04-07")
-    assert calls == [["release", "edit", "Spring", "--end", "2026-04-07"]]
+    assert calls == [["release", "edit", "--end", "2026-04-07", "--", "Spring"]]
     assert out["ok"] is True
 
 
 def test_release_edit_empty_description_clears_it(monkeypatch):
     calls = _capture(monkeypatch)
     mcp_server.release_edit("Spring", description="")
-    assert calls == [["release", "edit", "Spring", "--description", ""]]
+    assert calls == [["release", "edit", "--description", "", "--", "Spring"]]
 
 
 def test_release_edit_requires_a_change(monkeypatch):
@@ -160,7 +161,7 @@ def test_release_close_and_reopen(monkeypatch):
     calls = _capture(monkeypatch, stdout="Release CLOSED: Spring")
     assert mcp_server.release_close("Spring")["ok"] is True
     assert mcp_server.release_reopen("Spring")["ok"] is True
-    assert calls == [["release", "close", "Spring"], ["release", "reopen", "Spring"]]
+    assert calls == [["release", "close", "--", "Spring"], ["release", "reopen", "--", "Spring"]]
 
 
 def test_release_close_surfaces_cli_refusal(monkeypatch):

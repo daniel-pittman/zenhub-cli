@@ -148,7 +148,7 @@ def test_duplicate_names_refuse(verb, args):
 
 
 @pytest.mark.parametrize("args", [
-    ["move", "Do", "--position", "0"], ["rename", "Do", "New"], ["delete", "Do", "-y"],
+    ["move", "Do", "--position", "0"], ["rename", "Do", "New"],
     ["create", "New", "--after", "Do"], ["move", "Backlog", "--before", "Do"],
 ])
 def test_ambiguous_names_and_anchors_refuse_and_list_candidates(args):
@@ -330,11 +330,43 @@ def test_missing_names_report_usage_without_loading_config(verb):
     assert "MUST NOT LOAD" not in r.stderr
 
 
-def test_help_cannot_be_consumed_as_description_and_mutate():
-    r = _run(["create", "New", "-d", "--help"])
+@pytest.mark.parametrize("value", ["-h", "--help"])
+def test_help_flag_as_option_value_is_sent_literally(value):
+    r = _run(["create", "New", "-d", value])
     assert r.returncode == 0, r.stderr
-    assert "Usage: zh pipeline" in r.stdout
+    assert "Usage: zh pipeline" not in r.stdout
+    assert _mutation(r)[0]["input"]["description"] == value
+
+
+@pytest.mark.parametrize("value", ["-h", "--help"])
+def test_help_flag_as_anchor_value_reaches_the_resolver(value):
+    r = _run(["create", "New", "--after", value])
+    assert r.returncode != 0
+    assert "Usage: zh pipeline" not in r.stdout
+    assert "Pipeline not found: " + value in r.stderr
     assert not _mutation(r)
+
+
+def test_help_flag_still_prints_help_elsewhere():
+    r = _run(["create", "New", "--after", "Doing", "-h"])
+    assert r.returncode == 0 and "Usage: zh pipeline" in r.stdout
+    assert not _mutation(r)
+
+
+@pytest.mark.parametrize("name", ["one", "Do", "dON", "oin"])
+def test_delete_refuses_partial_name_and_names_candidates(name):
+    r = _run(["delete", name, "-y"])
+    assert r.returncode != 0
+    assert "No pipeline named exactly" in r.stderr
+    assert not _mutation(r)
+    if name == "one":
+        assert "Done" in r.stderr
+
+
+def test_delete_accepts_exact_name_case_and_whitespace_insensitive():
+    r = _run(["delete", "  dOnE ", "-y"])
+    assert r.returncode == 0, r.stderr
+    assert _mutation(r)[0]["input"]["pipelineId"] == "p3"
 
 
 def test_create_empty_workspace_and_empty_description():
