@@ -72,6 +72,16 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh unassign <issue#> <user> [user...]` — remove ONLY the named assignee(s); `zh unassign <issue#> --all` to clear everyone (a bare unassign with no user errors rather than removing all, so a missing target can't silently un-assign teammates)
 - `zh priority <issue#> <name|clear>`: set priority by name. Priorities are workspace-defined, NOT a fixed high/medium/low set: the name is matched case-insensitively against the configured priorities (discover with `zh priorities`). An unconfigured name errors and lists the available ones rather than silently mis-setting. `clear` removes the priority.
 
+### Write operations (pipelines)
+
+- `zh pipeline create "Name" [--after "Pipeline" | --before "Pipeline" | --position N] [-d description] [--json|-q]`: create, appending by default. Duplicate names are refused case-insensitively.
+- `zh pipeline move "Name" --after "Pipeline" | --before "Pipeline" | --position N`: change board order. Positions start at 0 and refer to the final index; anchors resolve with the source removed.
+- `zh pipeline rename "Name" "New name" [-d description]`: rename, optionally setting or clearing the description.
+- `zh pipeline delete "Name" [-y]`: **DANGER, propose first ALWAYS.** Only empty pipelines may be deleted, proven by the exact unfiltered `issues.totalCount`, including closed issues and ZenHub-only cards. Missing counts refuse. The API needs a destination, so the CLI passes the previous adjacent pipeline, or the next for the first, and states that no issues move. The only pipeline cannot be deleted. Interactive callers retype the full name; `-y` skips and non-interactive callers proceed without prompting, like `zh delete`.
+- Names prefer an exact case-insensitive match over a partial match. Mutations refuse ambiguity and list candidates. Extra positional arguments refuse; quote multi-word names. Use `zh pipeline -- create` to view verb-named pipelines and `zh pipeline create -- "--name"` for a flag-shaped name, placing options before `--`.
+- All writes re-read and print the resulting order, marking the changed pipeline. Create `--json` returns `{id, name, pipelines}` with ordered rows carrying `changed`; `-q` prints the id with order on stderr. Delete marks the removed name separately.
+- MCP mirrors: `pipeline_create`, `pipeline_move`, `pipeline_rename`, `pipeline_delete`, each accepting `repo_path` and `workspace`. **Never call `pipeline_delete(confirm=True)` until the deletion proposal is approved.** Without explicit confirmation the tool refuses without invoking the CLI.
+
 ### Write operations (relationships)
 - `zh block <blocked#> <blocking#>` — set dependency (blocked is blocked BY blocking)
 - `zh unblock <blocked#> <blocking#>` — remove dependency (requires `ZH_REST_TOKEN` because GraphQL API has no deleteBlockage mutation)
