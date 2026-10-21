@@ -1752,8 +1752,12 @@ cmd_mine() {
 # totalCount precisely to avoid a full walk). But an aggregate only needs to
 # know whether its number is PLAUSIBLE, and that is one asymmetric comparison:
 #
-#   ZenHub reporting MORE open issues than GitHub has  -> implausible. A board
-#       cannot hold more open issues than its repositories contain.
+#   ZenHub reporting MORE open cards than GitHub has   -> implausible. A board
+#       cannot hold more open cards than its repositories contain.
+#
+# A board holds issues AND pull requests, so the GitHub side counts both
+# (`is:open` with no `is:issue`); restricting it to issues would flag every
+# board that carries an open PR.
 #   ZenHub reporting FEWER                             -> normal and silent.
 #       Plenty of issues are never added to a board.
 #
@@ -1808,14 +1812,14 @@ zh_count_plausibility_check() {
         # Flush before exceeding the cap (200 leaves headroom for the prefix
         # and any URL-encoding expansion).
         if [[ ${#batch} -gt 0 ]] && [[ $(( ${#batch} + ${#r} + 6 )) -gt 200 ]]; then
-            batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+            batch_total=$(gh api "search/issues?q=is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
             [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
             batch=""
         fi
         batch="${batch}+repo:${r}"
     done <<< "$repo_list"
     if [[ -n "$batch" ]]; then
-        batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+        batch_total=$(gh api "search/issues?q=is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
         [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
     fi
     # A partial sum would understate GitHub's side and manufacture a false
@@ -1833,7 +1837,7 @@ zh_count_plausibility_check() {
     local plausible reason
     if [[ "$zenhub_open" -gt "$github_open" ]]; then
         plausible=false
-        reason="ZenHub reports more open issues (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — a board cannot hold more open issues than its repositories contain, unless the board has ZenHub-only cards or this GitHub token cannot see every repository"
+        reason="ZenHub reports more open issues and pull requests (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — a board cannot hold more open cards than its repositories contain, unless the board has ZenHub-only cards or this GitHub token cannot see every repository"
     else
         plausible=true
         reason="ZenHub's open count does not exceed GitHub's"

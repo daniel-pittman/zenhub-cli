@@ -917,7 +917,10 @@ _ANSI_RE = re.compile(
 )
 
 
-def _as_text(value) -> str:
+_SUBPROCESS_ENCODING = "utf-8"
+
+
+def _as_text(value: bytes | str | None) -> str:
     """Coerce a subprocess output field to str.
 
     `subprocess.run(text=True)` decodes stdout/stderr only on normal
@@ -931,7 +934,7 @@ def _as_text(value) -> str:
     if value is None:
         return ""
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
+        return value.decode(_SUBPROCESS_ENCODING, errors="replace")
     return value
 
 
@@ -1041,6 +1044,8 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
             [str(ZH_BIN)] + args,
             capture_output=True,
             text=True,
+            encoding=_SUBPROCESS_ENCODING,
+            errors="replace",
             input=stdin,
             cwd=cwd,
             timeout=timeout,
