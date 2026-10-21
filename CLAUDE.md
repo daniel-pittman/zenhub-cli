@@ -121,6 +121,14 @@ zh sprint remove <name> <issue#> [<issue#> ...] # Remove issues from a sprint
 zh sa current 42                              # Top-level alias for sprint add
 zh sr current 42                              # Top-level alias for sprint remove
 
+# Releases (matched by title, case-insensitive, or by id)
+zh releases [--all|--closed] [--json]         # List releases (open by default)
+zh release <title>                            # Release detail + issues (also: release show)
+zh release create "Title" --start 2026-03-01 --end 2026-03-31 [-d desc] [--json|-q]
+zh release edit <title> [-t title] [-d desc] [--start date] [--end date]
+zh release close <title> / zh release reopen <title>
+zh release delete <title>                     # Not in ZenHub's public API: explains, suggests close
+
 # Global flags (peeled off before any subcommand)
 zh -r owner/repo <cmd>                        # Target a specific repo
 zh -w "Backend Team" <cmd>                    # Target a specific workspace
