@@ -2155,13 +2155,19 @@ Use the full name."
 
 # Pipeline mutations resolve names against one workspace snapshot and refuse ties.
 zh_pipeline_resolve() {
-    local rows="$1" name="$2" matched count
+    local rows="$1" name="$2" exact_only="${3:-false}" matched count
     matched=$(printf '%s' "$rows" | jq -c --arg n "$name" '
         def norm: gsub("^\\s+|\\s+$"; "") | ascii_downcase;
         [.[] | select((.name | norm) == ($n | norm))] as $exact
         | if ($exact | length) > 0 then $exact
           else [.[] | select((.name | norm) | contains($n | norm))] end')
     count=$(printf '%s' "$matched" | jq length)
+    # A destructive verb must not act on a partial match: refuse and name it.
+    if [[ "$exact_only" == true && "$count" -gt 0 ]] &&
+        [[ "$(printf '%s' "$matched" | jq -r --arg n "$name" 'def norm: gsub("^\\s+|\\s+$"; "") | ascii_downcase; map(select((.name | norm) == ($n | norm))) | length')" -eq 0 ]]; then
+        error "No pipeline named exactly '${name}'. Partial match: $(printf '%s' "$matched" | jq -r '[.[].name] | join(", ")')
+Use the full name; delete requires an exact name."
+    fi
     [[ "$count" -gt 0 ]] || error "Pipeline not found: ${name}
 Available: $(printf '%s' "$rows" | jq -r '[.[].name] | join(", ")')"
     [[ "$count" -eq 1 ]] || error "Ambiguous pipeline '${name}' matches: $(printf '%s' "$matched" | jq -r '[.[].name] | join(", ")')
@@ -2205,7 +2211,7 @@ Usage: zh pipeline <name> [--all] [--no-urls] [--no-verify]
 Positions count from 0. Create appends by default. Move positions refer to
 its final index, with the source removed before resolving an anchor.
 Names match case-insensitively, preferring exact names over partial matches.
-Mutations refuse ambiguous matches. Quote multi-word names.
+Mutations refuse ambiguous matches; delete requires an exact name. Quote multi-word names.
 Use 'zh pipeline -- create' to view a pipeline named Create (also move,
 rename, delete). A flag-shaped name needs --; put options before it:
   zh pipeline create --position 0 -- "--experimental"
@@ -2283,7 +2289,7 @@ cmd_pipeline_mutate() {
     workspace_id=$(get_workspace_id "$owner_repo")
     rows=$(zh_pipeline_rows "$workspace_id" "$([[ "$verb" == delete ]] && echo true || echo false)")
     if [[ "$verb" != create ]]; then
-        target=$(zh_pipeline_resolve "$rows" "$name")
+        target=$(zh_pipeline_resolve "$rows" "$name" "$([[ "$verb" == delete ]] && echo true || echo false)")
         pipeline_id=$(printf '%s' "$target" | jq -r .id)
         actual_name=$(printf '%s' "$target" | jq -r .name)
     fi
@@ -2385,14 +2391,10 @@ cmd_pipeline_mutate() {
 }
 
 cmd_pipeline() {
-    local arg
-    for arg in ${@+"$@"}; do
-        [[ "$arg" == -- ]] && break
-        if [[ "$arg" == -h || "$arg" == --help ]]; then
-            cmd_pipeline_help
-            return 0
-        fi
-    done
+    if zh_wants_help "-d --description --after --before --position" ${@+"$@"}; then
+        cmd_pipeline_help
+        return 0
+    fi
     # An explicit -- makes verb names and flag-shaped pipeline names readable.
     case "${1:-}" in
         --) shift; cmd_pipeline_show -- "$@" ;;
@@ -7228,9 +7230,15 @@ cmd_release_show() {
     local wanted=""
     local show_urls=true
     local json_output=false
+    local end_options=false
 
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$wanted" ]] || error "Unexpected argument: $1 (quote a multi-word release title)"
+            wanted="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
             --no-urls) show_urls=false; shift ;;
             --json) json_output=true; shift ;;
             -*)
@@ -7361,9 +7369,15 @@ cmd_release_create() {
 
     local title="" description="" start_on="" end_on=""
     local output_mode="text"
+    local end_options=false
 
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$title" ]] || error "Unexpected argument: $1 (quote a multi-word title)"
+            title="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
             -d|--description)
                 [[ $# -ge 2 ]] || error "Option $1 requires a value"
                 description="$2"; shift 2 ;;
@@ -7462,9 +7476,15 @@ cmd_release_edit() {
     local wanted=""
     local new_title="" new_description="" new_start="" new_end=""
     local set_title=false set_description=false
+    local end_options=false
 
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$wanted" ]] || error "Unexpected argument: $1 (quote a multi-word release title)"
+            wanted="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
             -t|--title)
                 [[ $# -ge 2 ]] || error "Option $1 requires a value"
                 new_title="$2"; set_title=true; shift 2 ;;
@@ -7585,6 +7605,8 @@ zh_release_set_state() {
 
     load_config
 
+    local end_options=false
+    if [[ "${1:-}" == -- ]]; then end_options=true; shift; fi
     local wanted="${1:-}"
     if [[ -z "$wanted" ]]; then
         error "Usage: zh release ${verb} <title|id>"
@@ -7592,7 +7614,7 @@ zh_release_set_state() {
     if [[ $# -gt 1 ]]; then
         error "Unexpected argument: $2 (quote a multi-word release title)"
     fi
-    if [[ "$wanted" == -* && "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+    if [[ "$wanted" == -* && "${ZH_END_OF_OPTS:-false}" != "true" && "$end_options" != true ]]; then
         error "Unknown option for release ${verb}: ${wanted} (a title starting with '-' needs 'zh -- release ${verb} ...')"
     fi
 
@@ -7632,7 +7654,25 @@ Close it instead, which hides it from 'zh releases' and keeps its history:
 To remove it completely, delete it in the ZenHub web app."
 }
 
+# True when args hold a help flag outside any option value and before `--`.
+# Skipping the value slot keeps a literal "-h" title or description usable.
+zh_wants_help() {
+    local skip_value="$1"; shift
+    local a skip=false
+    for a in ${@+"$@"}; do
+        if [[ "$skip" == true ]]; then skip=false; continue; fi
+        [[ "$a" == -- ]] && return 1
+        [[ "$a" == -h || "$a" == --help ]] && return 0
+        [[ " $skip_value " == *" $a "* ]] && skip=true
+    done
+    return 1
+}
+
 cmd_release() {
+    if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]] && zh_wants_help "-t --title -d --description -s --start -e --end" ${@+"$@"}; then
+        cmd_help
+        return 0
+    fi
     if [[ $# -eq 0 ]]; then
         cmd_releases
         return
@@ -7648,6 +7688,7 @@ cmd_release() {
         close) cmd_release_close "$@" ;;
         reopen) cmd_release_reopen "$@" ;;
         delete|rm) cmd_release_delete "$@" ;;
+        --) cmd_release_show -- "$@" ;;
         -*)
             if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
                 error "Unknown option for release: ${sub} (to list releases use 'zh releases ${sub}'; a title starting with '-' needs 'zh -- release ...')"
@@ -10168,6 +10209,13 @@ main() {
                 # title reachable despite the guards added for #102.
                 case "${args[0]:-}" in
                     pipeline|pipe|col) args+=("--") ;;
+                    release|rel)
+                        # `release` honors `--` itself: it ends that subcommand's
+                        # options without disabling its help scan before the `--`.
+                        shift
+                        args+=("--" "$@")
+                        break
+                        ;;
                 esac
                 ZH_END_OF_OPTS=true
                 shift
@@ -10206,7 +10254,7 @@ main() {
     #
     # Subcommands in _ZH_SELF_HELP print their own, more specific usage; they
     # are passed through untouched. Add a command here when you give it one.
-    local _zh_self_help=" count doctor reparent pipeline pipe col "
+    local _zh_self_help=" count doctor reparent pipeline pipe col release rel "
     if [[ "$_zh_self_help" != *" ${command} "* ]] && [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
         local _zh_arg
         for _zh_arg in ${@+"$@"}; do

@@ -4914,13 +4914,12 @@ def sprint_remove_issues(sprint_name: str, issue_numbers: list[int],
 # =============================================================================
 
 def _release_args(sub: str, ref: str, *rest: str) -> list[str]:
-    """Build the `zh release <sub> <ref> ...` argv.
+    """Build the `zh release <sub> ... -- <ref>` argv.
 
-    A reference that begins with `-` would parse as a flag, so it is routed
-    through zh's global `--`, which makes it a positional.
+    Options come first and the reference follows a subcommand-level `--`, so
+    a reference or option value that looks like a flag is never parsed as one.
     """
-    args = ["release", sub, ref, *rest]
-    return (["--"] + args) if ref.startswith("-") else args
+    return ["release", sub, *rest, "--", ref]
 
 
 def _release_ref_error(ref: str) -> str:
@@ -5032,11 +5031,10 @@ def release_create(title: str, start: str, end: str, description: str = "",
     if not start or not end:
         return {"ok": False, "id": None, "release": None, "raw": "",
                 "stderr": "start and end dates (YYYY-MM-DD) are required"}
-    args = ["release", "create", title, "--start", start, "--end", end, "--json"]
+    args = ["release", "create", "--start", start, "--end", end, "--json"]
     if description:
         args += ["--description", description]
-    if title.startswith("-"):
-        args = ["--"] + args
+    args += ["--", title]
     r = _run_zh(args, cwd=_resolve_cwd(repo_path))
     data = _parse_json_stdout(r["stdout_plain"])
     data = data if isinstance(data, dict) else None

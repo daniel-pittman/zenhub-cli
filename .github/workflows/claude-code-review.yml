@@ -215,7 +215,7 @@ jobs:
     # OAuth-bound review action errors on them. Skip the review there; the
     # semgrep job above still runs and posts its findings. Fork PRs get no
     # secrets either, so the review is skipped there too; review-gate reports it.
-    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) }}
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     # Both gates post their sticky comments before the review runs:
     #   semgrep -> "Semgrep (OSS)"; await-tests -> "CI Tests".
     needs: [semgrep, await-tests]
@@ -456,7 +456,7 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           REVIEW_RESULT: ${{ needs.claude-review.result }}
           EXTRACT_RESULT: ${{ needs.verdict-extract.result }}
-          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           VERDICT_LINE: ${{ needs.verdict-extract.outputs.verdict_line }}
           REVIEW_BOT: 'claude[bot]'
           ACK_LABEL: review-ack
