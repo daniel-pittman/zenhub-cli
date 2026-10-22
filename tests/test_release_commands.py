@@ -741,6 +741,34 @@ def test_unconfirmable_post_state_exits_2() -> None:
     assert "could not be re-read" in r.stderr
 
 
+def test_unconfirmable_post_state_json_is_a_parseable_unverified_document() -> None:
+    r = run_zh_with_stubs(_member_stubs(post_null=True), 'cmd_release_add --json "Spring launch" 7 9')
+    assert r.returncode == 2
+    assert _mutation(r.stderr) is not None
+    doc = json.loads(r.stdout)
+    assert doc == {
+        "action": "add", "release": {"id": "rel-1", "title": "Spring launch"},
+        "requested": [7, 9], "succeeded": [], "failed": [], "unverified": [7, 9],
+        "pagination_bailed": "post_state_unreadable",
+    }
+
+
+def test_oversized_issue_number_is_refused_before_any_call() -> None:
+    # 18446744073709551658 is 2**64 + 42: arithmetic would wrap it to #42.
+    for big in ("18446744073709551658", "2147483648", "99999999999"):
+        r = run_zh_with_stubs(_member_stubs(known=(42,)), f'cmd_release_add "Spring launch" {big}')
+        assert r.returncode == 1, big
+        assert f"Issue number out of range: {big}" in r.stderr, big
+        assert _calls(r.stderr) == [], big
+
+
+def test_long_zero_padded_issue_number_is_its_value() -> None:
+    stubs = _member_stubs(post=[(7, "widgets")])
+    r = run_zh_with_stubs(stubs, 'cmd_release_add "Spring launch" 0000000000000000000007 7')
+    assert r.returncode == 0, r.stderr
+    assert _mutation(r.stderr)["input"]["issueIds"] == ["iss-7"]
+
+
 # --- add / remove: `--` and help -----------------------------------------------
 
 def test_add_options_before_subcommand_double_dash_and_dash_title() -> None:

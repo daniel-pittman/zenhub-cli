@@ -7736,8 +7736,15 @@ Examples:
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${arg} (quote a multi-word release title)"
         fi
-        # Normalise leading zeros so "042" and "42" dedup together.
-        stripped=$((10#$stripped))
+        # Strip leading zeros as text so "042" and "42" dedup together.
+        # Arithmetic would wrap a 19+ digit number onto a real issue
+        # (18446744073709551658 becomes 42), and GraphQL's Int stops at
+        # 2147483647, so a larger number is refused before any call.
+        stripped="${stripped#"${stripped%%[!0]*}"}"
+        [[ -n "$stripped" ]] || stripped=0
+        if [[ ${#stripped} -gt 10 ]] || (( 10#$stripped > 2147483647 )); then
+            error "Issue number out of range: ${arg}"
+        fi
         already_seen=false
         for seen in ${inputs[@]+"${inputs[@]}"}; do
             if [[ "$seen" == "$stripped" ]]; then
@@ -7824,6 +7831,16 @@ Examples:
     local post_state=""
     post_state=$(zh_release_issues_fetch_all "$release_id" "$workspace_id") || post_state=""
     if [[ -z "$post_state" ]]; then
+        if [[ "$json_output" == "true" ]]; then
+            jq -n \
+                --arg action "$verb" \
+                --arg id "$release_id" \
+                --arg title "$release_title" \
+                --argjson requested "$(printf '%s\n' "${inputs[@]}" | jq -s .)" \
+                '{action: $action, release: {id: $id, title: $title}, requested: $requested,
+                  succeeded: [], failed: [], unverified: $requested,
+                  pagination_bailed: "post_state_unreadable"}'
+        fi
         echo "" >&2
         warn "The ${verb} was sent, but the release could not be re-read to confirm it."
         warn "Re-verify with 'zh release show \"${release_title}\"'."
