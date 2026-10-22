@@ -7689,7 +7689,7 @@ Options:
 Examples:
   zh release add \"Spring launch\" 42
   zh release add \"Spring launch\" 42 43 44
-  zh -- release add \"-dash title\" 42    # a title starting with '-'"
+  zh release add --json -- \"-dash title\" 42    # a title starting with '-'"
     if [[ "$mode" == "remove" ]]; then
         verb="remove"
         usage_text="Usage: zh release remove <title|id> <issue#> [<issue#> ...] [--json]
@@ -7701,23 +7701,30 @@ Options:
 
 Examples:
   zh release remove \"Spring launch\" 42
-  zh release rm \"Spring launch\" 42 43    # 'rm' is an alias for remove"
+  zh release rm \"Spring launch\" 42 43    # 'rm' is an alias for remove
+  zh release remove -- \"-dash title\" 42  # a title starting with '-'"
     fi
 
     # Parse everything before any network call: an unknown flag or a
-    # non-number never reaches the mutation. After the global `zh --`
-    # a dash-leading first positional is taken as the release title.
-    local wanted="" have_release=false json_output=false
+    # non-number never reaches the mutation. Options are recognised until
+    # a subcommand-level `--`; after it every argument is the release
+    # reference and then issue numbers. After the global `zh --` options
+    # still parse, and only a dash-leading release slot is taken as data.
+    local wanted="" have_release=false json_output=false end_options=false
     local -a inputs=()
     local arg stripped seen already_seen
     while [[ $# -gt 0 ]]; do
         arg="$1"
         shift
-        if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+        if [[ "$end_options" != true ]]; then
             case "$arg" in
+                --) end_options=true; continue ;;
                 --json) json_output=true; continue ;;
                 -*)
-                    error "Unknown option for release ${verb}: ${arg} (a title starting with '-' needs 'zh -- release ${verb} ...')" ;;
+                    if [[ "$have_release" == true || "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+                        error "Unknown option for release ${verb}: ${arg} (a title starting with '-' needs 'zh -- release ${verb} ...')"
+                    fi
+                    ;;
             esac
         fi
         if [[ "$have_release" != "true" ]]; then

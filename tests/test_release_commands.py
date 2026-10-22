@@ -739,3 +739,59 @@ def test_unconfirmable_post_state_exits_2() -> None:
     r = run_zh_with_stubs(_member_stubs(post_null=True), 'cmd_release_remove "Spring launch" 7')
     assert r.returncode == 2
     assert "could not be re-read" in r.stderr
+
+
+# --- add / remove: `--` and help -----------------------------------------------
+
+def test_add_options_before_subcommand_double_dash_and_dash_title() -> None:
+    stubs = _member_stubs(releases=[_release("rel-d", "-dash title")], post=[(7, "widgets")])
+    r = run_zh_with_stubs(stubs, 'main release add --json -- "-dash title" 7')
+    assert r.returncode == 0, r.stderr
+    doc = json.loads(r.stdout)
+    assert doc["release"] == {"id": "rel-d", "title": "-dash title"}
+    assert _mutation(r.stderr)["input"]["releaseIds"] == ["rel-d"]
+
+
+def test_json_is_still_an_option_after_global_double_dash() -> None:
+    stubs = _member_stubs(releases=[_release("rel-d", "-dash title")], post=[])
+    r = run_zh_with_stubs(stubs, 'main -- release remove "-dash title" 7 --json')
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["succeeded"] == [7]
+
+
+def test_flag_after_title_is_still_refused_after_global_double_dash() -> None:
+    r = run_zh_with_stubs(_member_stubs(), 'main -- release add "Spring launch" 7 -3')
+    assert r.returncode == 1
+    assert "Unknown option for release add: -3" in r.stderr
+    assert _calls(r.stderr) == []
+
+
+def test_dash_number_after_subcommand_double_dash_is_not_an_issue() -> None:
+    r = run_zh_with_stubs(_member_stubs(), 'main release add -- "Spring launch" 7 -3')
+    assert r.returncode == 1
+    assert "Invalid issue number: -3" in r.stderr
+    assert _calls(r.stderr) == []
+
+
+def test_help_flag_prints_help_for_add_and_remove() -> None:
+    for sub in ("add", "remove", "rm"):
+        r = run_zh_with_stubs(_member_stubs(), f'main release {sub} "Spring launch" 7 -h')
+        assert r.returncode == 0, (sub, r.stderr)
+        assert "USAGE" in r.stdout
+        assert _calls(r.stderr) == [], sub
+
+
+def test_help_shaped_title_after_double_dash_is_data() -> None:
+    stubs = _member_stubs(releases=[_release("rel-h", "-h")], post=[(7, "widgets")])
+    r = run_zh_with_stubs(stubs, 'main release add -- -h 7')
+    assert r.returncode == 0, r.stderr
+    assert _mutation(r.stderr)["input"]["releaseIds"] == ["rel-h"]
+
+
+def test_release_double_dash_shows_a_release_named_like_a_subcommand() -> None:
+    # `add`, `remove` and `rm` are subcommands; a release with one of those
+    # titles stays reachable as data after `zh release --`.
+    shown = run_zh_with_stubs(_stubs([_release("rel-a", "add")]), 'main release -- add')
+    assert shown.returncode == 0, shown.stderr
+    assert "Release: add" in shown.stdout
+    assert _mutation(shown.stderr) is None
