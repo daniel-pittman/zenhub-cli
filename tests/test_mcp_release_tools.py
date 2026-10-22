@@ -172,3 +172,73 @@ def test_release_close_surfaces_cli_refusal(monkeypatch):
 
 def test_no_release_delete_tool():
     assert not hasattr(mcp_server, "release_delete")
+
+
+# --- release_add / release_remove -------------------------------------------------
+
+def _capture_exit(monkeypatch, stdout="", exit_code=0, stderr=""):
+    calls = []
+
+    def fake_run_zh(args, **kwargs):
+        calls.append(list(args))
+        return {"ok": exit_code == 0, "exit_code": exit_code,
+                "stdout_plain": stdout, "stderr_plain": stderr}
+
+    monkeypatch.setattr(mcp_server, "_run_zh", fake_run_zh)
+    return calls
+
+
+def _membership_doc(action="add", succeeded=(7,), failed=(), unverified=(), bailed=""):
+    requested = sorted({*succeeded, *failed, *unverified})
+    return json.dumps({
+        "action": action, "release": {"id": "r1", "title": "Spring"},
+        "requested": requested, "succeeded": list(succeeded), "failed": list(failed),
+        "unverified": list(unverified), "pagination_bailed": bailed,
+    })
+
+
+def test_release_add_argv_puts_reference_and_numbers_after_double_dash(monkeypatch):
+    calls = _capture_exit(monkeypatch, stdout=_membership_doc(succeeded=(7, 8)))
+    out = mcp_server.release_add("-odd", [7, 8])
+    assert calls == [["release", "add", "--json", "--", "-odd", "7", "8"]]
+    assert out["ok"] is True and out["incomplete"] is False
+    assert out["confirmed"] == [7, 8] and out["failed"] == [] and out["unverified"] == []
+    assert out["release"] == {"id": "r1", "title": "Spring"}
+
+
+def test_release_remove_argv(monkeypatch):
+    calls = _capture_exit(monkeypatch, stdout=_membership_doc(action="remove"))
+    out = mcp_server.release_remove("Spring", [7])
+    assert calls == [["release", "remove", "--json", "--", "Spring", "7"]]
+    assert out["ok"] is True and out["confirmed"] == [7]
+
+
+def test_release_add_rejected_issue_is_not_ok(monkeypatch):
+    _capture_exit(monkeypatch, stdout=_membership_doc(succeeded=(7,), failed=(8,)), exit_code=1)
+    out = mcp_server.release_add("Spring", [7, 8])
+    assert out["ok"] is False
+    assert out["confirmed"] == [7] and out["failed"] == [8]
+
+
+def test_release_add_exit_2_with_document_is_ok_but_incomplete(monkeypatch):
+    doc = _membership_doc(succeeded=(7,), unverified=(9,), bailed="stuck_cursor")
+    _capture_exit(monkeypatch, stdout=doc, exit_code=2)
+    out = mcp_server.release_add("Spring", [7, 9])
+    assert out["ok"] is True and out["incomplete"] is True
+    assert out["unverified"] == [9] and out["pagination_bailed"] == "stuck_cursor"
+
+
+def test_release_add_exit_2_refusal_without_document_is_not_ok(monkeypatch):
+    _capture_exit(monkeypatch, exit_code=2, stderr="can't be proven unique. Pass the release id")
+    out = mcp_server.release_add("Spring", [7])
+    assert out["ok"] is False and out["incomplete"] is False
+    assert out["confirmed"] == [] and "release id" in out["stderr"]
+
+
+def test_release_membership_validates_before_running(monkeypatch):
+    calls = _capture_exit(monkeypatch)
+    for out in (mcp_server.release_add("", [7]), mcp_server.release_remove(" ", [7]),
+                mcp_server.release_add("Spring", []), mcp_server.release_remove("Spring", [])):
+        assert out["ok"] is False and out["stderr"]
+        assert {"confirmed", "failed", "unverified", "incomplete"} <= out.keys()
+    assert calls == []

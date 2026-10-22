@@ -818,7 +818,7 @@ zh release remove "Spring launch" 44
 zh release rm "Spring launch" 43 --json    # machine-readable result
 ```
 
-`release add` and `release remove` resolve the release and every issue number before changing anything, and list all the numbers they couldn't find at once. After the change they re-read the release and report each issue. They exit 0 when every issue is confirmed, 1 when any issue ended up in the wrong state (or none was confirmed), and 2 when the re-read was cut short and some issues couldn't be checked. `--json` uses the same exit codes. A release title is refused (exit 2, nothing sent) if the release listing was cut short, because a second release with the same title could be on a page that wasn't read. Pass the release id instead. A release title that starts with `-` needs the global `--`: `zh -- release add "-beta" 42`.
+`release add` and `release remove` resolve the release and every issue number before changing anything, and list all the numbers they couldn't find at once. After the change they re-read the release and report each issue. They exit 0 when every issue is confirmed, 1 when any issue ended up in the wrong state (or none was confirmed), and 2 when the re-read was cut short and some issues couldn't be checked. `--json` uses the same exit codes. A release title is refused (exit 2, nothing sent) if the release listing was cut short, because a second release with the same title could be on a page that wasn't read. Pass the release id instead. Options go before a `--`; everything after it is the release and then issue numbers, so a title that starts with `-` works either as `zh release add --json -- "-beta" 42` or after the global `--` as `zh -- release add "-beta" 42 --json`. Issue numbers above 2147483647 are refused before anything is sent. If the re-read fails outright, `--json` still prints a document, with every issue under `unverified` and `pagination_bailed` set to `post_state_unreadable`.
 
 ZenHub's public API has no mutation for deleting a release, so `zh release delete` exits with an explanation and suggests `zh release close`. Delete a release in the ZenHub web app if it must be removed completely.
 
@@ -981,7 +981,7 @@ Roughly 35 tools covering the same surface as `zh`:
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
 | Sub-issue management | `subissue_add_children`, `subissue_remove_children`, `subissue_reorder` |
 | Sprint membership | `sprint_add_issues`, `sprint_remove_issues` |
-| Releases | `release_list`, `release_show` (read); `release_create`, `release_edit`, `release_close`, `release_reopen` (write). No `release_delete`: the API cannot delete one |
+| Releases | `release_list`, `release_show` (read); `release_create`, `release_edit`, `release_close`, `release_reopen`, `release_add`, `release_remove` (write). `release_add` / `release_remove` return `confirmed`, `failed` and `unverified` issue lists; a cut-short re-read is `ok` with `incomplete: true`. No `release_delete`: the API cannot delete one |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
 Release tools address a release by title (case-insensitive) or id. A listing that bailed mid-pagination comes back with `incomplete=true`; the mutating tools then refuse a title and need the release id.

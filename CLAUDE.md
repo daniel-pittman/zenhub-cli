@@ -146,7 +146,10 @@ zh release add <title> <issue#> [...] [--json]    # Add issues to a release
 zh release remove <title> <issue#> [...] [--json] # Remove issues (alias: rm)
                                               # 0 confirmed / 1 failure / 2 re-read incomplete
 zh release delete <title>                     # Not in ZenHub's public API: explains, suggests close
-# MCP: release_list, release_show, release_create, release_edit, release_close, release_reopen (no delete)
+# Options before `--`, then the release and issue numbers: zh release add --json -- "-dash title" 42
+# Mutations refuse a title when the release listing is incomplete (exit 2, nothing sent); pass the id.
+# MCP: release_list, release_show, release_create, release_edit, release_close, release_reopen,
+#      release_add, release_remove (confirmed/failed/unverified; exit 2 = ok + incomplete) (no delete)
 
 # Global flags (peeled off before any subcommand)
 zh -r owner/repo <cmd>                        # Target a specific repo

@@ -129,3 +129,63 @@ def test_pipeline_delete_exact_name_proceeds(monkeypatch):
     out = mcp_server.pipeline_delete("done", confirm=True)
     assert out["ok"] is True, out
     assert _mutations(runs)[0]["input"]["pipelineId"] == "p3"
+
+
+@pytest.mark.parametrize("ref", ["--json", "-h", "--help", "-dash title", "--", "rm"])
+def test_release_add_with_a_flag_named_reference_hits_that_release(monkeypatch, ref):
+    runs = _bridge(monkeypatch, rc._member_stubs(
+        releases=[rc._release("intended", ref), rc._release("other", "Spring launch")],
+        post=[(7, "widgets"), (8, "widgets")]))
+    out = mcp_server.release_add(ref, [7, 8])
+    assert out["ok"] is True, out
+    assert out["confirmed"] == [7, 8] and out["incomplete"] is False
+    assert out["release"] == {"id": "intended", "title": ref}
+    assert _mutations(runs) == [{"input": {"issueIds": ["iss-7", "iss-8"],
+                                           "releaseIds": ["intended"]}}]
+
+
+@pytest.mark.parametrize("ref", ["--json", "-h", "--"])
+def test_release_remove_with_a_flag_named_reference_hits_that_release(monkeypatch, ref):
+    runs = _bridge(monkeypatch, rc._member_stubs(releases=[rc._release("intended", ref)], post=[]))
+    out = mcp_server.release_remove(ref, [7])
+    assert out["ok"] is True, out
+    assert out["confirmed"] == [7] and out["failed"] == []
+    assert _mutations(runs)[0]["input"]["releaseIds"] == ["intended"]
+
+
+def test_release_remove_still_attached_is_not_ok(monkeypatch):
+    _bridge(monkeypatch, rc._member_stubs(post=[(7, "widgets")]))
+    out = mcp_server.release_remove("Spring launch", [7, 9])
+    assert out["ok"] is False
+    assert out["confirmed"] == [9] and out["failed"] == [7]
+
+
+def test_release_add_cut_short_reread_is_ok_and_incomplete(monkeypatch):
+    _bridge(monkeypatch, rc._member_stubs(issues_bailed=True, post=[(7, "widgets")]))
+    out = mcp_server.release_add("Spring launch", [7, 9])
+    assert out["ok"] is True and out["incomplete"] is True, out
+    assert out["confirmed"] == [7] and out["unverified"] == [9]
+
+
+def test_release_add_unreadable_reread_is_ok_and_incomplete(monkeypatch):
+    runs = _bridge(monkeypatch, rc._member_stubs(post_null=True))
+    out = mcp_server.release_add("Spring launch", [7])
+    assert out["ok"] is True and out["incomplete"] is True, out
+    assert out["unverified"] == [7] and out["pagination_bailed"] == "post_state_unreadable"
+    assert runs[0].returncode == 2
+
+
+def test_release_add_title_refused_on_incomplete_listing(monkeypatch):
+    runs = _bridge(monkeypatch, rc._member_stubs(list_bailed=True))
+    out = mcp_server.release_add("Spring launch", [7])
+    assert out["ok"] is False and out["incomplete"] is False
+    assert "Pass the release id" in out["stderr"]
+    assert runs[0].returncode == 2 and not _mutations(runs)
+
+
+def test_release_add_oversized_issue_number_sends_nothing(monkeypatch):
+    runs = _bridge(monkeypatch, rc._member_stubs(known=(42,)))
+    out = mcp_server.release_add("Spring launch", [18446744073709551658])
+    assert out["ok"] is False
+    assert "Issue number out of range" in out["stderr"]
+    assert "CALL=" not in runs[0].stderr

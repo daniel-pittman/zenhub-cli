@@ -13,8 +13,9 @@ Wraps tools/zh so that:
     pipeline_move, pipeline_rename, pipeline_delete) are explicit verbs
     so callers can audit which destructive operations they invoked.
   - Release tools (release_list, release_show, release_create, release_edit,
-    release_close, release_reopen) wrap `zh release`; there is no
-    release_delete because ZenHub's API cannot delete a release.
+    release_close, release_reopen, release_add, release_remove) wrap
+    `zh release`; there is no release_delete because ZenHub's API cannot
+    delete a release.
 
 v1.9.0 model migration: ZenHub removed Legacy Epics and ZenhubEpics in June
 2025. The epic_* tools no longer hit the dead ZenhubEpic API; an epic is now a
@@ -5133,6 +5134,109 @@ def release_reopen(release: str, repo_path: str = "") -> dict:
         dict with: ok, release (the reference as given), raw, stderr.
     """
     return _release_set_state("reopen", release, repo_path)
+
+
+def _release_membership(sub: str, release: str, issue_numbers: list[int],
+                        repo_path: str) -> dict:
+    """Run `zh release add|remove --json -- <ref> <issue#>...`.
+
+    The reference and the issue numbers all follow the subcommand-level
+    `--`, so a flag-shaped title is data. Exit 2 with a JSON document means
+    the change was sent but the re-read could not check every issue: ok is
+    True and incomplete is True, as with release_list. Exit 2 with no
+    document is a refusal before anything was sent (an incomplete release
+    listing with a title reference): ok is False.
+    """
+    def result(ok, data, raw, stderr):
+        bailed = (data or {}).get("pagination_bailed") or ""
+        return {
+            "ok": ok,
+            "release": (data or {}).get("release"),
+            "requested": (data or {}).get("requested", []),
+            "confirmed": (data or {}).get("succeeded", []),
+            "failed": (data or {}).get("failed", []),
+            "unverified": (data or {}).get("unverified", []),
+            "incomplete": bool(bailed),
+            "pagination_bailed": bailed,
+            "raw": raw,
+            "stderr": stderr,
+        }
+
+    err = _release_ref_error(release)
+    if not err and not issue_numbers:
+        err = "issue_numbers must list at least one issue number"
+    if err:
+        return result(False, None, "", err)
+    args = ["release", sub, "--json", "--", release, *(str(n) for n in issue_numbers)]
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"])
+    data = data if isinstance(data, dict) and "action" in data else None
+    exit_ok = bool(r.get("ok")) or _safe_int(r.get("exit_code")) == 2
+    return result(data is not None and exit_ok, data, r["stdout_plain"], _stderr_plain(r))
+
+
+@mcp.tool()
+def release_add(release: str, issue_numbers: list[int], repo_path: str = "") -> dict:
+    """Add one or more issues to a release.
+
+    The release and every issue are resolved before anything is sent; if
+    any issue is missing, nothing is sent. Afterwards the release is
+    re-read and each issue is reported as confirmed, failed or unverified.
+    If the release listing is incomplete, a title reference is refused and
+    nothing is sent; pass the release id then.
+
+    Args:
+        release: Release title (case-insensitive) or ZenHub release id.
+        issue_numbers: Issue numbers in the current repository.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with:
+            ok: bool: True when every issue is confirmed, or when the
+                re-read was cut short (then incomplete is True)
+            release: dict | None: id, title
+            requested: list[int]: the deduplicated input
+            confirmed: list[int]: seen in the release after the add
+            failed: list[int]: not in the release after a full re-read
+            unverified: list[int]: the re-read never reached them
+            incomplete: bool: True when the re-read was cut short; check
+                with release_show before retrying
+            pagination_bailed: str ("" when complete)
+            raw: stdout, stderr: error output
+    """
+    return _release_membership("add", release, issue_numbers, repo_path)
+
+
+@mcp.tool()
+def release_remove(release: str, issue_numbers: list[int], repo_path: str = "") -> dict:
+    """Remove one or more issues from a release.
+
+    Same contract as release_add: everything is resolved first, the
+    release is re-read afterwards, and a title reference is refused when
+    the release listing is incomplete.
+
+    Args:
+        release: Release title (case-insensitive) or ZenHub release id.
+        issue_numbers: Issue numbers in the current repository.
+        repo_path: Optional absolute path of a git checkout to run zh from.
+
+    Returns:
+        dict with:
+            ok: bool: True when every issue is confirmed removed, or when
+                the re-read was cut short (then incomplete is True)
+            release: dict | None: id, title
+            requested: list[int]: the deduplicated input
+            confirmed: list[int]: absent from the release after a full
+                re-read
+            failed: list[int]: still in the release after the remove
+            unverified: list[int]: absence could not be proven because
+                the re-read was cut short
+            incomplete: bool: True when the re-read was cut short; check
+                with release_show before retrying
+            pagination_bailed: str ("" when complete)
+            raw: stdout, stderr: error output
+    """
+    return _release_membership("remove", release, issue_numbers, repo_path)
 
 
 # =============================================================================
