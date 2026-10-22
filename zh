@@ -1008,11 +1008,17 @@ COMMANDS:
                                   [-s|--start YYYY-MM-DD] [-e|--end YYYY-MM-DD]
                              close <title>                     Mark the release closed
                              reopen <title>                    Mark the release open
+                             add <title> <issue#> [...] [--json]
+                                                               Add issues to the release
+                             remove <title> <issue#> [...] [--json]
+                                                               Remove issues (alias: rm)
                              delete <title>                    Not supported by ZenHub's
                                                                API; explains, use close
                            Example: zh release "Spring launch"
                            Example: zh release create "Spring launch" -s 2026-03-01 -e 2026-03-31
                            Example: zh release edit "Spring launch" --end 2026-04-07
+                           Example: zh release add "Spring launch" 42 43
+                           Example: zh release rm "Spring launch" 43
                            (alias: rel)
 
     help                    Show this help message
@@ -6979,10 +6985,11 @@ zh_releases_fetch_all() {
 # Emits "<id>\t<title>" on stdout; exits non-zero when the release is
 # missing or the title matches more than one release (pass the id then).
 #
-# `mode` is "mutate" for commands that change the release. A title match is
-# only trustworthy when the listing was complete (a same-titled release on an
-# unreached page would go unnoticed), so mutations refuse it; an id match is
-# exact and is always accepted.
+# `mode` is "mutate" for every command that changes the release or its
+# issues. A title match is only trustworthy when the listing was complete (a
+# same-titled release on an unreached page would go unnoticed), so mutations
+# refuse it with exit 2; an id match is exact and is always accepted. Any
+# other mode, including the default, accepts the match with a warning.
 zh_resolve_release() {
     local workspace_id="$1"
     local wanted="$2"
@@ -7024,8 +7031,8 @@ zh_resolve_release() {
 
     if [[ -n "$listing_bailed" && "$matched_by_id" != "true" ]]; then
         if [[ "$mode" == "mutate" ]]; then
-            printf "${RED}Error:${NC} The release listing was incomplete (%s), so a title match can't be trusted.\n" "$listing_bailed" >&2
-            echo "  Pass the release id instead (shown by 'zh release show', or 'zh releases --json')." >&2
+            printf "${RED}Error:${NC} The release listing was incomplete (%s), so the title '%s' can't be proven unique.\n" "$listing_bailed" "$wanted" >&2
+            echo "  Pass the release id instead (from 'zh releases --all --json')." >&2
             exit 2
         fi
         warn "Release listing was incomplete (${listing_bailed}); a same-titled release may exist on an unreached page."
@@ -7654,6 +7661,270 @@ Close it instead, which hides it from 'zh releases' and keeps its history:
 To remove it completely, delete it in the ZenHub web app."
 }
 
+# Shared body for `release add` / `release remove`. Mirrors
+# cmd_sprint_add / cmd_sprint_remove: dedup the inputs, resolve the
+# release and EVERY issue before mutating, then re-read the release and
+# classify each input from what is actually attached.
+#
+# Exit codes (the cmd_sprint_remove convention):
+#   0 — every input confirmed, full coverage
+#   1 — real failure: an input confirmed in the wrong state, zero
+#       confirmed with full coverage, or the mutation itself failed
+#   2 — coverage incomplete only: the post-state walk bailed (or could
+#       not run) after the mutation fired. Re-verify before retrying.
+zh_release_membership() {
+    local mode="$1"
+    shift
+
+    load_config
+
+    local verb="add"
+    local usage_text="Usage: zh release add <title|id> <issue#> [<issue#> ...] [--json]
+
+Add one or more issues to a release.
+
+Options:
+  --json    Machine-readable result on stdout
+
+Examples:
+  zh release add \"Spring launch\" 42
+  zh release add \"Spring launch\" 42 43 44
+  zh -- release add \"-dash title\" 42    # a title starting with '-'"
+    if [[ "$mode" == "remove" ]]; then
+        verb="remove"
+        usage_text="Usage: zh release remove <title|id> <issue#> [<issue#> ...] [--json]
+
+Remove one or more issues from a release.
+
+Options:
+  --json    Machine-readable result on stdout
+
+Examples:
+  zh release remove \"Spring launch\" 42
+  zh release rm \"Spring launch\" 42 43    # 'rm' is an alias for remove"
+    fi
+
+    # Parse everything before any network call: an unknown flag or a
+    # non-number never reaches the mutation. After the global `zh --`
+    # a dash-leading first positional is taken as the release title.
+    local wanted="" have_release=false json_output=false
+    local -a inputs=()
+    local arg stripped seen already_seen
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        shift
+        if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+            case "$arg" in
+                --json) json_output=true; continue ;;
+                -*)
+                    error "Unknown option for release ${verb}: ${arg} (a title starting with '-' needs 'zh -- release ${verb} ...')" ;;
+            esac
+        fi
+        if [[ "$have_release" != "true" ]]; then
+            wanted="$arg"
+            have_release=true
+            continue
+        fi
+        stripped="${arg#\#}"
+        if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
+            error "Invalid issue number: ${arg} (quote a multi-word release title)"
+        fi
+        # Normalise leading zeros so "042" and "42" dedup together.
+        stripped=$((10#$stripped))
+        already_seen=false
+        for seen in ${inputs[@]+"${inputs[@]}"}; do
+            if [[ "$seen" == "$stripped" ]]; then
+                already_seen=true
+                break
+            fi
+        done
+        if [[ "$already_seen" != "true" ]]; then
+            inputs+=("$stripped")
+        fi
+    done
+
+    if [[ -z "$wanted" ]] || [[ ${#inputs[@]} -eq 0 ]]; then
+        error "$usage_text"
+    fi
+
+    local owner_repo
+    owner_repo=$(get_repo_info)
+
+    local repo_id
+    repo_id=$(get_repo_id "$owner_repo")
+
+    local workspace_id
+    workspace_id=$(get_workspace_id "$owner_repo")
+
+    [[ "$json_output" == "true" ]] || info "Resolving release '${wanted}'..."
+    local resolved release_id release_title
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted" mutate)
+    release_id="${resolved%%	*}"
+    release_title="${resolved#*	}"
+
+    # Lists every missing number at once and exits before the mutation.
+    [[ "$json_output" == "true" ]] || info "Resolving ${#inputs[@]} issue(s)..."
+    local issues_resolved
+    issues_resolved=$(zh_resolve_issue_ids_for_sprint "$repo_id" "${inputs[@]}")
+
+    local issue_ids_json
+    issue_ids_json=$(printf '%s' "$issues_resolved" | awk -F'\t' 'NF >= 1 {print $1}' | jq -R . | jq -s .)
+
+    local mutation
+    if [[ "$mode" == "add" ]]; then
+        mutation='
+        mutation($input: AddIssuesToReleasesInput!) {
+            addIssuesToReleases(input: $input) {
+                releases { id }
+            }
+        }'
+    else
+        mutation='
+        mutation($input: RemoveIssuesFromReleasesInput!) {
+            removeIssuesFromReleases(input: $input) {
+                releases { id }
+            }
+        }'
+    fi
+
+    local mutation_vars
+    mutation_vars=$(jq -n --arg release_id "$release_id" --argjson issue_ids "$issue_ids_json" \
+        '{input: {issueIds: $issue_ids, releaseIds: [$release_id]}}')
+
+    # Fail-soft envelope (cmd_sprint_add pattern): keep the cause hint
+    # instead of dying bare under set -e.
+    local response="" response_err=""
+    local _relmem_err_file
+    _relmem_err_file=$(mktemp -t zh_relmem.XXXXXX 2>/dev/null) || _relmem_err_file=/dev/null
+    response=$(zh_graphql "$mutation" "$mutation_vars" 2>"$_relmem_err_file") || response=""
+    if [[ "$_relmem_err_file" != "/dev/null" ]]; then
+        response_err=$(zh_cause_hint "$_relmem_err_file")
+        rm -f "$_relmem_err_file" 2>/dev/null || true
+    fi
+    if [[ -z "$response" ]]; then
+        local direction="to"
+        [[ "$mode" == "remove" ]] && direction="from"
+        if [[ -n "$response_err" ]]; then
+            error "Failed to ${verb} issue(s) ${direction} release '${release_title}' (cause: ${response_err}). Verify with 'zh release show \"${release_title}\"' before retrying."
+        else
+            error "Failed to ${verb} issue(s) ${direction} release '${release_title}': ZenHub API call returned no usable response (check token / network / rate limits, then verify with 'zh release show \"${release_title}\"' before retrying)."
+        fi
+    fi
+
+    # The mutation has fired. If the post-state walk dies (release
+    # deleted / ACL-revoked in between), say so and exit 2 rather than
+    # letting the walker's `error` read as "nothing happened".
+    local post_state=""
+    post_state=$(zh_release_issues_fetch_all "$release_id" "$workspace_id") || post_state=""
+    if [[ -z "$post_state" ]]; then
+        echo "" >&2
+        warn "The ${verb} was sent, but the release could not be re-read to confirm it."
+        warn "Re-verify with 'zh release show \"${release_title}\"'."
+        exit 2
+    fi
+
+    local pagination_bailed
+    pagination_bailed=$(echo "$post_state" | jq -r '.pagination_bailed // ""')
+
+    # Issue numbers of OUR repo now in the release. Repo-filtered: a
+    # sibling repo's same-numbered issue must not count.
+    local present_csv
+    present_csv=$(echo "$post_state" | jq -r \
+        --arg owner "${owner_repo%%/*}" \
+        --arg repo "${owner_repo##*/}" \
+        '[
+           .nodes[]
+           | select(
+               ((.repository.ownerName // "") | ascii_downcase) == ($owner | ascii_downcase)
+               and ((.repository.name // "") | ascii_downcase) == ($repo | ascii_downcase)
+             )
+           | .number | tostring
+         ] | join(",")')
+
+    local input_nums_csv
+    input_nums_csv=$(printf '%s' "$issues_resolved" | awk -F'\t' 'NF >= 2 {print $2}' | paste -sd, -)
+
+    # Seeing an input in the release is proof either way. NOT seeing it
+    # is proof only when the walk covered the whole release; otherwise
+    # the input is un-verified rather than succeeded/failed.
+    local classified
+    classified=$(jq -nc \
+        --arg mode "$mode" \
+        --arg inputs "$input_nums_csv" \
+        --arg present "$present_csv" \
+        --arg bailed "$pagination_bailed" \
+        '($inputs | split(",") | map(select(. != ""))) as $in
+         | ($present | split(",")) as $p
+         | [$in[] | select(. as $n | $p | any(. == $n))] as $seen
+         | [$in[] | select(. as $n | $p | all(. != $n))] as $unseen
+         | (if $mode == "add" then
+              {succeeded: $seen, failed: (if $bailed == "" then $unseen else [] end),
+               unverified: (if $bailed == "" then [] else $unseen end)}
+            else
+              {succeeded: (if $bailed == "" then $unseen else [] end), failed: $seen,
+               unverified: (if $bailed == "" then [] else $unseen end)}
+            end)
+         | map_values(map(tonumber))')
+
+    local total_input success_count failed_count unverified_count
+    total_input=${#inputs[@]}
+    success_count=$(echo "$classified" | jq '.succeeded | length')
+    failed_count=$(echo "$classified" | jq '.failed | length')
+    unverified_count=$(echo "$classified" | jq '.unverified | length')
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$classified" | jq \
+            --arg action "$verb" \
+            --arg id "$release_id" \
+            --arg title "$release_title" \
+            --arg bailed "$pagination_bailed" \
+            --argjson requested "$(printf '%s\n' "${inputs[@]}" | jq -s .)" \
+            '{action: $action, release: {id: $id, title: $title}, requested: $requested}
+             + . + {pagination_bailed: $bailed}'
+    else
+        local succeeded_list failed_list
+        succeeded_list=$(echo "$classified" | jq -r '.succeeded | map("#\(.)") | join(", ")')
+        failed_list=$(echo "$classified" | jq -r '.failed | map("#\(.)") | join(", ")')
+        echo ""
+        if [[ "$success_count" -gt 0 ]]; then
+            if [[ "$mode" == "add" ]]; then
+                success "Added ${success_count}/${total_input} issue(s) to release '${release_title}': ${succeeded_list}"
+            else
+                success "Removed ${success_count}/${total_input} issue(s) from release '${release_title}': ${succeeded_list}"
+            fi
+        fi
+        if [[ "$failed_count" -gt 0 ]]; then
+            if [[ "$mode" == "add" ]]; then
+                warn "${failed_count} not in the release after the add (rejected by ZenHub): ${failed_list}"
+            else
+                warn "${failed_count} still in the release after the remove (rejected by ZenHub): ${failed_list}"
+            fi
+        fi
+        if [[ -n "$pagination_bailed" ]]; then
+            warn "Post-state coverage incomplete — re-verify."
+            warn "  Release-issues walk bailed: ${pagination_bailed}."
+            if [[ "$unverified_count" -gt 0 ]]; then
+                warn "  ${unverified_count}/${total_input} input(s) un-verified (the walk never reached them)."
+            fi
+            warn "  Re-verify with 'zh release show \"${release_title}\"'."
+        fi
+    fi
+
+    # A real failure beats a coverage warning (cmd_sprint_remove order).
+    if [[ "$failed_count" -gt 0 ]]; then
+        exit 1
+    fi
+    if [[ "$success_count" -eq 0 ]] && [[ -z "$pagination_bailed" ]]; then
+        exit 1
+    fi
+    if [[ -n "$pagination_bailed" ]]; then
+        exit 2
+    fi
+}
+
+cmd_release_add() { zh_release_membership "add" "$@"; }
+cmd_release_remove() { zh_release_membership "remove" "$@"; }
+
 # True when args hold a help flag outside any option value and before `--`.
 # Skipping the value slot keeps a literal "-h" title or description usable.
 zh_wants_help() {
@@ -7687,7 +7958,9 @@ cmd_release() {
         edit|update) cmd_release_edit "$@" ;;
         close) cmd_release_close "$@" ;;
         reopen) cmd_release_reopen "$@" ;;
-        delete|rm) cmd_release_delete "$@" ;;
+        add) cmd_release_add "$@" ;;
+        remove|rm) cmd_release_remove "$@" ;;
+        delete) cmd_release_delete "$@" ;;
         --) cmd_release_show -- "$@" ;;
         -*)
             if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then

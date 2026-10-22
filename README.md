@@ -189,7 +189,9 @@ ZH_REST_TOKEN=your_rest_token_here
 | `release create "Title" --start <date> --end <date>` | `release new` | Create a release for the current repo |
 | `release edit <title\|id> [-t] [-d] [--start] [--end]` | `release update` | Change a release's title, description or dates |
 | `release close <title\|id>` / `release reopen <title\|id>` | | Mark a release closed or open |
-| `release delete <title\|id>` | `release rm` | Always refused: ZenHub's public API has no delete mutation. Explains and suggests `release close` |
+| `release add <title\|id> <issue#> [...] [--json]` | | Add one or more issues to a release |
+| `release remove <title\|id> <issue#> [...] [--json]` | `release rm` | Remove one or more issues from a release |
+| `release delete <title\|id>` | | Always refused: ZenHub's public API has no delete mutation. Explains and suggests `release close` |
 | `types` | | List assignable issue types (name, level, disposition, source) |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -787,7 +789,7 @@ The mutations report per-issue success / failure. An issue can fail to link for 
 
 ### Releases
 
-A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids. A multi-word title must be quoted, and a title starting with `-` needs `zh -- release ...`. Dates must be real calendar dates. If the release listing is incomplete (exit 2), `edit`, `close` and `reopen` refuse a title and need the id.
+A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids. A multi-word title must be quoted, and a title starting with `-` needs `zh -- release ...`. Dates must be real calendar dates. If the release listing is incomplete, every command that changes a release (`edit`, `close`, `reopen`, `add`, `remove`) refuses a title with exit 2 and sends nothing; pass the id.
 
 ```bash
 # List open releases; --all includes closed ones, --closed shows only closed
@@ -809,7 +811,14 @@ zh release edit "Spring launch" -t "Spring launch (v2)"
 # Close or reopen
 zh release close "Spring launch"
 zh release reopen "Spring launch"
+
+# Add issues to a release, or remove them (rm is an alias)
+zh release add "Spring launch" 42 43 44
+zh release remove "Spring launch" 44
+zh release rm "Spring launch" 43 --json    # machine-readable result
 ```
+
+`release add` and `release remove` resolve the release and every issue number before changing anything, and list all the numbers they couldn't find at once. After the change they re-read the release and report each issue. They exit 0 when every issue is confirmed, 1 when any issue ended up in the wrong state (or none was confirmed), and 2 when the re-read was cut short and some issues couldn't be checked. `--json` uses the same exit codes. A release title is refused (exit 2, nothing sent) if the release listing was cut short, because a second release with the same title could be on a page that wasn't read. Pass the release id instead. A release title that starts with `-` needs the global `--`: `zh -- release add "-beta" 42`.
 
 ZenHub's public API has no mutation for deleting a release, so `zh release delete` exits with an explanation and suggests `zh release close`. Delete a release in the ZenHub web app if it must be removed completely.
 

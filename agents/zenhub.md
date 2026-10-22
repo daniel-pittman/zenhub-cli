@@ -114,6 +114,7 @@ The sprint mutations report per-issue success / failure. The ZenHub API doesn't 
 - `zh release create "<title>" --start YYYY-MM-DD --end YYYY-MM-DD [-d <description>] [--json|-q]` — create a release attached to the current repo.
 - `zh release edit <title|id> [-t <title>] [-d <description>] [--start YYYY-MM-DD] [--end YYYY-MM-DD]` — sends only the fields given; the resulting date range is checked first.
 - `zh release close <title|id>` / `zh release reopen <title|id>` — set the release state.
+- `zh release add <title|id> <issue#> [...] [--json]` / `zh release remove <title|id> <issue#> [...] [--json]` (alias `rm`) — change release membership in one API call. Every issue is resolved first (nothing is sent if any is missing), then the release is re-read to confirm each one. Exit 0 all confirmed, 1 real failure, 2 re-read incomplete (re-verify with `zh release show`). A title is refused when the release listing was cut short (exit 2, nothing sent, as for edit/close/reopen); pass the release id then.
 - `zh release delete` is refused: ZenHub's public API has no delete mutation. Propose `close`, or deletion in the ZenHub web app.
 - MCP equivalents: `release_list`, `release_show`, `release_create`, `release_edit`, `release_close`, `release_reopen` (there is no `release_delete`). A listing flagged `incomplete` means a title can't be trusted for edit/close/reopen; pass the release id. Releases can't be deleted, so confirm title and dates before `release_create`.
 
@@ -136,6 +137,7 @@ Use `-w` when a repo is connected to multiple workspaces — the historical defa
 - `zh epic list` → `zh epic ls`; `show` → `view`; `create` → `new`; `remove` → `rm`; `reopen` → `open`; `update` → `edit`, `modify`
 - `zh subissue` → `subissues`, `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
 - `zh sprints` → `sp`; `zh sprint add` → top-level `sa`; `zh sprint remove` → top-level `sr` (and `rm` as inner alias)
+- `zh releases` → `rels`; `zh release` → `rel`; `zh release remove` → `rm`
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 
