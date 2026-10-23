@@ -345,3 +345,42 @@ def test_run_zh_timeout_str_output_passes_through(monkeypatch):
     assert result["stdout_plain"] == "partial ok"
     assert result["stderr_plain"].startswith("warn")
     assert result["stderr_plain"].endswith("(args=['epic', 'show', '828'])")
+
+
+def test_run_zh_non_utf8_output_does_not_raise(tmp_path, monkeypatch):
+    """Bytes that are not valid UTF-8 on zh's stdout/stderr are replaced, not
+    raised, so a stray byte in an issue title cannot crash a tool call."""
+    script = tmp_path / "zh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "printf 'title \\377\\376 end\\n'\n"
+        "printf 'err \\377\\n' >&2\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setattr(mcp_server, "ZH_BIN", script)
+
+    result = mcp_server._run_zh(["x"])
+    assert result["ok"] is True
+    assert "title " in result["stdout"] and "�" in result["stdout"]
+    assert "�" in result["stderr"]
+
+
+def test_run_zh_passes_utf8_replace_to_subprocess(monkeypatch):
+    import pathlib
+    import subprocess
+
+    seen = {}
+
+    class _R:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(*a, **kw):
+        seen.update(kw)
+        return _R()
+
+    monkeypatch.setattr(pathlib.Path, "exists", lambda self: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    mcp_server._run_zh(["x"])
+    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"

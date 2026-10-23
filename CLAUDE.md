@@ -45,6 +45,21 @@ zh doctor --no-verify   # Skip the GitHub cross-check (faster, proves less)
 # discarding every change. `connection.state` is connected / not_registered /
 # unknown; `unknown` is never a pass.
 zh pipeline "Name"      # Issues in a pipeline (with ZenHub URLs)
+zh pipeline create "Name" [--after "Pipeline" | --before "Pipeline" | --position N] [-d description] [--json|-q]
+zh pipeline move "Name" --after "Pipeline" | --before "Pipeline" | --position N
+zh pipeline rename "Name" "New name" [-d description]
+zh pipeline delete "Name" [-y]  # DANGER, propose first; only empty pipelines (exact totalCount, including closed)
+zh pipeline -- create          # View a pipeline literally named Create
+# Pipeline positions start at 0; create appends by default. Move uses the final
+# index, removing the source before resolving --after/--before. Mutations refuse
+# ambiguous names and duplicate create/rename names, case-insensitively.
+# Flag-shaped names need --, with options first: zh pipeline create -- "--name"
+# Successful writes re-read and print order with the changed pipeline marked.
+# --json returns {id,name,pipelines}; -q prints id, with order on stderr.
+# Delete requires an adjacent destination even with 0 issues and reports it.
+# Interactive delete retypes the name; -y skips; non-interactive proceeds.
+# MCP: pipeline_create / pipeline_move / pipeline_rename / pipeline_delete;
+# all accept repo_path/workspace. Delete requires explicit confirm=True after approval.
 
 # Manage issues
 zh move <issue> "Pipeline"    # Move to pipeline
@@ -131,6 +146,10 @@ zh release add <title> <issue#> [...] [--json]    # Add issues to a release
 zh release remove <title> <issue#> [...] [--json] # Remove issues (alias: rm)
                                               # 0 confirmed / 1 failure / 2 re-read incomplete
 zh release delete <title>                     # Not in ZenHub's public API: explains, suggests close
+# Options before `--`, then the release and issue numbers: zh release add --json -- "-dash title" 42
+# Mutations refuse a title when the release listing is incomplete (exit 2, nothing sent); pass the id.
+# MCP: release_list, release_show, release_create, release_edit, release_close, release_reopen,
+#      release_add, release_remove (confirmed/failed/unverified; exit 2 = ok + incomplete) (no delete)
 
 # Global flags (peeled off before any subcommand)
 zh -r owner/repo <cmd>                        # Target a specific repo

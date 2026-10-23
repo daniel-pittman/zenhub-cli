@@ -98,6 +98,33 @@ def test_check_scopes_to_every_workspace_repo():
     assert out["repos"] == 3 and out["plausible"] is True
 
 
+def _pr_aware_stubs(zenhub_open: int, issues_only: int, issues_and_prs: int) -> str:
+    """gh answers `issues_only` to a query restricted with is:issue and
+    `issues_and_prs` to one that counts both, like GitHub's search does."""
+    return _stubs(zenhub_open, 0).replace(
+        'if [[ "$*" == *search/issues* ]]; then printf "%s" "0"; return 0; fi',
+        'if [[ "$*" == *is:issue* ]]; then printf "%s" "' + str(issues_only) + '"; return 0; fi\n'
+        '            if [[ "$*" == *search/issues* ]]; then printf "%s" "' + str(issues_and_prs) + '"; return 0; fi')
+
+
+def test_board_holding_issues_plus_open_prs_is_plausible():
+    """A board's total is issues plus pull requests (123 + 30 = 153); the
+    GitHub side must count the same population."""
+    r = run_zh_with_stubs(_pr_aware_stubs(153, 123, 153), "zh_count_plausibility_check ws-gid 153")
+    out = json.loads(r.stdout)
+    assert out["plausible"] is True and out["github_open"] == 153
+
+
+def test_count_with_open_prs_prints_no_disagreement_warning():
+    r = run_zh_with_stubs(_pr_aware_stubs(153, 123, 153), "cmd_count")
+    assert "do NOT agree" not in (r.stdout + r.stderr)
+
+
+def test_real_mismatch_still_warns_with_prs_counted():
+    r = run_zh_with_stubs(_pr_aware_stubs(160, 123, 153), "zh_count_plausibility_check ws-gid 160")
+    assert json.loads(r.stdout)["plausible"] is False
+
+
 # --- the three aggregate commands ------------------------------------------
 
 def test_count_human_output_qualifies_a_stale_number():

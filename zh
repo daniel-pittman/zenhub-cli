@@ -842,6 +842,10 @@ COMMANDS:
                            Example: zh pipeline "In Progress"
                            Example: zh pipeline todo --all
 
+    pipeline create|move|rename|delete
+                           Manage pipelines; see zh pipeline --help
+                           Use zh pipeline -- create to view a verb-named pipeline
+
     pipelines [repo]        List pipeline names for a workspace
                            Example: zh pipelines
 
@@ -997,11 +1001,11 @@ COMMANDS:
                            a release id also works)
                            Subcommands:
                              show <title> [--no-urls] [--json] Dates, state + issues
-                             create "Title" --start YYYY-MM-DD --end YYYY-MM-DD
+                             create "Title" -s|--start YYYY-MM-DD -e|--end YYYY-MM-DD
                                     [-d description] [--json|-q]
                                                                Create for the current repo
                              edit <title> [-t title] [-d description]
-                                  [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+                                  [-s|--start YYYY-MM-DD] [-e|--end YYYY-MM-DD]
                              close <title>                     Mark the release closed
                              reopen <title>                    Mark the release open
                              add <title> <issue#> [...] [--json]
@@ -1758,8 +1762,12 @@ cmd_mine() {
 # totalCount precisely to avoid a full walk). But an aggregate only needs to
 # know whether its number is PLAUSIBLE, and that is one asymmetric comparison:
 #
-#   ZenHub reporting MORE open issues than GitHub has  -> implausible. A board
-#       cannot hold more open issues than its repositories contain.
+#   ZenHub reporting MORE open cards than GitHub has   -> implausible. A board
+#       cannot hold more open cards than its repositories contain.
+#
+# A board holds issues AND pull requests, so the GitHub side counts both
+# (`is:open` with no `is:issue`); restricting it to issues would flag every
+# board that carries an open PR.
 #   ZenHub reporting FEWER                             -> normal and silent.
 #       Plenty of issues are never added to a board.
 #
@@ -1814,14 +1822,14 @@ zh_count_plausibility_check() {
         # Flush before exceeding the cap (200 leaves headroom for the prefix
         # and any URL-encoding expansion).
         if [[ ${#batch} -gt 0 ]] && [[ $(( ${#batch} + ${#r} + 6 )) -gt 200 ]]; then
-            batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+            batch_total=$(gh api "search/issues?q=is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
             [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
             batch=""
         fi
         batch="${batch}+repo:${r}"
     done <<< "$repo_list"
     if [[ -n "$batch" ]]; then
-        batch_total=$(gh api "search/issues?q=is:issue+is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
+        batch_total=$(gh api "search/issues?q=is:open${batch}&per_page=1" --jq '.total_count' 2>/dev/null) || batch_total=""
         [[ "$batch_total" =~ ^[0-9]+$ ]] && github_open=$(( github_open + batch_total )) || failed=true
     fi
     # A partial sum would understate GitHub's side and manufacture a false
@@ -1839,7 +1847,7 @@ zh_count_plausibility_check() {
     local plausible reason
     if [[ "$zenhub_open" -gt "$github_open" ]]; then
         plausible=false
-        reason="ZenHub reports more open issues (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — a board cannot hold more open issues than its repositories contain, unless the board has ZenHub-only cards or this GitHub token cannot see every repository"
+        reason="ZenHub reports more open issues and pull requests (${zenhub_open}) than GitHub has (${github_open}) across the same ${repo_count} repositor$([[ "$repo_count" -eq 1 ]] && echo y || echo ies) — a board cannot hold more open cards than its repositories contain, unless the board has ZenHub-only cards or this GitHub token cannot see every repository"
     else
         plausible=true
         reason="ZenHub's open count does not exceed GitHub's"
@@ -2151,17 +2159,272 @@ Use the full name."
     echo ""
 }
 
-cmd_pipeline() {
-    load_config
+# Pipeline mutations resolve names against one workspace snapshot and refuse ties.
+zh_pipeline_resolve() {
+    local rows="$1" name="$2" exact_only="${3:-false}" matched count
+    matched=$(printf '%s' "$rows" | jq -c --arg n "$name" '
+        def norm: gsub("^\\s+|\\s+$"; "") | ascii_downcase;
+        [.[] | select((.name | norm) == ($n | norm))] as $exact
+        | if ($exact | length) > 0 then $exact
+          else [.[] | select((.name | norm) | contains($n | norm))] end')
+    count=$(printf '%s' "$matched" | jq length)
+    # A destructive verb must not act on a partial match: refuse and name it.
+    if [[ "$exact_only" == true && "$count" -gt 0 ]] &&
+        [[ "$(printf '%s' "$matched" | jq -r --arg n "$name" 'def norm: gsub("^\\s+|\\s+$"; "") | ascii_downcase; map(select((.name | norm) == ($n | norm))) | length')" -eq 0 ]]; then
+        error "No pipeline named exactly '${name}'. Partial match: $(printf '%s' "$matched" | jq -r '[.[].name] | join(", ")')
+Use the full name; delete requires an exact name."
+    fi
+    [[ "$count" -gt 0 ]] || error "Pipeline not found: ${name}
+Available: $(printf '%s' "$rows" | jq -r '[.[].name] | join(", ")')"
+    [[ "$count" -eq 1 ]] || error "Ambiguous pipeline '${name}' matches: $(printf '%s' "$matched" | jq -r '[.[].name] | join(", ")')
+Use the full name."
+    printf '%s' "$matched" | jq -c '.[0]'
+}
 
+zh_pipeline_rows() {
+    local workspace_id="$1" with_counts="${2:-false}" query response
+    if [[ "$with_counts" == true ]]; then
+        # Unfiltered totalCount includes closed issues and ZenHub-only cards.
+        query='query($workspaceId: ID!) { workspace(id: $workspaceId) {
+            pipelinesConnection { nodes { id name issues { totalCount } } }
+        } }'
+    else
+        query='query($workspaceId: ID!) { workspace(id: $workspaceId) {
+            pipelinesConnection { nodes { id name } }
+        } }'
+    fi
+    response=$(zh_graphql "$query" "$(jq -n --arg id "$workspace_id" '{workspaceId: $id}')") || return 1
+    printf '%s' "$response" | jq -e '.data.workspace.pipelinesConnection.nodes | type == "array"' >/dev/null ||
+        error "Could not read the workspace's pipeline list"
+    printf '%s' "$response" | jq -c '.data.workspace.pipelinesConnection.nodes'
+}
+
+zh_pipeline_order() {
+    local rows="$1" changed_id="$2"
+    printf 'Pipeline order (0-based):\n'
+    printf '%s' "$rows" | jq -r --arg id "$changed_id" '
+        to_entries[] | "\(if .value.id == $id then "*" else " " end) \(.key): \(.value.name)"'
+}
+
+cmd_pipeline_help() {
+    cat <<'EOF_HELP'
+Usage: zh pipeline <name> [--all] [--no-urls] [--no-verify]
+       zh pipeline create "Name" [--after "Pipeline" | --before "Pipeline" | --position N] [-d "Description"] [--json|-q]
+       zh pipeline move "Name" (--after "Pipeline" | --before "Pipeline" | --position N)
+       zh pipeline rename "Name" "New name" [-d "Description"]
+       zh pipeline delete "Name" [-y|--yes]
+
+Positions count from 0. Create appends by default. Move positions refer to
+its final index, with the source removed before resolving an anchor.
+Names match case-insensitively, preferring exact names over partial matches.
+Mutations refuse ambiguous matches; delete requires an exact name. Quote multi-word names.
+Use 'zh pipeline -- create' to view a pipeline named Create (also move,
+rename, delete). A flag-shaped name needs --; put options before it:
+  zh pipeline create --position 0 -- "--experimental"
+
+Every successful mutation prints the resulting order with * marking the
+changed pipeline. Delete marks the removed name separately. Create --json
+returns {id, name, pipelines}, with changed=true on the new pipeline;
+-q prints only its id on stdout and the resulting order on stderr.
+
+DANGER: deletion is permanent. Propose the deletion first for approval.
+Only EMPTY pipelines can be deleted, checked using the exact totalCount
+including closed issues. The API requires an adjacent destination, even
+though there are no issues to move; zh prints which destination it uses.
+Interactive callers must retype the pipeline name. -y skips the prompt;
+non-interactive callers proceed without prompting, like zh delete.
+EOF_HELP
+}
+
+cmd_pipeline_mutate() {
+    local verb="$1"; shift
+    local name="" new_name="" description="" has_description=false
+    local placement="" anchor="" position="" output_mode=text assume_yes=false
+    local positional=() end_options=false
+    while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            positional+=("$1"); shift; continue
+        fi
+        case "$1" in
+            --) end_options=true; shift ;;
+            -h|--help) cmd_pipeline_help; return 0 ;;
+            --after|--before|--position)
+                [[ "$verb" == create || "$verb" == move ]] || error "Option $1 is not valid for pipeline ${verb}"
+                [[ $# -ge 2 && -n "$2" ]] || error "Option $1 requires a value"
+                [[ -z "$placement" ]] || error "Use only one of --after, --before, --position"
+                placement="$1"
+                if [[ "$placement" == --position ]]; then position="$2"; else anchor="$2"; fi
+                shift 2 ;;
+            -d|--description)
+                [[ "$verb" == create || "$verb" == rename ]] || error "Option $1 is not valid for pipeline ${verb}"
+                [[ $# -ge 2 ]] || error "Option $1 requires a value"
+                description="$2"; has_description=true; shift 2 ;;
+            --json|-q|--quiet)
+                [[ "$verb" == create ]] || error "Option $1 is only valid for pipeline create"
+                if [[ "$1" == --json ]]; then output_mode=json; else output_mode=quiet; fi
+                shift ;;
+            -y|--yes)
+                [[ "$verb" == delete ]] || error "Option $1 is only valid for pipeline delete"
+                assume_yes=true; shift ;;
+            -*) error "Unknown option for pipeline ${verb}: $1 (a flag-shaped name needs --)" ;;
+            *) positional+=("$1"); shift ;;
+        esac
+    done
+    local required=1
+    [[ "$verb" == rename ]] && required=2
+    [[ ${#positional[@]} -ge "$required" ]] || error "Usage: zh pipeline ${verb} requires ${required} name(s). See zh pipeline --help"
+    [[ ${#positional[@]} -eq "$required" ]] || error "Unexpected argument: ${positional[$required]} (quote multi-word pipeline names)"
+    name="${positional[0]}"
+    [[ -n "${name//[[:space:]]/}" ]] || error "Pipeline name must not be empty"
+    if [[ "$verb" == rename ]]; then
+        new_name="${positional[1]}"
+        [[ -n "${new_name//[[:space:]]/}" ]] || error "New pipeline name must not be empty"
+    fi
+    [[ "$verb" != move || -n "$placement" ]] || error "Pipeline move requires --after, --before, or --position"
+    if [[ "$placement" == --position ]]; then
+        [[ "$position" =~ ^[0-9]+$ ]] || error "Invalid position: ${position} (use a non-negative integer starting at 0)"
+        # Compare canonical decimal strings before arithmetic to avoid overflow.
+        position=$(printf '%s' "$position" | sed 's/^0*//')
+        position="${position:-0}"
+        [[ ${#position} -le 9 ]] || error "Invalid position: out of range"
+    fi
+
+    load_config
+    local owner_repo workspace_id rows target='{}' pipeline_id="" actual_name="$name"
+    owner_repo=$(get_repo_info)
+    workspace_id=$(get_workspace_id "$owner_repo")
+    rows=$(zh_pipeline_rows "$workspace_id" "$([[ "$verb" == delete ]] && echo true || echo false)")
+    if [[ "$verb" != create ]]; then
+        target=$(zh_pipeline_resolve "$rows" "$name" "$([[ "$verb" == delete ]] && echo true || echo false)")
+        pipeline_id=$(printf '%s' "$target" | jq -r .id)
+        actual_name=$(printf '%s' "$target" | jq -r .name)
+    fi
+    if [[ "$verb" == create || "$verb" == rename ]]; then
+        local proposed="$name" duplicates
+        [[ "$verb" == rename ]] && proposed="$new_name"
+        duplicates=$(printf '%s' "$rows" | jq -c --arg n "$proposed" --arg id "$pipeline_id" '
+            def norm: gsub("^\\s+|\\s+$"; "") | ascii_downcase;
+            [.[] | select(.id != $id and ((.name | norm) == ($n | norm)))]')
+        [[ "$(printf '%s' "$duplicates" | jq length)" -eq 0 ]] || error "Pipeline name already exists: ${proposed}"
+    fi
+
+    local variables query operation remaining max_position
+    remaining=$(printf '%s' "$rows" | jq -c --arg id "$pipeline_id" '[.[] | select(.id != $id)]')
+    max_position=$(printf '%s' "$remaining" | jq length)
+    # Inserting into the remaining list permits indices 0 through its length.
+    if [[ "$verb" == create || "$verb" == move ]]; then
+        if [[ -z "$placement" ]]; then
+            position="$max_position"
+        elif [[ "$placement" != --position ]]; then
+            local anchor_row anchor_id
+            anchor_row=$(zh_pipeline_resolve "$rows" "$anchor")
+            anchor_id=$(printf '%s' "$anchor_row" | jq -r .id)
+            [[ "$anchor_id" != "$pipeline_id" ]] || error "Cannot move a pipeline relative to itself"
+            position=$(printf '%s' "$remaining" | jq --arg id "$anchor_id" 'map(.id) | index($id)')
+            [[ "$placement" == --after ]] && position=$((position + 1))
+        fi
+        [[ "$position" -le "$max_position" ]] || error "Invalid position: ${position} (expected 0 through ${max_position})"
+    fi
+
+    case "$verb" in
+        create)
+            operation=createPipeline
+            query='mutation($input: CreatePipelineInput!) { createPipeline(input: $input) { __typename } }'
+            variables=$(jq -n --arg ws "$workspace_id" --arg name "$name" --argjson pos "$position" \
+                --arg desc "$description" --argjson has_desc "$has_description" \
+                '{input: ({workspaceId: $ws, name: $name, position: $pos} +
+                    (if $has_desc then {description: $desc} else {} end))}') ;;
+        move)
+            operation=updatePipeline
+            query='mutation($input: UpdatePipelineInput!) { updatePipeline(input: $input) { __typename } }'
+            variables=$(jq -n --arg id "$pipeline_id" --argjson pos "$position" '{input: {pipelineId: $id, position: $pos}}') ;;
+        rename)
+            operation=updatePipeline
+            query='mutation($input: UpdatePipelineInput!) { updatePipeline(input: $input) { __typename } }'
+            variables=$(jq -n --arg id "$pipeline_id" --arg name "$new_name" \
+                --arg desc "$description" --argjson has_desc "$has_description" \
+                '{input: ({pipelineId: $id, name: $name} + (if $has_desc then {description: $desc} else {} end))}') ;;
+        delete)
+            local count destination destination_id destination_name
+            count=$(printf '%s' "$target" | jq -r '.issues.totalCount')
+            [[ "$count" =~ ^[0-9]+$ ]] || error "Cannot delete: exact issue count is unavailable"
+            [[ "$count" == 0 ]] || error "Cannot delete pipeline '${actual_name}': it holds ${count} issues (exact count, including closed issues). Move them first."
+            [[ "$(printf '%s' "$remaining" | jq length)" -gt 0 ]] || error "Cannot delete the only pipeline: the API requires an adjacent destination"
+            destination=$(printf '%s' "$rows" | jq -c --arg id "$pipeline_id" '
+                map(.id) | index($id)' )
+            destination=$(printf '%s' "$rows" | jq -c --argjson i "$destination" 'if $i > 0 then .[$i - 1] else .[1] end')
+            destination_id=$(printf '%s' "$destination" | jq -r .id)
+            destination_name=$(printf '%s' "$destination" | jq -r .name)
+            warn "DANGER: permanently delete empty pipeline '${actual_name}' (0 issues). API destination: adjacent pipeline '${destination_name}'; no issues to move."
+            if [[ "$assume_yes" != true && -t 0 ]]; then
+                printf 'Type the pipeline name (%s) to confirm, or anything else to cancel: ' "$actual_name" >&2
+                local reply=""
+                IFS= read -r reply || true
+                [[ "$reply" == "$actual_name" ]] || error "Aborted: confirmation did not match. Nothing was deleted."
+                # Confirmation may take time; require the pipeline still to be empty.
+                local fresh_rows fresh_target
+                fresh_rows=$(zh_pipeline_rows "$workspace_id" true)
+                fresh_target=$(printf '%s' "$fresh_rows" | jq -c --arg id "$pipeline_id" '.[] | select(.id == $id)')
+                [[ -n "$fresh_target" ]] || error "Pipeline disappeared during confirmation. Nothing was deleted."
+                [[ "$(printf '%s' "$fresh_target" | jq -r '.issues.totalCount')" == 0 ]] ||
+                    error "Pipeline is no longer confirmed empty. Nothing was deleted."
+            fi
+            operation=deletePipeline
+            query='mutation($input: DeletePipelineInput!) { deletePipeline(input: $input) { __typename } }'
+            variables=$(jq -n --arg id "$pipeline_id" --arg dest "$destination_id" '{input: {pipelineId: $id, destinationPipelineId: $dest}}') ;;
+    esac
+    # Payload fields vary by mutation; re-read the workspace for the result.
+    local response
+    response=$(zh_graphql "$query" "$variables")
+    printf '%s' "$response" | jq -e --arg op "$operation" '.data[$op] != null and ((.errors // []) | length == 0)' >/dev/null ||
+        error "ZenHub did not confirm pipeline ${verb}; inspect the board before retrying"
+    rows=$(zh_pipeline_rows "$workspace_id") || error "Pipeline ${verb} succeeded, but its resulting order could not be read. Inspect the board before retrying."
+    if [[ "$verb" == create ]]; then
+        target=$(zh_pipeline_resolve "$rows" "$name")
+        pipeline_id=$(printf '%s' "$target" | jq -r .id)
+        case "$output_mode" in
+            json)
+                jq -n --arg id "$pipeline_id" --arg name "$name" --argjson rows "$rows" \
+                    '{id: $id, name: $name, pipelines: ($rows | map(. + {changed: (.id == $id)}))}' ;;
+            quiet) printf '%s\n' "$pipeline_id"; zh_pipeline_order "$rows" "$pipeline_id" >&2 ;;
+            *) success "Created pipeline: ${name}"; zh_pipeline_order "$rows" "$pipeline_id" ;;
+        esac
+    else
+        success "Pipeline ${verb}: ${actual_name}"
+        [[ "$verb" == delete ]] && printf '* Removed: %s\n' "$actual_name"
+        zh_pipeline_order "$rows" "$pipeline_id"
+    fi
+}
+
+cmd_pipeline() {
+    if zh_wants_help "-d --description --after --before --position" ${@+"$@"}; then
+        cmd_pipeline_help
+        return 0
+    fi
+    # An explicit -- makes verb names and flag-shaped pipeline names readable.
+    case "${1:-}" in
+        --) shift; cmd_pipeline_show -- "$@" ;;
+        create|move|rename|delete) cmd_pipeline_mutate "$@" ;;
+        *) cmd_pipeline_show "$@" ;;
+    esac
+}
+
+cmd_pipeline_show() {
     local pipeline_name=""
     local include_closed=false
     local show_urls=true
     local skip_verify=false
 
+    local end_options=false
     # Parse arguments
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$pipeline_name" ]] || error "Unexpected argument: $1 (quote multi-word pipeline names)"
+            pipeline_name="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
+            -h|--help) cmd_pipeline_help; return 0 ;;
             --all|-a)
                 include_closed=true
                 shift
@@ -2174,10 +2437,10 @@ cmd_pipeline() {
                 show_urls=false
                 shift
                 ;;
+            -*) error "Unknown option for pipeline: $1 (a flag-shaped name needs --)" ;;
             *)
-                if [[ -z "$pipeline_name" ]]; then
-                    pipeline_name="$1"
-                fi
+                [[ -z "$pipeline_name" ]] || error "Unexpected argument: $1 (quote multi-word pipeline names)"
+                pipeline_name="$1"
                 shift
                 ;;
         esac
@@ -2189,6 +2452,8 @@ Example: zh pipeline \"In Progress\"
          zh pipeline todo --all       # Include closed issues
          zh pipeline todo --no-urls   # Hide URLs"
     fi
+
+    load_config
 
     local owner_repo
     owner_repo=$(get_repo_info)
@@ -2217,20 +2482,11 @@ Example: zh pipeline \"In Progress\"
     local pipelines_response
     pipelines_response=$(zh_graphql "$pipelines_query" "$pipelines_vars")
 
-    # Find pipeline by name (case-insensitive, trim whitespace)
-    local pipeline_id pipeline_actual_name
-    pipeline_id=$(echo "$pipelines_response" | jq -r --arg name "$pipeline_name" \
-        '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .id')
-    pipeline_actual_name=$(echo "$pipelines_response" | jq -r --arg name "$pipeline_name" \
-        '.data.workspace.pipelinesConnection.nodes[] | select((.name | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($name | gsub("^\\s+|\\s+$"; "") | ascii_downcase)) | .name')
-
-    if [[ -z "$pipeline_id" ]]; then
-        echo -e "${RED}Error:${NC} Pipeline '${pipeline_name}' not found." >&2
-        echo ""
-        echo "Available pipelines:"
-        echo "$pipelines_response" | jq -r '.data.workspace.pipelinesConnection.nodes[] | "  - \(.name)"'
-        exit 1
-    fi
+    local pipeline_id pipeline_actual_name target rows
+    rows=$(printf '%s' "$pipelines_response" | jq -c '.data.workspace.pipelinesConnection.nodes')
+    target=$(zh_pipeline_resolve "$rows" "$pipeline_name")
+    pipeline_id=$(printf '%s' "$target" | jq -r .id)
+    pipeline_actual_name=$(printf '%s' "$target" | jq -r .name)
 
     # Get EVERY issue in this pipeline. Previously this issued one `first: 50`
     # page and then derived the header count from `nodes | length` — so a
@@ -6643,7 +6899,7 @@ zh_releases_fetch_all() {
                     endOn
                     closedAt
                     issuesCount
-                    repositories(first: 10) { nodes { ownerName name } }
+                    repositories(first: 100) { totalCount nodes { ownerName name } }
                 }
             }
         }
@@ -6677,6 +6933,7 @@ zh_releases_fetch_all() {
 
         local response
         response=$(zh_graphql "$query" "$variables")
+        zh_release_require_object "$response" "listing releases"
 
         local workspace_kind
         workspace_kind=$(echo "$response" | jq -r '.data.workspace | type')
@@ -6689,19 +6946,27 @@ zh_releases_fetch_all() {
             first_page=false
         fi
 
-        local page_nodes
-        page_nodes=$(echo "$response" | jq -c '[(.data.workspace.releases.nodes // [])[] | select(. != null)]')
-        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
-
         local has_next end_cursor
         has_next=$(echo "$response" | jq -r '.data.workspace.releases.pageInfo.hasNextPage // false')
         end_cursor=$(echo "$response" | jq -r '.data.workspace.releases.pageInfo.endCursor // ""')
 
+        # A page that hands back the cursor it was requested with is a repeat
+        # of the previous one; drop it rather than count its nodes twice.
+        if [[ "$has_next" == "true" && -n "$end_cursor" && "$end_cursor" == "$last_cursor" ]]; then
+            warn "Release pagination cursor not advancing, bailing"
+            pagination_bailed="stuck_cursor"
+            break
+        fi
+
+        local page_nodes
+        page_nodes=$(echo "$response" | jq -c '[(.data.workspace.releases.nodes // [])[] | select(. != null)]')
+        all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
+
         if [[ "$has_next" != "true" ]]; then
             break
         fi
-        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
-            warn "Release pagination cursor not advancing — bailing"
+        if [[ -z "$end_cursor" ]]; then
+            warn "Release pagination returned no cursor, bailing"
             pagination_bailed="stuck_cursor"
             break
         fi
@@ -6720,13 +6985,15 @@ zh_releases_fetch_all() {
 # Emits "<id>\t<title>" on stdout; exits non-zero when the release is
 # missing or the title matches more than one release (pass the id then).
 #
-# `require_complete` ("1") refuses a TITLE match when the listing bailed:
-# a same-titled release may sit on a page the walk never reached, so the
-# match can't be proven unique. An id match is unique either way.
+# `mode` is "mutate" for every command that changes the release or its
+# issues. A title match is only trustworthy when the listing was complete (a
+# same-titled release on an unreached page would go unnoticed), so mutations
+# refuse it with exit 2; an id match is exact and is always accepted. Any
+# other mode, including the default, accepts the match with a warning.
 zh_resolve_release() {
     local workspace_id="$1"
     local wanted="$2"
-    local require_complete="${3:-}"
+    local mode="${3:-read}"
 
     local releases_json
     releases_json=$(zh_releases_fetch_all "$workspace_id" "")
@@ -6738,22 +7005,13 @@ zh_resolve_release() {
           else [.nodes[] | select((.title | gsub("^\\s+|\\s+$"; "") | ascii_downcase) == ($w | gsub("^\\s+|\\s+$"; "") | ascii_downcase))]
           end')
 
-    local match_count
+    local match_count listing_bailed matched_by_id
     match_count=$(echo "$matches" | jq 'length')
-
-    if [[ "$require_complete" == "1" ]] && [[ "$match_count" -gt 0 ]]; then
-        local strict_bailed matched_by_id
-        strict_bailed=$(echo "$releases_json" | jq -r '.pagination_bailed // ""')
-        matched_by_id=$(echo "$matches" | jq -r --arg w "$wanted" 'any(.[]; .id == $w)')
-        if [[ -n "$strict_bailed" ]] && [[ "$matched_by_id" != "true" ]]; then
-            error "The release listing was incomplete (${strict_bailed}), so the title '${wanted}' can't be proven unique. Pass the release id instead (from 'zh releases --all --json')."
-        fi
-    fi
+    listing_bailed=$(echo "$releases_json" | jq -r '.pagination_bailed // ""')
+    matched_by_id=$(echo "$matches" | jq -r --arg w "$wanted" 'any(.[]; .id == $w)')
 
     if [[ "$match_count" -eq 0 ]]; then
         printf "${RED}Error:${NC} Release '%s' not found.\n" "$wanted" >&2
-        local listing_bailed
-        listing_bailed=$(echo "$releases_json" | jq -r '.pagination_bailed // ""')
         if [[ -n "$listing_bailed" ]]; then
             echo "" >&2
             echo "  Listing was incomplete due to: ${listing_bailed}." >&2
@@ -6771,7 +7029,27 @@ zh_resolve_release() {
         exit 1
     fi
 
+    if [[ -n "$listing_bailed" && "$matched_by_id" != "true" ]]; then
+        if [[ "$mode" == "mutate" ]]; then
+            printf "${RED}Error:${NC} The release listing was incomplete (%s), so the title '%s' can't be proven unique.\n" "$listing_bailed" "$wanted" >&2
+            echo "  Pass the release id instead (from 'zh releases --all --json')." >&2
+            exit 2
+        fi
+        warn "Release listing was incomplete (${listing_bailed}); a same-titled release may exist on an unreached page."
+    fi
+
     echo "$matches" | jq -r '.[0] | "\(.id)\t\(.title)"'
+}
+
+# Exit with a clear message when a GraphQL response is not a JSON object
+# (an HTML error page from a proxy, an empty body), instead of letting every
+# later jq call print its own parse error.
+zh_release_require_object() {
+    local response="$1"
+    local context="$2"
+    if ! printf '%s' "$response" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        error "ZenHub returned an unreadable response while ${context} (check token / network)"
+    fi
 }
 
 # Validate a YYYY-MM-DD date argument; `label` names the flag in errors.
@@ -6781,19 +7059,32 @@ zh_release_validate_date() {
     if ! [[ "$value" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})$ ]]; then
         error "Invalid ${label} date '${value}' (expected YYYY-MM-DD)"
     fi
+    local year=$((10#${BASH_REMATCH[1]}))
     local month=$((10#${BASH_REMATCH[2]}))
     local day=$((10#${BASH_REMATCH[3]}))
-    if [[ "$month" -lt 1 || "$month" -gt 12 || "$day" -lt 1 || "$day" -gt 31 ]]; then
-        error "Invalid ${label} date '${value}' (expected YYYY-MM-DD)"
+    local max_day=31
+    case "$month" in
+        4|6|9|11) max_day=30 ;;
+        2)
+            if (( year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) )); then
+                max_day=29
+            else
+                max_day=28
+            fi
+            ;;
+    esac
+    if [[ "$year" -lt 1 || "$month" -lt 1 || "$month" -gt 12 || "$day" -lt 1 || "$day" -gt "$max_day" ]]; then
+        error "Invalid ${label} date '${value}' (expected a real calendar date, YYYY-MM-DD)"
     fi
 }
 
 # Walk every page of a release's issues. Emits { nodes, pagination_bailed }.
 zh_release_issues_fetch_all() {
     local release_id="$1"
+    local workspace_id="$2"
 
     local query='
-    query($releaseId: ID!, $after: String) {
+    query($releaseId: ID!, $workspaceId: ID!, $after: String) {
         node(id: $releaseId) {
             ... on Release {
                 issues(first: 100, after: $after) {
@@ -6806,7 +7097,7 @@ zh_release_issues_fetch_all() {
                         estimate { value }
                         assignees { nodes { login } }
                         repository { ownerName name }
-                        pipelineIssues { nodes { pipeline { name } } }
+                        pipelineIssue(workspaceId: $workspaceId) { pipeline { name } }
                     }
                 }
             }
@@ -6828,29 +7119,38 @@ zh_release_issues_fetch_all() {
         fi
 
         local variables
-        variables=$(jq -n --arg release_id "$release_id" --argjson after "$cursor" \
-            '{releaseId: $release_id, after: $after}')
+        variables=$(jq -n --arg release_id "$release_id" --arg workspace_id "$workspace_id" \
+            --argjson after "$cursor" \
+            '{releaseId: $release_id, workspaceId: $workspace_id, after: $after}')
 
         local response
         response=$(zh_graphql "$query" "$variables")
+        zh_release_require_object "$response" "listing release issues"
 
         if [[ "$(echo "$response" | jq -r '.data.node | type')" == "null" ]]; then
             error "Release '${release_id}' resolved to null (deleted, ACL-revoked, or otherwise inaccessible)"
+        fi
+
+        local has_next end_cursor
+        has_next=$(echo "$response" | jq -r '.data.node.issues.pageInfo.hasNextPage // false')
+        end_cursor=$(echo "$response" | jq -r '.data.node.issues.pageInfo.endCursor // ""')
+
+        # See zh_releases_fetch_all: a repeated cursor means a repeated page.
+        if [[ "$has_next" == "true" && -n "$end_cursor" && "$end_cursor" == "$last_cursor" ]]; then
+            warn "Release-issues pagination cursor not advancing, bailing"
+            pagination_bailed="stuck_cursor"
+            break
         fi
 
         local page_nodes
         page_nodes=$(echo "$response" | jq -c '[(.data.node.issues.nodes // [])[] | select(. != null)]')
         all_nodes=$(jq -n --argjson a "$all_nodes" --argjson b "$page_nodes" '$a + $b')
 
-        local has_next end_cursor
-        has_next=$(echo "$response" | jq -r '.data.node.issues.pageInfo.hasNextPage // false')
-        end_cursor=$(echo "$response" | jq -r '.data.node.issues.pageInfo.endCursor // ""')
-
         if [[ "$has_next" != "true" ]]; then
             break
         fi
-        if [[ -z "$end_cursor" || "$end_cursor" == "$last_cursor" ]]; then
-            warn "Release-issues pagination cursor not advancing — bailing"
+        if [[ -z "$end_cursor" ]]; then
+            warn "Release-issues pagination returned no cursor, bailing"
             pagination_bailed="stuck_cursor"
             break
         fi
@@ -6890,6 +7190,8 @@ cmd_releases() {
 
     if [[ "$json_output" == "true" ]]; then
         echo "$releases_json" | jq '{workspace: .workspace_name, releases: .nodes, pagination_bailed: .pagination_bailed}'
+        # Same signal as text mode: the JSON is printed, flagged incomplete.
+        [[ -z "$(echo "$releases_json" | jq -r '.pagination_bailed // ""')" ]] || exit 2
         return 0
     fi
 
@@ -6909,8 +7211,12 @@ cmd_releases() {
     if [[ "$count" -eq 0 ]]; then
         echo "  No releases found"
     else
-        echo "$releases_json" | jq -r '.nodes[] |
-            "  \(.title)\n    \(.state) │ \(.startOn // "?") → \(.endOn // "?") │ \(.issuesCount // 0) issues │ \([.repositories.nodes[].name] | join(", "))\n"'
+        echo "$releases_json" | jq -r '
+            def repo_names: ((.repositories.nodes // []) | length) as $shown
+                | ((.repositories.nodes // []) | map(.name) | join(", "))
+                  + (if (.repositories.totalCount // 0) > $shown then " (+\((.repositories.totalCount) - $shown) more)" else "" end);
+            .nodes[] |
+            "  \(.title)\n    \(.state) │ \(.startOn // "?") → \(.endOn // "?") │ \(.issuesCount // 0) issues │ \(repo_names)\n"'
     fi
 
     echo -e "${CYAN}Tip:${NC} Use 'zh release <title>' to view the issues in a release"
@@ -6931,16 +7237,29 @@ cmd_release_show() {
     local wanted=""
     local show_urls=true
     local json_output=false
+    local end_options=false
 
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$wanted" ]] || error "Unexpected argument: $1 (quote a multi-word release title)"
+            wanted="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
             --no-urls) show_urls=false; shift ;;
             --json) json_output=true; shift ;;
-            *)
-                if [[ -z "$wanted" ]]; then
-                    wanted="$1"
+            -*)
+                if [[ -z "$wanted" && "${ZH_END_OF_OPTS:-false}" == "true" ]]; then
+                    wanted="$1"; shift
+                else
+                    error "Unknown option for release show: $1 (a title starting with '-' needs 'zh -- release show ...')"
                 fi
-                shift
+                ;;
+            *)
+                if [[ -n "$wanted" ]]; then
+                    error "Unexpected argument: $1 (quote a multi-word release title)"
+                fi
+                wanted="$1"; shift
                 ;;
         esac
     done
@@ -6979,21 +7298,23 @@ Examples:
                 endOn
                 closedAt
                 issuesCount
-                repositories(first: 10) { nodes { ownerName name } }
+                repositories(first: 100) { totalCount nodes { ownerName name } }
             }
         }
     }'
 
     local detail_response
     detail_response=$(zh_graphql "$detail_query" "$(jq -n --arg id "$release_id" '{releaseId: $id}')")
+    zh_release_require_object "$detail_response" "loading the release"
 
     local issues_json
-    issues_json=$(zh_release_issues_fetch_all "$release_id")
+    issues_json=$(zh_release_issues_fetch_all "$release_id" "$workspace_id")
 
     if [[ "$json_output" == "true" ]]; then
         jq -n --argjson release "$(echo "$detail_response" | jq '.data.node')" \
             --argjson issues "$issues_json" \
             '$release + {issues: $issues.nodes, pagination_bailed: $issues.pagination_bailed}'
+        [[ -z "$(echo "$issues_json" | jq -r '.pagination_bailed // ""')" ]] || exit 2
         return 0
     fi
 
@@ -7004,7 +7325,10 @@ Examples:
     end_on=$(echo "$detail_response" | jq -r '.data.node.endOn // "?"')
     closed_at=$(echo "$detail_response" | jq -r '.data.node.closedAt[:10] // empty')
     description=$(echo "$detail_response" | jq -r '.data.node.description // empty')
-    repos=$(echo "$detail_response" | jq -r '[.data.node.repositories.nodes[] | "\(.ownerName)/\(.name)"] | join(", ")')
+    repos=$(echo "$detail_response" | jq -r '(.data.node.repositories.nodes // []) as $nodes
+        | ($nodes | map("\(.ownerName)/\(.name)") | join(", "))
+          + (if (.data.node.repositories.totalCount // 0) > ($nodes | length)
+             then " (+\((.data.node.repositories.totalCount) - ($nodes | length)) more)" else "" end)')
 
     local issue_count open_count closed_count
     issue_count=$(echo "$issues_json" | jq '.nodes | length')
@@ -7032,7 +7356,7 @@ Examples:
         echo "  No issues in this release"
     elif [[ "$show_urls" == "true" ]]; then
         echo "$issues_json" | jq -r '.nodes[] |
-            "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(.pipelineIssues.nodes[0].pipeline.name // "—")\n    \(if .state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.htmlUrl)\n"'
+            "  #\(.number) │ \(.repository.ownerName)/\(.repository.name) │ \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(.pipelineIssue.pipeline.name // "—")\n    \(if .state == "CLOSED" then "✓ " else "" end)\(.title)\n    → \(.htmlUrl)\n"'
     else
         echo "$issues_json" | jq -r '.nodes[] |
             "  #\(.number)  \((.estimate.value // "—") | tostring) pts │ \([.assignees.nodes[].login] | join(",") | if . == "" then "unassigned" else . end) │ \(if .state == "CLOSED" then "✓ " else "  " end)\(.title)"'
@@ -7052,9 +7376,15 @@ cmd_release_create() {
 
     local title="" description="" start_on="" end_on=""
     local output_mode="text"
+    local end_options=false
 
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$title" ]] || error "Unexpected argument: $1 (quote a multi-word title)"
+            title="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
             -d|--description)
                 [[ $# -ge 2 ]] || error "Option $1 requires a value"
                 description="$2"; shift 2 ;;
@@ -7153,9 +7483,15 @@ cmd_release_edit() {
     local wanted=""
     local new_title="" new_description="" new_start="" new_end=""
     local set_title=false set_description=false
+    local end_options=false
 
     while [[ $# -gt 0 ]]; do
+        if [[ "$end_options" == true ]]; then
+            [[ -z "$wanted" ]] || error "Unexpected argument: $1 (quote a multi-word release title)"
+            wanted="$1"; shift; continue
+        fi
         case "$1" in
+            --) end_options=true; shift ;;
             -t|--title)
                 [[ $# -ge 2 ]] || error "Option $1 requires a value"
                 new_title="$2"; set_title=true; shift 2 ;;
@@ -7168,7 +7504,13 @@ cmd_release_edit() {
             -e|--end)
                 [[ $# -ge 2 ]] || error "Option $1 requires a YYYY-MM-DD value"
                 new_end="$2"; shift 2 ;;
-            -*) error "Unknown option for release edit: $1" ;;
+            -*)
+                if [[ -z "$wanted" && "${ZH_END_OF_OPTS:-false}" == "true" ]]; then
+                    wanted="$1"; shift
+                else
+                    error "Unknown option for release edit: $1 (a title starting with '-' needs 'zh -- release edit ...')"
+                fi
+                ;;
             *)
                 if [[ -n "$wanted" ]]; then
                     error "Unexpected argument: $1 (quote a multi-word release title)"
@@ -7201,7 +7543,7 @@ Examples:
     workspace_id=$(get_workspace_id "$owner_repo")
 
     local resolved release_id release_title
-    resolved=$(zh_resolve_release "$workspace_id" "$wanted")
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted" mutate)
     release_id="${resolved%%	*}"
     release_title="${resolved#*	}"
 
@@ -7232,6 +7574,7 @@ Examples:
     zh_release_update "$release_id" "$changes" >/dev/null
 
     echo ""
+    [[ "$set_title" == true ]] && release_title="$new_title"
     success "Updated release: ${release_title}"
     echo "$changes" | jq -r 'to_entries[] | "  \(.key): \(.value)"'
 }
@@ -7269,9 +7612,17 @@ zh_release_set_state() {
 
     load_config
 
+    local end_options=false
+    if [[ "${1:-}" == -- ]]; then end_options=true; shift; fi
     local wanted="${1:-}"
     if [[ -z "$wanted" ]]; then
         error "Usage: zh release ${verb} <title|id>"
+    fi
+    if [[ $# -gt 1 ]]; then
+        error "Unexpected argument: $2 (quote a multi-word release title)"
+    fi
+    if [[ "$wanted" == -* && "${ZH_END_OF_OPTS:-false}" != "true" && "$end_options" != true ]]; then
+        error "Unknown option for release ${verb}: ${wanted} (a title starting with '-' needs 'zh -- release ${verb} ...')"
     fi
 
     local owner_repo
@@ -7281,7 +7632,7 @@ zh_release_set_state() {
     workspace_id=$(get_workspace_id "$owner_repo")
 
     local resolved release_id release_title
-    resolved=$(zh_resolve_release "$workspace_id" "$wanted")
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted" mutate)
     release_id="${resolved%%	*}"
     release_title="${resolved#*	}"
 
@@ -7338,7 +7689,7 @@ Options:
 Examples:
   zh release add \"Spring launch\" 42
   zh release add \"Spring launch\" 42 43 44
-  zh -- release add \"-dash title\" 42    # a title starting with '-'"
+  zh release add --json -- \"-dash title\" 42    # a title starting with '-'"
     if [[ "$mode" == "remove" ]]; then
         verb="remove"
         usage_text="Usage: zh release remove <title|id> <issue#> [<issue#> ...] [--json]
@@ -7350,23 +7701,30 @@ Options:
 
 Examples:
   zh release remove \"Spring launch\" 42
-  zh release rm \"Spring launch\" 42 43    # 'rm' is an alias for remove"
+  zh release rm \"Spring launch\" 42 43    # 'rm' is an alias for remove
+  zh release remove -- \"-dash title\" 42  # a title starting with '-'"
     fi
 
     # Parse everything before any network call: an unknown flag or a
-    # non-number never reaches the mutation. After the global `zh --`
-    # a dash-leading first positional is taken as the release title.
-    local wanted="" have_release=false json_output=false
+    # non-number never reaches the mutation. Options are recognised until
+    # a subcommand-level `--`; after it every argument is the release
+    # reference and then issue numbers. After the global `zh --` options
+    # still parse, and only a dash-leading release slot is taken as data.
+    local wanted="" have_release=false json_output=false end_options=false
     local -a inputs=()
     local arg stripped seen already_seen
     while [[ $# -gt 0 ]]; do
         arg="$1"
         shift
-        if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+        if [[ "$end_options" != true ]]; then
             case "$arg" in
+                --) end_options=true; continue ;;
                 --json) json_output=true; continue ;;
                 -*)
-                    error "Unknown option for release ${verb}: ${arg} (a title starting with '-' needs 'zh -- release ${verb} ...')" ;;
+                    if [[ "$have_release" == true || "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+                        error "Unknown option for release ${verb}: ${arg} (a title starting with '-' needs 'zh -- release ${verb} ...')"
+                    fi
+                    ;;
             esac
         fi
         if [[ "$have_release" != "true" ]]; then
@@ -7378,8 +7736,15 @@ Examples:
         if ! [[ "$stripped" =~ ^[0-9]+$ ]]; then
             error "Invalid issue number: ${arg} (quote a multi-word release title)"
         fi
-        # Normalise leading zeros so "042" and "42" dedup together.
-        stripped=$((10#$stripped))
+        # Strip leading zeros as text so "042" and "42" dedup together.
+        # Arithmetic would wrap a 19+ digit number onto a real issue
+        # (18446744073709551658 becomes 42), and GraphQL's Int stops at
+        # 2147483647, so a larger number is refused before any call.
+        stripped="${stripped#"${stripped%%[!0]*}"}"
+        [[ -n "$stripped" ]] || stripped=0
+        if [[ ${#stripped} -gt 10 ]] || (( 10#$stripped > 2147483647 )); then
+            error "Issue number out of range: ${arg}"
+        fi
         already_seen=false
         for seen in ${inputs[@]+"${inputs[@]}"}; do
             if [[ "$seen" == "$stripped" ]]; then
@@ -7407,7 +7772,7 @@ Examples:
 
     [[ "$json_output" == "true" ]] || info "Resolving release '${wanted}'..."
     local resolved release_id release_title
-    resolved=$(zh_resolve_release "$workspace_id" "$wanted" "1")
+    resolved=$(zh_resolve_release "$workspace_id" "$wanted" mutate)
     release_id="${resolved%%	*}"
     release_title="${resolved#*	}"
 
@@ -7464,8 +7829,18 @@ Examples:
     # deleted / ACL-revoked in between), say so and exit 2 rather than
     # letting the walker's `error` read as "nothing happened".
     local post_state=""
-    post_state=$(zh_release_issues_fetch_all "$release_id") || post_state=""
+    post_state=$(zh_release_issues_fetch_all "$release_id" "$workspace_id") || post_state=""
     if [[ -z "$post_state" ]]; then
+        if [[ "$json_output" == "true" ]]; then
+            jq -n \
+                --arg action "$verb" \
+                --arg id "$release_id" \
+                --arg title "$release_title" \
+                --argjson requested "$(printf '%s\n' "${inputs[@]}" | jq -s .)" \
+                '{action: $action, release: {id: $id, title: $title}, requested: $requested,
+                  succeeded: [], failed: [], unverified: $requested,
+                  pagination_bailed: "post_state_unreadable"}'
+        fi
         echo "" >&2
         warn "The ${verb} was sent, but the release could not be re-read to confirm it."
         warn "Re-verify with 'zh release show \"${release_title}\"'."
@@ -7574,7 +7949,25 @@ Examples:
 cmd_release_add() { zh_release_membership "add" "$@"; }
 cmd_release_remove() { zh_release_membership "remove" "$@"; }
 
+# True when args hold a help flag outside any option value and before `--`.
+# Skipping the value slot keeps a literal "-h" title or description usable.
+zh_wants_help() {
+    local skip_value="$1"; shift
+    local a skip=false
+    for a in ${@+"$@"}; do
+        if [[ "$skip" == true ]]; then skip=false; continue; fi
+        [[ "$a" == -- ]] && return 1
+        [[ "$a" == -h || "$a" == --help ]] && return 0
+        [[ " $skip_value " == *" $a "* ]] && skip=true
+    done
+    return 1
+}
+
 cmd_release() {
+    if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]] && zh_wants_help "-t --title -d --description -s --start -e --end" ${@+"$@"}; then
+        cmd_help
+        return 0
+    fi
     if [[ $# -eq 0 ]]; then
         cmd_releases
         return
@@ -7592,6 +7985,13 @@ cmd_release() {
         add) cmd_release_add "$@" ;;
         remove|rm) cmd_release_remove "$@" ;;
         delete) cmd_release_delete "$@" ;;
+        --) cmd_release_show -- "$@" ;;
+        -*)
+            if [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
+                error "Unknown option for release: ${sub} (to list releases use 'zh releases ${sub}'; a title starting with '-' needs 'zh -- release ...')"
+            fi
+            cmd_release_show "$sub" "$@"
+            ;;
         *) cmd_release_show "$sub" "$@" ;;
     esac
 }
@@ -10104,6 +10504,16 @@ main() {
                 # used, because it also carries the operator's intent that what
                 # follows is positional — which is what makes a flag-shaped
                 # title reachable despite the guards added for #102.
+                case "${args[0]:-}" in
+                    pipeline|pipe|col) args+=("--") ;;
+                    release|rel)
+                        # `release` honors `--` itself: it ends that subcommand's
+                        # options without disabling its help scan before the `--`.
+                        shift
+                        args+=("--" "$@")
+                        break
+                        ;;
+                esac
                 ZH_END_OF_OPTS=true
                 shift
                 args+=("$@")
@@ -10141,7 +10551,7 @@ main() {
     #
     # Subcommands in _ZH_SELF_HELP print their own, more specific usage; they
     # are passed through untouched. Add a command here when you give it one.
-    local _zh_self_help=" count doctor reparent "
+    local _zh_self_help=" count doctor reparent pipeline pipe col release rel "
     if [[ "$_zh_self_help" != *" ${command} "* ]] && [[ "${ZH_END_OF_OPTS:-false}" != "true" ]]; then
         local _zh_arg
         for _zh_arg in ${@+"$@"}; do

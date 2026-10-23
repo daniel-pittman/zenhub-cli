@@ -152,6 +152,10 @@ ZH_REST_TOKEN=your_rest_token_here
 | `count [pipeline] [--all] [-q] [--json] [--no-verify]` | `n` | **Exact** issue counts (from the API's own totalCount — never a truncated page), cross-checked against GitHub |
 | `doctor [--json] [--no-verify]` | `check`, `health` | Hierarchy health check: open issues under a CLOSED parent, parent cycles. Cross-checks ZenHub's states against GitHub. Exits 0 healthy / 1 findings / 2 inconclusive |
 | `pipeline <name> [--all]` | `pipe`, `col` | List issues in a specific pipeline |
+| `pipeline create "Name" [--after "Pipeline"\|--before "Pipeline"\|--position N] [-d description] [--json\|-q]` | | Create a pipeline; append by default, positions start at 0 |
+| `pipeline move "Name" --after "Pipeline"\|--before "Pipeline"\|--position N` | | Reorder a pipeline |
+| `pipeline rename "Name" "New name" [-d description]` | | Rename a pipeline and optionally set or clear its description |
+| `pipeline delete "Name" [-y]` | | **DANGER, propose first:** permanently delete an empty pipeline after checking the exact issue count |
 | `pipelines [repo]` | `pipes`, `p` | List pipeline names for a workspace |
 | `move <issue> <pipeline>` | `mv`, `m` | Move an issue to a pipeline |
 | `reorder <issue> <position>` | `order`, `pos` | Reorder issue within its pipeline |
@@ -186,8 +190,8 @@ ZH_REST_TOKEN=your_rest_token_here
 | `release edit <title\|id> [-t] [-d] [--start] [--end]` | `release update` | Change a release's title, description or dates |
 | `release close <title\|id>` / `release reopen <title\|id>` | | Mark a release closed or open |
 | `release add <title\|id> <issue#> [...] [--json]` | | Add one or more issues to a release |
-| `release remove <title\|id> <issue#> [...] [--json]` | `rm` | Remove one or more issues from a release |
-| `release delete <title\|id>` | | Not in ZenHub's public API: explains and suggests `release close` |
+| `release remove <title\|id> <issue#> [...] [--json]` | `release rm` | Remove one or more issues from a release |
+| `release delete <title\|id>` | | Always refused: ZenHub's public API has no delete mutation. Explains and suggests `release close` |
 | `types` | | List assignable issue types (name, level, disposition, source) |
 | `labels` | | List available labels |
 | `users` | | List users who can be assigned to issues |
@@ -228,6 +232,34 @@ zh pipeline "In Progress"
 # Include closed issues
 zh pipeline "Done" --all
 ```
+
+### Manage Pipelines
+
+```bash
+zh pipeline create "Review"                         # Append at the end
+zh pipeline create "Ready" --after "Backlog" -d "Ready to start"
+zh pipeline create "Triage" --position 0 --json      # Zero-based index
+zh pipeline create "Queue" --before "Done" -q        # New id on stdout
+zh pipeline move "Review" --before "Done"
+zh pipeline move "Triage" --position 1
+zh pipeline rename "Ready" "Ready for work" -d ""    # Clear description
+
+# Propose deletion and get approval first. Only empty pipelines are allowed.
+zh pipeline delete "Unused"
+zh pipeline delete "Unused" -y                       # Skip interactive prompt
+
+# Escape a pipeline name that collides with a verb, or starts with a dash
+zh pipeline -- create
+zh pipeline create --position 0 -- "--experimental"
+```
+
+Names match case-insensitively, preferring an exact match over a partial match. Mutations refuse ambiguous matches and list the candidates. Creating or renaming to an existing name is refused. Quote multi-word names; extra positional arguments are errors. Place options before `--` when using a flag-shaped name.
+
+Create positions range from 0 through the current pipeline count, inclusive. Move positions are final indices from 0 through count minus 1. For `--after` and `--before`, the source is removed before calculating its new position; using itself as an anchor is refused. Every successful mutation re-reads and prints the resulting order with `*` marking the changed pipeline. Delete prints `* Removed: Name` before the remaining order. Create `--json` returns `{id, name, pipelines}`, where ordered pipeline rows carry `changed`; `-q` prints the new id on stdout and the order on stderr.
+
+**Pipeline deletion is permanent, so propose it first.** Deletion refuses any issues, including closed issues and ZenHub-only cards, using the API's exact `issues.totalCount` without fetching a truncated issue page. An unavailable count also refuses. ZenHub requires a destination even for an empty pipeline: `zh` uses the previous adjacent pipeline, or the next for the first pipeline, and reports its name. Deleting the only pipeline is refused. Interactive callers must retype the pipeline's full name; `-y` / `--yes` skips this, and non-interactive callers proceed without prompting, as with `zh delete`.
+
+The MCP tools are `pipeline_create`, `pipeline_move`, `pipeline_rename`, and `pipeline_delete`. Each accepts `repo_path` and an optional `workspace` name. `pipeline_delete` refuses without running the CLI unless the caller explicitly passes `confirm=True` after approval.
 
 ### Move & Prioritize Issues
 
@@ -757,7 +789,7 @@ The mutations report per-issue success / failure. An issue can fail to link for 
 
 ### Releases
 
-A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids.
+A ZenHub release is a dated group of issues (start date → end date) attached to one or more repositories. A workspace lists the releases of its repositories. Releases are matched by title (case-insensitive, ignoring surrounding spaces) or by their ZenHub id, which `zh release show` prints. When two releases share a title, `zh` refuses to guess and lists their ids. A multi-word title must be quoted, and a title starting with `-` needs `zh -- release ...`. Dates must be real calendar dates. If the release listing is incomplete, every command that changes a release (`edit`, `close`, `reopen`, `add`, `remove`) refuses a title with exit 2 and sends nothing; pass the id.
 
 ```bash
 # List open releases; --all includes closed ones, --closed shows only closed
@@ -786,7 +818,7 @@ zh release remove "Spring launch" 44
 zh release rm "Spring launch" 43 --json    # machine-readable result
 ```
 
-`release add` and `release remove` resolve the release and every issue number before changing anything, and list all the numbers they couldn't find at once. After the change they re-read the release and report each issue. They exit 0 when every issue is confirmed, 1 when any issue ended up in the wrong state (or none was confirmed), and 2 when the re-read was cut short and some issues couldn't be checked. `--json` uses the same exit codes. A release title is refused if the release listing was cut short, because a second release with the same title could be on a page that wasn't read. Pass the release id instead. A release title that starts with `-` needs the global `--`: `zh -- release add "-beta" 42`.
+`release add` and `release remove` resolve the release and every issue number before changing anything, and list all the numbers they couldn't find at once. After the change they re-read the release and report each issue. They exit 0 when every issue is confirmed, 1 when any issue ended up in the wrong state (or none was confirmed), and 2 when the re-read was cut short and some issues couldn't be checked. `--json` uses the same exit codes. A release title is refused (exit 2, nothing sent) if the release listing was cut short, because a second release with the same title could be on a page that wasn't read. Pass the release id instead. Options go before a `--`; everything after it is the release and then issue numbers, so a title that starts with `-` works either as `zh release add --json -- "-beta" 42` or after the global `--` as `zh -- release add "-beta" 42 --json`. Issue numbers above 2147483647 are refused before anything is sent. If the re-read fails outright, `--json` still prints a document, with every issue under `unverified` and `pagination_bailed` set to `post_state_unreadable`.
 
 ZenHub's public API has no mutation for deleting a release, so `zh release delete` exits with an explanation and suggests `zh release close`. Delete a release in the ZenHub web app if it must be removed completely.
 
@@ -944,11 +976,15 @@ Roughly 35 tools covering the same surface as `zh`:
 | Counting & health | `count` (exact totals, never a truncated page), `doctor` (hierarchy health; read `conclusive` before trusting `healthy`) |
 | Reparenting | `move_children` (move sub-issues to a new parent, detaching from the current one) |
 | Issue lifecycle | `create_issue`, `close_issue`, `reopen_issue`, `move_issue`, `reorder_issue`, `comment`, `assign`, `unassign`, `set_estimate`, `set_priority` |
+| Pipeline management | `pipeline_create`, `pipeline_move`, `pipeline_rename`, `pipeline_delete` (propose first, then explicit `confirm=True`) |
 | Dependencies | `block_issue` |
 | Epic management | `epic_create`, `epic_update`, `epic_add_children`, `epic_remove_children`, `epic_close`, `epic_reopen` |
 | Sub-issue management | `subissue_add_children`, `subissue_remove_children`, `subissue_reorder` |
 | Sprint membership | `sprint_add_issues`, `sprint_remove_issues` |
+| Releases | `release_list`, `release_show` (read); `release_create`, `release_edit`, `release_close`, `release_reopen`, `release_add`, `release_remove` (write). `release_add` / `release_remove` return `confirmed`, `failed` and `unverified` issue lists; a cut-short re-read is `ok` with `incomplete: true`. No `release_delete`: the API cannot delete one |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
+
+Release tools address a release by title (case-insensitive) or id. A listing that bailed mid-pagination comes back with `incomplete=true`; the mutating tools then refuse a title and need the release id.
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.
 
