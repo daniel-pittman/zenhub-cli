@@ -55,6 +55,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh issue <N>` — also shows `Parent: #<N>` and `Sub-issues: <count>` when present, giving cheap 3-tier hierarchy visibility
 - `zh sprints [--all]` — list sprints in the workspace (● marks the active sprint). `--all` includes closed sprints.
 - `zh sprint <name>` — show sprint detail + issues. Special names: `current` / `active` for the active sprint. Bare `zh sprint` also defaults to current. Use `--no-urls` for compact output.
+- `zh releases [--all|--closed] [--json]` — list releases (open by default). `zh release <title|id> [--no-urls] [--json]` shows a release's dates, state and issues. Titles match case-insensitively; a shared title is refused with the ids listed.
 
 ### Write operations (issue lifecycle)
 - `zh create "<title>" -t <type> -p "<pipeline>" -f <body_file>`: create issue. `-t` accepts any assignable type (discover with `zh types`), including the planning-panel types Epic/Initiative/Project and Sub-task; an unknown type is a hard error that lists the available ones. Optional `--parent <issue#>` wires the new issue as a sub-issue of `<issue#>`; a CLOSED `<issue#>` is REFUSED before the issue is created (nothing is left behind), overridable with `--allow-closed-parent`. Optional `--priority <name>` sets a configured priority at create time (same name-resolution path as `zh priority`; discover names with `zh priorities`). Optional `--json` emits a clean JSON object on stdout (number, url, title, type, pipeline, estimate, parent, priority, priority_requested) with human chatter on stderr, for reliable batch parsing; `-q`/`--quiet` emits only the new number. `priority_requested` carries the requested priority name even when `priority` is null (post-create mutation did not confirm; safe to retry via `zh priority`); compare the two fields to detect a partial apply.
@@ -70,6 +71,16 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh assign <issue#> <user> [user...]` — assign one or more users
 - `zh unassign <issue#> <user> [user...]` — remove ONLY the named assignee(s); `zh unassign <issue#> --all` to clear everyone (a bare unassign with no user errors rather than removing all, so a missing target can't silently un-assign teammates)
 - `zh priority <issue#> <name|clear>`: set priority by name. Priorities are workspace-defined, NOT a fixed high/medium/low set: the name is matched case-insensitively against the configured priorities (discover with `zh priorities`). An unconfigured name errors and lists the available ones rather than silently mis-setting. `clear` removes the priority.
+
+### Write operations (pipelines)
+
+- `zh pipeline create "Name" [--after "Pipeline" | --before "Pipeline" | --position N] [-d description] [--json|-q]`: create, appending by default. Duplicate names are refused case-insensitively.
+- `zh pipeline move "Name" --after "Pipeline" | --before "Pipeline" | --position N`: change board order. Positions start at 0 and refer to the final index; anchors resolve with the source removed.
+- `zh pipeline rename "Name" "New name" [-d description]`: rename, optionally setting or clearing the description.
+- `zh pipeline delete "Name" [-y]`: **DANGER, propose first ALWAYS.** Only empty pipelines may be deleted, proven by the exact unfiltered `issues.totalCount`, including closed issues and ZenHub-only cards. Missing counts refuse. The API needs a destination, so the CLI passes the previous adjacent pipeline, or the next for the first, and states that no issues move. The only pipeline cannot be deleted. Interactive callers retype the full name; `-y` skips and non-interactive callers proceed without prompting, like `zh delete`.
+- Names prefer an exact case-insensitive match over a partial match. Mutations refuse ambiguity and list candidates. Extra positional arguments refuse; quote multi-word names. Use `zh pipeline -- create` to view verb-named pipelines and `zh pipeline create -- "--name"` for a flag-shaped name, placing options before `--`.
+- All writes re-read and print the resulting order, marking the changed pipeline. Create `--json` returns `{id, name, pipelines}` with ordered rows carrying `changed`; `-q` prints the id with order on stderr. Delete marks the removed name separately.
+- MCP mirrors: `pipeline_create`, `pipeline_move`, `pipeline_rename`, `pipeline_delete`, each accepting `repo_path` and `workspace`. **Never call `pipeline_delete(confirm=True)` until the deletion proposal is approved.** Without explicit confirmation the tool refuses without invoking the CLI.
 
 ### Write operations (relationships)
 - `zh block <blocked#> <blocking#>` — set dependency (blocked is blocked BY blocking)
@@ -99,6 +110,14 @@ Sub-issues are the tier below Issue (Epic → Issue → Sub-issue). A sub-issue 
 
 The sprint mutations report per-issue success / failure. The ZenHub API doesn't distinguish reasons (already-in-sprint, archived, ineligible) so `zh` surfaces counts and affected numbers; if anything fails, investigate via `zh sprint <name>` and the issue's history.
 
+### Write operations (releases)
+- `zh release create "<title>" --start YYYY-MM-DD --end YYYY-MM-DD [-d <description>] [--json|-q]` — create a release attached to the current repo.
+- `zh release edit <title|id> [-t <title>] [-d <description>] [--start YYYY-MM-DD] [--end YYYY-MM-DD]` — sends only the fields given; the resulting date range is checked first.
+- `zh release close <title|id>` / `zh release reopen <title|id>` — set the release state.
+- `zh release add <title|id> <issue#> [...] [--json]` / `zh release remove <title|id> <issue#> [...] [--json]` (alias `rm`): change release membership in one API call. Every issue is resolved first (nothing is sent if any is missing), then the release is re-read to confirm each one. Exit 0 all confirmed, 1 real failure, 2 re-read incomplete (re-verify with `zh release show`). A title is refused when the release listing was cut short (exit 2, nothing sent, as for edit/close/reopen); pass the release id then. Options go before a `--` and the release and issue numbers after it, so `zh release add --json -- "-beta" 42` handles a dash-leading title.
+- `zh release delete` is refused: ZenHub's public API has no delete mutation. Propose `close`, or deletion in the ZenHub web app.
+- MCP equivalents: `release_list`, `release_show`, `release_create`, `release_edit`, `release_close`, `release_reopen`, `release_add`, `release_remove` (there is no `release_delete`). A listing flagged `incomplete` means a title can't be trusted for edit/close/reopen/add/remove; pass the release id. `release_add` / `release_remove` return `confirmed`, `failed` and `unverified` lists: `ok` with `incomplete: true` means the change was sent but the re-read was cut short, so check with `release_show` before retrying; `ok: false` with empty lists and a stderr refusal means nothing was sent. Releases can't be deleted, so confirm title and dates before `release_create`.
+
 ### Repository / workspace targeting (global flags)
 - `-r owner/repo` (alias `--repo`) before any subcommand: target a specific GitHub repo instead of the one `git remote get-url origin` resolves.
 - `-w "Workspace Name"` (alias `--workspace`): target a specific workspace by name. Case-insensitive match.
@@ -118,6 +137,7 @@ Use `-w` when a repo is connected to multiple workspaces — the historical defa
 - `zh epic list` → `zh epic ls`; `show` → `view`; `create` → `new`; `remove` → `rm`; `reopen` → `open`; `update` → `edit`, `modify`
 - `zh subissue` → `subissues`, `sub`, `child`, `children`; `zh subissue list` → `ls`; `remove` → `rm`; `reorder` → `order`, `pos`
 - `zh sprints` → `sp`; `zh sprint add` → top-level `sa`; `zh sprint remove` → top-level `sr` (and `rm` as inner alias)
+- `zh releases` → `rels`; `zh release` → `rel`; `zh release remove` → `rm`
 
 ### MCP-only tools (no `zh` CLI equivalent — Python-side smarts)
 

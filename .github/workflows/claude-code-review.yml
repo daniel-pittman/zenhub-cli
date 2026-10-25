@@ -132,7 +132,13 @@ jobs:
   # full-length commit SHA", and gh is preinstalled on the runner, so polling and
   # commenting need no action at all.
   await-tests:
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    # Gate on who AUTHORED the pull request, not github.actor, which is whoever
+    # triggered THIS run. The two diverge the moment anyone re-runs a dependabot
+    # PR's checks or updates its branch, and branch protection makes updating
+    # mandatory before merge. Keying on the actor flipped these jobs from skipped
+    # to running against a PR the review never comments on, so verdict-extract
+    # found nothing and a required check failed, leaving dependabot PRs unmergeable.
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -182,6 +188,18 @@ jobs:
             fi
             printf '\n_Posted before the Claude review so the test outcome is folded into the review._\n'
           } > ci-tests-comment.md
+
+      - name: Post the CI result as a sticky PR comment
+        # A pull request from a fork gets a read-only GITHUB_TOKEN, so the
+        # comment write fails there. It is advisory, so it must not fail the
+        # job; the test wait above stays fatal-on-error.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          MARKER: '### CI Tests'
+        run: |
           # Sticky: replace any prior CI Tests comment so the thread keeps one.
           gh api "repos/$REPO/issues/$PR/comments" \
             --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" \
@@ -195,8 +213,9 @@ jobs:
   claude-review:
     # Dependabot PRs get a read-only token and no Actions secrets, so the
     # OAuth-bound review action errors on them. Skip the review there; the
-    # semgrep job above still runs and posts its findings.
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    # semgrep job above still runs and posts its findings. Fork PRs get no
+    # secrets either, so the review is skipped there too; review-gate reports it.
+    if: ${{ github.event.pull_request.user.login != 'dependabot[bot]' && !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     # Both gates post their sticky comments before the review runs:
     #   semgrep -> "Semgrep (OSS)"; await-tests -> "CI Tests".
     needs: [semgrep, await-tests]
@@ -218,11 +237,11 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/head', github.event.inputs.pr_number) || github.ref }}
           fetch-depth: 1
 
-      # SHA-pinned anthropics/claude-code-action v1.0.193. Bump by re-resolving
+      # SHA-pinned anthropics/claude-code-action v1.0.254. Bump by re-resolving
       # the v1 tag's target commit:
       #   gh api repos/anthropics/claude-code-action/git/refs/tags/v1
       - name: Run Claude code review
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
+        uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1.0.254
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
@@ -276,7 +295,7 @@ jobs:
   verdict-extract:
     needs: [claude-review]
     # Only run when the review actually produced something to extract from.
-    if: ${{ needs.claude-review.result == 'success' && github.actor != 'dependabot[bot]' }}
+    if: ${{ needs.claude-review.result == 'success' && github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     # The verdict travels to the gate as a JOB OUTPUT built from the action's
     # STRUCTURED OUTPUT (claude-code-action's `--json-schema` feature, v1.0.152+):
@@ -350,13 +369,13 @@ jobs:
           fi
 
 
-      # SHA-pinned anthropics/claude-code-action v1.0.193. Cheap model (Haiku) —
+      # SHA-pinned anthropics/claude-code-action v1.0.254. Cheap model (Haiku) —
       # this is a one-shot classification, not a review. The verdict comes back as
       # schema-validated STRUCTURED OUTPUT (the `--json-schema` claude_arg), exposed
       # as steps.extract.outputs.structured_output — no comment, no log-file parse.
       - name: Extract the merge verdict
         id: extract
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
+        uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1.0.254
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # track_progress off: this is a data task, not a PR conversation; we read
@@ -423,7 +442,7 @@ jobs:
     # always(): the gate must still run (and report INCONCLUSIVE) when the review
     # or extractor errored — `needs` would otherwise SKIP it, and a skipped
     # required check could be misread as non-blocking. Skip only for dependabot.
-    if: ${{ always() && github.actor != 'dependabot[bot]' }}
+    if: ${{ always() && github.event.pull_request.user.login != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -437,6 +456,7 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           REVIEW_RESULT: ${{ needs.claude-review.result }}
           EXTRACT_RESULT: ${{ needs.verdict-extract.result }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           VERDICT_LINE: ${{ needs.verdict-extract.outputs.verdict_line }}
           REVIEW_BOT: 'claude[bot]'
           ACK_LABEL: review-ack
@@ -451,8 +471,14 @@ jobs:
           fi
           verdict=""; count="0"; reason=""; gate="BLOCK"
 
-          # 1) INCONCLUSIVE if the review or the extractor didn't complete.
-          if [ "$REVIEW_RESULT" != "success" ]; then
+          # 1) A fork PR never gets the cloud review (no secrets, read-only token),
+          # so its absence is expected, not a flake. Say so, and keep the gate red
+          # until a maintainer reviews locally and applies review-ack.
+          if [ "$IS_FORK" = "true" ] && [ "$REVIEW_RESULT" = "skipped" ]; then
+            verdict="FORK"
+            reason="Fork PR: the cloud review does not run on forks; a maintainer reviews locally and applies \`${ACK_LABEL}\`."
+          # INCONCLUSIVE if the review or the extractor didn't complete.
+          elif [ "$REVIEW_RESULT" != "success" ]; then
             verdict="INCONCLUSIVE"
             reason="The Claude review did not complete (job result: \`${REVIEW_RESULT}\`). Usually a transient API throttle, not a code finding."
           elif [ "$EXTRACT_RESULT" != "success" ]; then
@@ -510,6 +536,7 @@ jobs:
               PASS:PASS)        printf '✅ **Gate: PASS** — %s\n' "$reason" ;;
               PASS:*)           printf '✅ **Gate: PASS (override)** — %s\n' "$reason" ;;
               BLOCK:BLOCK)      printf '🛑 **Gate: BLOCK** — the review reported %s HIGH/CRITICAL finding(s). Address them and push (the review re-runs on each push), or a maintainer can apply the `%s` label to override.\n' "$count" "$ACK_LABEL" ;;
+              *:FORK)           printf '🛑 **Gate: BLOCK (fork PR)** : %s\n' "$reason" ;;
               *:INCONCLUSIVE)   printf '⚠️ **Gate: INCONCLUSIVE** — %s Push a new commit to re-run the checks (they re-run on every push), or a maintainer can apply the `%s` label.\n' "$reason" "$ACK_LABEL" ;;
               *)                printf '🛑 **Gate: BLOCK** — %s\n' "$reason" ;;
             esac
