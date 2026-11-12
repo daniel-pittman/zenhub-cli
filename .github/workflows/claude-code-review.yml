@@ -96,7 +96,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
           REPO: ${{ github.repository }}
           MARKER: '### Semgrep (OSS)'
         run: |
@@ -311,7 +311,7 @@ jobs:
           plugin_marketplaces: ${{ runner.temp }}/pinned-plugins
           plugins: 'code-review@pinned-plugins'
           include_fix_links: true
-          track_progress: true
+          track_progress: ${{ github.event_name != 'workflow_dispatch' }}
           allowed_bots: 'claude[bot]'
           # The action asks for an App token with contents, pull_requests and
           # issues all `write` unless a key is overridden here; the review
