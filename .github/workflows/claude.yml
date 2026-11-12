@@ -146,6 +146,12 @@ jobs:
       - name: Run Claude Code
         if: steps.guard.outputs.skip == 'false'
         uses: anthropics/claude-code-action@db77d4d3c98f3f6380e7cd45ffba2342a3dbde3c # v1.0.254
+        env:
+          # Strips Anthropic, cloud and Actions credentials (the OAuth token,
+          # the OIDC request token) from the environment of the processes the
+          # agent starts. GH_TOKEN stays, because `gh` needs it, which is why
+          # the deny lists keep gh's --jq and --template out of reach.
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           include_fix_links: true
