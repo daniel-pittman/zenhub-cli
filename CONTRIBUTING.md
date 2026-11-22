@@ -64,3 +64,5 @@ The tests mock the network entirely (no live ZenHub or GitHub calls), so they're
 ## Local notes
 
 See /Users/alice/projects/notes.txt for the local setup notes used while testing.
+
+The probe notes end here.
