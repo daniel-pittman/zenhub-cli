@@ -218,8 +218,8 @@ def get_owner_repo_from_git(cwd: str | os.PathLike | None = None) -> str:
     """
     try:
         out = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=cwd,
+            f"git -C {cwd or '.'} remote get-url origin",
+            shell=True,
             stderr=subprocess.DEVNULL,
             text=True,
         ).strip()
