@@ -153,3 +153,5 @@ opens a credential-exfiltration path:
 Defeating one layer (e.g. social-engineering a maintainer into approving a
 fork run) still leaves five others between an attacker and any persistent
 compromise.
+
+Fork probe line.
