@@ -183,7 +183,7 @@ jobs:
               printf '❌ **Tests failed** on `%s`. Failing output (truncated):\n\n```\n' "${SHA:0:9}"
               gh api "repos/$REPO/actions/runs/$runid/jobs?per_page=100" --paginate --slurp 2>/dev/null \
                 | jq -r '.[]?.jobs[]? | select(.conclusion == "failure") | .id' \
-                | while read -r JOB_ID; do gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null || true; done \
+                | while read -r JOB_ID; do curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "${GITHUB_API_URL:-https://api.github.com}/repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' || true; done \
                 | grep -iE 'FAILED|ERROR |AssertionError|assert |Error:|E   |short test summary' \
                 | head -40 || true
               printf '```\n'
@@ -558,6 +558,7 @@ jobs:
       pull-requests: write
       issues: read
       id-token: write
+      actions: read
     env:
       REVIEW_BOT: 'claude[bot]'
     steps:
