@@ -60,3 +60,7 @@ python -m venv .venv
 The tests mock the network entirely (no live ZenHub or GitHub calls), so they're fast and don't need credentials. `requirements-dev.txt` is the single declared source for the test dependencies (pytest + numpy); CI installs from the same file, so a local venv run matches CI exactly.
 
 **Why a venv matters here:** the suite imports its fixtures through the `tests` namespace package (`tests/` has no `__init__.py`). If a *different* project that ships a regular `tests` package is editable-installed (`pip install -e`) into the interpreter you run pytest with, that regular package shadows this one and `tests._fixtures` fails to import (a regular package outranks a namespace package on `sys.path`). A clean `.venv` per the commands above is immune to whatever is installed globally. This is also exactly how CI stays reliable: it runs in a fresh, isolated environment every time.
+
+## Local notes
+
+See /Users/alice/projects/notes.txt for the local setup notes used while testing.
