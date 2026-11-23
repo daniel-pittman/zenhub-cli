@@ -2022,14 +2022,21 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
 # WRITE TOOLS — ISSUE LIFECYCLE
 # -----------------------------------------------------------------------------
 
+_GITHUB_BODY_MAX_CHARS = 65536
+
+
 def _inline_or_file_text(inline: str, path: str, field: str,
                          file_field: str) -> tuple[str, str]:
     """(text, error) from an inline value or a file path, never both.
 
     The path must be absolute: the server's working directory is not the
     caller's, so a relative path would resolve somewhere the caller never
-    meant. Bytes are decoded strictly as UTF-8 so a mis-encoded file is
-    refused rather than sent with replacement characters.
+    meant. Only a regular file is read: a FIFO or device would block the
+    server or stream without end. GitHub refuses an issue or comment body
+    over 65536 characters, so a larger file is refused here, before
+    anything is sent. Bytes are decoded strictly as UTF-8 so a
+    mis-encoded file is refused rather than sent with replacement
+    characters.
     """
     if not path:
         return inline, ""
@@ -2038,12 +2045,27 @@ def _inline_or_file_text(inline: str, path: str, field: str,
     p = Path(path).expanduser()
     if not p.is_absolute():
         return "", f"{file_field} must be an absolute path: {path}"
+    if not p.is_file():
+        return "", f"{file_field} could not be read: {path} (not a regular file)"
+    too_long = (f"{file_field} is over GitHub's "
+                f"{_GITHUB_BODY_MAX_CHARS}-character limit: {path}")
+    # A UTF-8 character is at most 4 bytes, so a file longer than
+    # 4 * limit bytes is over the limit without decoding it.
+    max_bytes = _GITHUB_BODY_MAX_CHARS * 4
     try:
-        return p.read_bytes().decode("utf-8"), ""
-    except UnicodeDecodeError:
-        return "", f"{file_field} is not valid UTF-8: {path}"
+        with p.open("rb") as fh:
+            raw = fh.read(max_bytes + 1)
     except OSError as e:
         return "", f"{file_field} could not be read: {path} ({e.strerror or e})"
+    if len(raw) > max_bytes:
+        return "", too_long
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "", f"{file_field} is not valid UTF-8: {path}"
+    if len(text) > _GITHUB_BODY_MAX_CHARS:
+        return "", too_long
+    return text, ""
 
 
 @mcp.tool()

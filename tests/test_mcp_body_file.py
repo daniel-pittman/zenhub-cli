@@ -190,3 +190,41 @@ def test_comment_refuses_missing_and_empty_file(monkeypatch, tmp_path) -> None:
     out = mcp_server.comment(42, message_file=str(empty))
     assert out["ok"] is False and out["stderr"] == "message must be non-empty"
     assert seen == []
+
+
+# ---- non-regular files and GitHub's size limit --------------------------------
+
+def test_fifo_is_refused_without_blocking(monkeypatch, tmp_path) -> None:
+    import os
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    seen = _capture(monkeypatch)
+    out = mcp_server.create_issue("Title", body_file=str(fifo),
+                                  skip_duplicate_check=True)
+    assert out["ok"] is False
+    assert "not a regular file" in out["stderr"]
+    assert seen == []
+
+
+def test_body_at_the_limit_is_sent(monkeypatch, tmp_path) -> None:
+    limit = mcp_server._GITHUB_BODY_MAX_CHARS
+    f = tmp_path / "max.md"
+    f.write_text("é" * limit, encoding="utf-8")
+    seen = _capture(monkeypatch)
+    out = mcp_server.create_issue("Title", body_file=str(f),
+                                  skip_duplicate_check=True)
+    assert out["ok"] is True
+    assert len(_arg_after(seen[0], "-b")) == limit
+
+
+def test_body_over_the_limit_is_refused(monkeypatch, tmp_path) -> None:
+    limit = mcp_server._GITHUB_BODY_MAX_CHARS
+    seen = _capture(monkeypatch)
+    for name, text in (("chars.md", "a" * (limit + 1)),
+                       ("bytes.md", "✓" * (limit * 2))):
+        f = tmp_path / name
+        f.write_text(text, encoding="utf-8")
+        out = mcp_server.comment(42, message_file=str(f))
+        assert out["ok"] is False, name
+        assert "character limit" in out["stderr"], (name, out["stderr"])
+    assert seen == []
