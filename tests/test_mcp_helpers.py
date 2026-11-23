@@ -1035,7 +1035,7 @@ def test_planning_create_forwards_new_kwargs(monkeypatch):
     """
     captured = {}
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         captured["args"] = list(args)
         return {
             "ok": True,
@@ -1069,7 +1069,7 @@ def test_planning_create_omits_unset_kwargs(monkeypatch):
     """
     captured = {}
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         captured["args"] = list(args)
         return {
             "ok": True,
@@ -1093,7 +1093,7 @@ def test_planning_create_forwards_pipeline_and_parent_in_response(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": (
                 '{"number": 42, "url": "u", "title": "T", "type": "Epic",'
@@ -1118,7 +1118,7 @@ def test_epic_list_returns_both_items_and_epics(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": (
                 "  #42  OPEN    Auth redesign\n"
@@ -1141,7 +1141,7 @@ def test_planning_list_returns_items_only(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": "  #1  OPEN  An initiative\n",
             "stderr": "",
@@ -1186,7 +1186,7 @@ def test_planning_create_blocks_on_duplicate(monkeypatch):
 
     called = {"ran": False}
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         called["ran"] = True
         return {"ok": True, "stdout_plain": '{"number": 99}', "stderr": ""}
 
@@ -1234,7 +1234,7 @@ def test_planning_create_confirm_create_overrides_block(monkeypatch):
         },
     )
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         return {
             "ok": True,
             "stdout_plain": (
@@ -1278,7 +1278,7 @@ def test_planning_create_skip_duplicate_check_bypasses_preflight(monkeypatch):
         mcp_server, "_similarity_repo", fake_similarity_repo,
     )
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         return {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
@@ -1324,7 +1324,7 @@ def test_planning_create_warn_recommendation_does_not_block(monkeypatch):
 
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
             "stderr": "",
@@ -1351,7 +1351,7 @@ def test_planning_create_similarity_failure_does_not_block(monkeypatch):
     )
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
             "stderr": "",
@@ -1420,7 +1420,7 @@ def test_create_issue_forwards_parent_and_related_issues(monkeypatch):
     captured = _capture_check_duplicate(monkeypatch, result=_STRUCTURAL_WARN)
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
             "stderr": "",
@@ -1459,7 +1459,7 @@ def test_create_issue_parent_zero_forwards_none(monkeypatch):
     )
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T"}',
             "stderr": "",
@@ -1494,7 +1494,7 @@ def test_planning_create_forwards_related_issues(monkeypatch, noun_create):
     captured = _capture_check_duplicate(monkeypatch, result=_STRUCTURAL_WARN)
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             # parent=4 matches the requested parent, so this models a CLEAN
             # success (partial_applied stays False). Omitting parent here
@@ -1539,7 +1539,7 @@ def test_planning_create_parent_wire_failure_sets_partial_applied(
     success."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             # number present, but parent came back null despite --parent 4
             "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": null}',
@@ -1582,7 +1582,7 @@ def test_planning_create_parent_mismatch_is_partial(monkeypatch, noun_create):
     boolean, not a reachable production path."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": 7}',
             "stderr": "",
@@ -1604,7 +1604,7 @@ def test_planning_create_parse_failure_is_not_partial(monkeypatch, noun_create):
     a partial-success, so the bulk-load guard shouldn't read it as one)."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": "not json at all",
             "stderr": "",
@@ -1625,7 +1625,7 @@ def test_planning_create_parent_wired_ok_is_not_partial(monkeypatch, noun_create
     False (no false positive on the happy path)."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": 4}',
             "stderr": "",
@@ -1647,7 +1647,7 @@ def test_planning_create_no_parent_requested_is_not_partial(
     wire failure."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": '{"number": 99, "url": "u", "title": "T", "parent": null}',
             "stderr": "",
@@ -1699,7 +1699,7 @@ def test_planning_create_priority_applied_success(monkeypatch, noun_create):
     partial_applied stays False (priority is not a wire signal)."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": ('{"number": 99, "url": "u", "title": "T", '
                              '"priority": "High", "priority_requested": "High"}'),
@@ -1725,7 +1725,7 @@ def test_planning_create_priority_divergence_not_partial(monkeypatch, noun_creat
     where partial_applied is the parent-wire signal only)."""
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "stdout_plain": ('{"number": 99, "url": "u", "title": "T", '
                              '"priority": null, "priority_requested": "High"}'),
@@ -1778,7 +1778,7 @@ def test_set_issue_type_exposes_partial_applied_on_exit_2(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": False,
             "exit_code": 2,
             "stdout_plain": "",
@@ -1798,7 +1798,7 @@ def test_set_issue_type_clean_success_partial_false(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "exit_code": 0,
             "stdout_plain": "OK: Set type of #42 to Epic",
@@ -1817,7 +1817,7 @@ def test_set_issue_type_real_failure_partial_false(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": False,
             "exit_code": 1,
             "stdout_plain": "",
@@ -1836,7 +1836,7 @@ def test_create_issue_threads_priority_to_args(monkeypatch):
     """
     captured = {}
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         captured["args"] = list(args)
         return {
             "ok": True,
@@ -1874,7 +1874,7 @@ def test_create_issue_shape_includes_priority_and_estimate(monkeypatch):
     """
     monkeypatch.setattr(
         mcp_server, "_run_zh",
-        lambda args, cwd=None: {
+        lambda args, cwd=None, stdin=None: {
             "ok": True,
             "exit_code": 0,
             "stdout_plain": (
@@ -1906,7 +1906,7 @@ def test_create_issue_priority_omitted_when_not_passed(monkeypatch):
     """
     captured = {}
 
-    def fake_run_zh(args, cwd=None):
+    def fake_run_zh(args, cwd=None, stdin=None):
         captured["args"] = list(args)
         return {
             "ok": True,

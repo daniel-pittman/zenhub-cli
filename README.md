@@ -984,6 +984,8 @@ Roughly 35 tools covering the same surface as `zh`:
 | Releases | `release_list`, `release_show` (read); `release_create`, `release_edit`, `release_close`, `release_reopen`, `release_add`, `release_remove` (write). `release_add` / `release_remove` return `confirmed`, `failed` and `unverified` issue lists; a cut-short re-read is `ok` with `incomplete: true`. No `release_delete`: the API cannot delete one |
 | Similarity search | `zh_similar`, `zh_reindex` (see below) |
 
+Long text can come from a file: `create_issue` takes `body_file` and `comment` takes `message_file`, each an absolute path to a UTF-8 file and mutually exclusive with the inline `body` / `message`. The file's text gets the same non-empty check, and the same duplicate check, as inline text.
+
 Release tools address a release by title (case-insensitive) or id. A listing that bailed mid-pagination comes back with `incomplete=true`; the mutating tools then refuse a title and need the release id.
 
 `epic_delete` is intentionally NOT exposed as an MCP tool — permanent deletion is irreversible and should be invoked via the CLI directly with deliberation.

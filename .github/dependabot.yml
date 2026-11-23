@@ -10,8 +10,13 @@
 #   read yet. The entry is kept for fleet consistency and activates the moment
 #   a manifest lands at the repo root.
 version: 2
+# Every ecosystem waits 7 days after a release before Dependabot proposes it
+# (cooldown): a compromised or mistaken release is usually caught within days.
+# Security updates are not delayed.
 updates:
   - package-ecosystem: "github-actions"
+    cooldown:
+      default-days: 7
     directory: "/"
     schedule:
       interval: "weekly"
@@ -21,6 +26,8 @@ updates:
           - "*"
 
   - package-ecosystem: "pip"
+    cooldown:
+      default-days: 7
     directory: "/"
     schedule:
       interval: "weekly"
