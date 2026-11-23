@@ -71,6 +71,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -1089,6 +1090,19 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
             "stdout_plain": _ANSI_RE.sub("", captured_stdout),
             "stderr_plain": _ANSI_RE.sub("", combined_stderr),
         }
+    except (OSError, ValueError) as e:
+        # zh never started: E2BIG from an argument over Linux's per-argument
+        # limit, a missing cwd, a NUL byte in an argument. Nothing was sent,
+        # so return the same failure shape a tool can report, not a raise.
+        msg = f"zh could not be started: {e}"
+        return {
+            "ok": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": msg,
+            "stdout_plain": "",
+            "stderr_plain": msg,
+        }
     return {
         "ok": result.returncode == 0,
         "exit_code": result.returncode,
@@ -2022,15 +2036,91 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
 # WRITE TOOLS — ISSUE LIFECYCLE
 # -----------------------------------------------------------------------------
 
+_GITHUB_BODY_MAX_CHARS = 65536
+
+
+def _inline_or_file_text(inline: str, path: str, field: str,
+                         file_field: str) -> tuple[str, str]:
+    """(text, error) from an inline value or a file path, never both.
+
+    The path must be absolute: the server's working directory is not the
+    caller's, so a relative path would resolve somewhere the caller never
+    meant. Only a regular file is read, checked on the opened descriptor
+    (opened non-blocking) so a path swapped for a FIFO after the check
+    cannot block the server. GitHub refuses an issue or comment body over
+    65536 characters, so a larger file is refused here, before anything
+    is sent. Bytes are decoded strictly as UTF-8 so a mis-encoded file is
+    refused rather than sent with replacement characters. A NUL byte is
+    refused in either source: bash drops it when zh reads stdin, so the
+    text sent would differ from the text given.
+    """
+    if not path:
+        if "\x00" in inline:
+            return "", f"{field} contains a NUL byte"
+        if len(inline) > _GITHUB_BODY_MAX_CHARS:
+            return "", (f"{field} is over GitHub's "
+                        f"{_GITHUB_BODY_MAX_CHARS}-character limit")
+        try:
+            # stdin is encoded with errors="replace", so a lone surrogate
+            # would silently post as "?"; refuse it instead.
+            inline.encode("utf-8")
+        except UnicodeEncodeError:
+            return "", f"{field} is not valid Unicode text"
+        return inline, ""
+    if inline:
+        return "", f"pass {field} or {file_field}, not both"
+    unreadable = f"{file_field} could not be read: {path}"
+    if not path.startswith(("/", "~")):
+        return "", f"{file_field} must be an absolute path: {path}"
+    try:
+        p = Path(path).expanduser()
+    except RuntimeError:
+        return "", f"{unreadable} (unknown home directory)"
+    if not p.is_absolute():
+        return "", f"{file_field} must be an absolute path: {path}"
+    too_long = (f"{file_field} is over GitHub's "
+                f"{_GITHUB_BODY_MAX_CHARS}-character limit: {path}")
+    # A UTF-8 character is at most 4 bytes, so a file longer than
+    # 4 * limit bytes is over the limit without decoding it.
+    max_bytes = _GITHUB_BODY_MAX_CHARS * 4
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+    except (OSError, ValueError) as e:
+        return "", f"{unreadable} ({getattr(e, 'strerror', None) or e})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "", f"{unreadable} (not a regular file)"
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read(max_bytes + 1)
+    except OSError as e:
+        return "", f"{unreadable} ({e.strerror or e})"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > max_bytes:
+        return "", too_long
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "", f"{file_field} is not valid UTF-8: {path}"
+    if len(text) > _GITHUB_BODY_MAX_CHARS:
+        return "", too_long
+    if "\x00" in text:
+        return "", f"{file_field} contains a NUL byte: {path}"
+    return text, ""
+
+
 @mcp.tool()
-def create_issue(title: str, body: str, type: str = "Task",
+def create_issue(title: str, body: str = "", type: str = "Task",
                  pipeline: str = "Product Backlog",
                  labels: str = "", parent: int = 0,
                  priority: str = "", repo_path: str = "",
                  confirm_create: bool = False,
                  skip_duplicate_check: bool = False,
                  related_issues: list[int] | None = None,
-                 allow_closed_parent: bool = False) -> dict:
+                 allow_closed_parent: bool = False,
+                 body_file: str = "") -> dict:
     """Create a new ZenHub issue.
 
     Runs a pre-flight similarity check against existing open issues
@@ -2049,7 +2139,14 @@ def create_issue(title: str, body: str, type: str = "Task",
 
     Args:
         title: Issue title (required, non-empty).
-        body: Issue body / description in Markdown (required, non-empty).
+        body: Issue body / description in Markdown. Required (non-empty)
+            unless `body_file` is given.
+        body_file: Absolute path of a UTF-8 file holding the body, for
+            bodies too long or backtick-heavy to pass inline. Mutually
+            exclusive with `body`; the file's text gets the same
+            non-empty check and duplicate check an inline body does. A
+            missing, unreadable or non-UTF-8 file is refused before
+            anything is sent.
         type: Issue type. Defaults to Task. Discover with list_types.
         pipeline: Target pipeline. Defaults to "Product Backlog".
         labels: Comma-separated label names (optional).
@@ -2148,6 +2245,11 @@ def create_issue(title: str, body: str, type: str = "Task",
         return {**_empty_create_shape,
                 "stderr": "title must be non-empty",
                 "duplicate_check": _validation_dup_placeholder}
+    body, file_err = _inline_or_file_text(body, body_file, "body", "body_file")
+    if file_err:
+        return {**_empty_create_shape,
+                "stderr": file_err,
+                "duplicate_check": _validation_dup_placeholder}
     if not body.strip():
         return {**_empty_create_shape,
                 "stderr": "body must be non-empty",
@@ -2220,7 +2322,10 @@ def create_issue(title: str, body: str, type: str = "Task",
     # v1.9.0: use --json so the new number is parsed from a clean JSON
     # object on stdout rather than scraped from a colorized success line
     # (the parse-miss that motivated G2).
-    args = ["create", title, "-t", type, "-p", pipeline, "-b", body, "--json"]
+    # The body travels on stdin, never as an argument: an argument that looks
+    # like a flag (a body of "--help") is parsed as one, and argv is visible
+    # to other local users and capped per argument on Linux.
+    args = ["create", title, "-t", type, "-p", pipeline, "--stdin", "--json"]
     if labels:
         args.extend(["-l", labels])
     if parent and parent > 0:
@@ -2229,7 +2334,7 @@ def create_issue(title: str, body: str, type: str = "Task",
             args.append("--allow-closed-parent")
     if priority:
         args.extend(["--priority", priority])
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path), stdin=body)
 
     # Round-6 finding #6: shape parity with _planning_create. The bash
     # --json emit carries priority / priority_requested / estimate;
@@ -2396,17 +2501,28 @@ def reorder_issue(number: int, position: str, repo_path: str = "") -> dict:
 
 
 @mcp.tool()
-def comment(number: int, message: str, repo_path: str = "") -> dict:
+def comment(number: int, message: str = "", repo_path: str = "",
+            message_file: str = "") -> dict:
     """Add a comment to an issue.
 
     Args:
         number: Issue number.
-        message: Comment text (Markdown supported).
+        message: Comment text (Markdown supported). Required (non-empty)
+            unless `message_file` is given.
         repo_path: Optional absolute path of a git checkout to run zh from.
+        message_file: Absolute path of a UTF-8 file holding the comment
+            text. Mutually exclusive with `message`; a missing,
+            unreadable, non-UTF-8 or empty file is refused before
+            anything is sent.
 
     Returns:
         dict with: ok, partial_applied, number, raw, stderr.
     """
+    message, file_err = _inline_or_file_text(
+        message, message_file, "message", "message_file")
+    if file_err:
+        return {"ok": False, "partial_applied": False,
+                "number": number, "raw": "", "stderr": file_err}
     if not message.strip():
         # v1.9.2 round-3 (PR #27) finding #1: validation early-return
         # must match the success-path key set (number, raw, stderr)
@@ -2421,8 +2537,9 @@ def comment(number: int, message: str, repo_path: str = "") -> dict:
         return {"ok": False, "partial_applied": False,
                 "number": number, "raw": "",
                 "stderr": "message must be non-empty"}
-    r = _run_zh(["comment", str(number), "-m", message],
-                cwd=_resolve_cwd(repo_path))
+    # On stdin for the same reasons as create_issue's body.
+    r = _run_zh(["comment", str(number), "--stdin"],
+                cwd=_resolve_cwd(repo_path), stdin=message)
     # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],

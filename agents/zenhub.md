@@ -335,7 +335,7 @@ DO NOT actually move tickets into a sprint without explicit go-ahead — sprint 
 
 For routine operations:
 
-- **Create**: `zh create "<title>" -t <type> -p <pipeline> -f <body_file>` from the shell, OR the `create_issue` MCP tool. Default type is `Task` unless the work is clearly a `Feature` (multi-AC, multi-week) or `Bug` (regression). Default pipeline is `Product Backlog` unless told otherwise.
+- **Create**: `zh create "<title>" -t <type> -p <pipeline> -f <body_file>` from the shell, OR the `create_issue` MCP tool (pass a long or backtick-heavy body as `body_file`, an absolute path, instead of inline `body`; `comment` takes `message_file` the same way). Default type is `Task` unless the work is clearly a `Feature` (multi-AC, multi-week) or `Bug` (regression). Default pipeline is `Product Backlog` unless told otherwise.
 
   **Always run the duplicate-check flow first** (see Hard Rule #5):
   1. `zh_similar(<candidate title + 1-sentence summary>)` — surface any existing tickets that already track this work
