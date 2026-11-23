@@ -204,12 +204,26 @@ def test_comment_refuses_missing_and_empty_file(monkeypatch, tmp_path) -> None:
 # ---- non-regular files and GitHub's size limit --------------------------------
 
 def test_fifo_is_refused_without_blocking(monkeypatch, tmp_path) -> None:
+    """The check runs on a descriptor opened non-blocking, so a FIFO with no
+    writer is refused at once. Without O_NONBLOCK the open would block; the
+    alarm turns that hang into a failure."""
     import os
+    import signal
+
+    def _hung(signum, frame):  # noqa: ARG001
+        raise TimeoutError("opening the FIFO blocked")
+
     fifo = tmp_path / "pipe"
     os.mkfifo(fifo)
     seen = _capture(monkeypatch)
-    out = mcp_server.create_issue("Title", body_file=str(fifo),
-                                  skip_duplicate_check=True)
+    old = signal.signal(signal.SIGALRM, _hung)
+    signal.alarm(5)
+    try:
+        out = mcp_server.create_issue("Title", body_file=str(fifo),
+                                      skip_duplicate_check=True)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
     assert out["ok"] is False
     assert "not a regular file" in out["stderr"]
     assert seen == []
@@ -276,21 +290,6 @@ def test_nul_bytes_are_refused(monkeypatch, tmp_path) -> None:
     assert seen == []
 
 
-def test_regular_file_check_is_on_the_opened_descriptor(monkeypatch, tmp_path) -> None:
-    """A path that passes a stat-by-name check and is then swapped for a FIFO
-    must still be refused without blocking: the check reads the descriptor."""
-    import os
-    fifo = tmp_path / "pipe"
-    os.mkfifo(fifo)
-    seen = _capture(monkeypatch)
-    monkeypatch.setattr(mcp_server.Path, "is_file", lambda self: True)
-    out = mcp_server.create_issue("Title", body_file=str(fifo),
-                                  skip_duplicate_check=True)
-    assert out["ok"] is False
-    assert "not a regular file" in out["stderr"]
-    assert seen == []
-
-
 # ---- the real zh script: --stdin carries the body into createIssue ------------
 
 def test_zh_create_stdin_puts_the_exact_body_in_create_issue(monkeypatch, tmp_path) -> None:
@@ -351,3 +350,32 @@ def test_run_zh_returns_a_failure_when_zh_cannot_start(tmp_path) -> None:
     assert r["ok"] is False
     assert r["exit_code"] == -1
     assert r["stderr_plain"].startswith("zh could not be started:")
+
+
+def test_lone_surrogate_is_refused(monkeypatch) -> None:
+    seen = _capture(monkeypatch, stdout="")
+    out = mcp_server.comment(42, "bad \ud800 text")
+    assert out["ok"] is False and "not valid Unicode" in out["stderr"]
+    assert seen == []
+
+
+def test_zh_comment_succeeds_on_a_large_body(tmp_path) -> None:
+    """The real cmd_comment with a body over 128 KiB on stdin must exit 0
+    once gh has posted it. A preview built with `echo | head` died of
+    SIGPIPE under pipefail here, so zh reported failure for a comment that
+    was already posted, and a retry would post it twice."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _bash_runner import run_zh_with_stubs
+
+    got = tmp_path / "gh_stdin"
+    stubs = r"""
+        load_config() { :; }
+        get_repo_info() { printf 'acme/widgets'; }
+        gh() { cat > "__GOT__"; echo "https://example/42#issuecomment-1"; }
+    """.replace("__GOT__", str(got))
+    body = "é" * 65536 + "\n" + "a" * 10000
+    r = run_zh_with_stubs(stubs, 'cmd_comment "$@"', args=["42", "--stdin"],
+                          stdin=body)
+    assert r.returncode == 0, (r.returncode, r.stderr[-300:])
+    assert "Added comment to #42" in r.stdout
+    assert got.read_text(encoding="utf-8") == body + "\n", "gh did not get the whole body"

@@ -2060,6 +2060,12 @@ def _inline_or_file_text(inline: str, path: str, field: str,
         if len(inline) > _GITHUB_BODY_MAX_CHARS:
             return "", (f"{field} is over GitHub's "
                         f"{_GITHUB_BODY_MAX_CHARS}-character limit")
+        try:
+            # stdin is encoded with errors="replace", so a lone surrogate
+            # would silently post as "?"; refuse it instead.
+            inline.encode("utf-8")
+        except UnicodeEncodeError:
+            return "", f"{field} is not valid Unicode text"
         return inline, ""
     if inline:
         return "", f"pass {field} or {file_field}, not both"

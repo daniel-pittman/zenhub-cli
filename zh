@@ -3165,12 +3165,14 @@ Examples:
     echo ""
     success "Added comment to #${issue_num}"
     # Show preview of comment (first 100 chars)
-    local preview
-    preview=$(echo "$body" | head -c 100)
+    # A parameter slice, not `echo | head`: under pipefail, head closing the
+    # pipe early kills echo with SIGPIPE on a large body, and zh would exit
+    # non-zero after the comment was already posted, inviting a duplicate.
+    local preview="${body:0:100}"
     if [[ ${#body} -gt 100 ]]; then
         preview="${preview}..."
     fi
-    echo -e "  Comment: ${preview}"
+    printf '  Comment: %s\n' "$preview"
 }
 
 cmd_attach() {
