@@ -1,9 +1,10 @@
 """MCP parity with `zh create --body-file` and `zh comment --file` (#140).
 
 `create_issue` takes `body_file` and `comment` takes `message_file`, each
-mutually exclusive with its inline field. The file's text must reach `zh`
-byte for byte (backticks, non-ASCII, trailing newlines), and every refusal
-must happen before `zh` is called, so a bad path never sends anything.
+mutually exclusive with its inline field. The text, inline or from a file,
+reaches `zh` on stdin exactly as given (backticks, non-ASCII, a leading
+`--help`) and never as an argument, and every refusal happens before `zh` is
+called, so a bad path never sends anything.
 """
 
 from __future__ import annotations
@@ -25,9 +26,11 @@ CREATED = ('{"number": 7, "url": "https://github.com/o/r/issues/7", '
 
 def _capture(monkeypatch, ok: bool = True, stdout: str = CREATED) -> list[list[str]]:
     seen: list[list[str]] = []
+    stdins.clear()
 
-    def fake_run_zh(args, **kwargs):  # noqa: ARG001
+    def fake_run_zh(args, **kwargs):
         seen.append(args)
+        stdins.append(kwargs.get("stdin"))
         return {"ok": ok, "exit_code": 0 if ok else 1,
                 "stdout_plain": stdout, "stderr_plain": ""}
 
@@ -35,8 +38,14 @@ def _capture(monkeypatch, ok: bool = True, stdout: str = CREATED) -> list[list[s
     return seen
 
 
-def _arg_after(args: list[str], flag: str) -> str:
-    return args[args.index(flag) + 1]
+stdins: list[str | None] = []
+
+
+def _assert_sent_on_stdin(args: list[str], text: str) -> None:
+    assert "--stdin" in args
+    assert "-b" not in args and "-m" not in args
+    assert text not in args, "the text must never travel as an argument"
+    assert stdins[-1] == text
 
 
 # ---- create_issue ---------------------------------------------------------
@@ -50,7 +59,7 @@ def test_create_issue_reads_body_file_verbatim(monkeypatch, tmp_path) -> None:
                                   skip_duplicate_check=True)
 
     assert out["ok"] is True and out["number"] == 7
-    assert _arg_after(seen[0], "-b") == BODY
+    _assert_sent_on_stdin(seen[0], BODY)
 
 
 def test_create_issue_inline_body_unchanged(monkeypatch) -> None:
@@ -58,7 +67,7 @@ def test_create_issue_inline_body_unchanged(monkeypatch) -> None:
     out = mcp_server.create_issue("Title", "inline body",
                                   skip_duplicate_check=True)
     assert out["ok"] is True
-    assert _arg_after(seen[0], "-b") == "inline body"
+    _assert_sent_on_stdin(seen[0], "inline body")
 
 
 def test_create_issue_refuses_body_and_body_file(monkeypatch, tmp_path) -> None:
@@ -166,7 +175,7 @@ def test_comment_reads_message_file_verbatim(monkeypatch, tmp_path) -> None:
 
     assert out["ok"] is True
     assert seen[0][:2] == ["comment", "42"]
-    assert _arg_after(seen[0], "-m") == BODY
+    _assert_sent_on_stdin(seen[0], BODY)
 
 
 def test_comment_refuses_message_and_file(monkeypatch, tmp_path) -> None:
@@ -214,7 +223,7 @@ def test_body_at_the_limit_is_sent(monkeypatch, tmp_path) -> None:
     out = mcp_server.create_issue("Title", body_file=str(f),
                                   skip_duplicate_check=True)
     assert out["ok"] is True
-    assert len(_arg_after(seen[0], "-b")) == limit
+    assert len(stdins[-1]) == limit
 
 
 def test_body_over_the_limit_is_refused(monkeypatch, tmp_path) -> None:
@@ -228,3 +237,98 @@ def test_body_over_the_limit_is_refused(monkeypatch, tmp_path) -> None:
         assert out["ok"] is False, name
         assert "character limit" in out["stderr"], (name, out["stderr"])
     assert seen == []
+
+
+# ---- review findings: flag-shaped text, odd paths, NUL bytes, swapped FIFO -----
+
+def test_flag_shaped_text_is_data(monkeypatch, tmp_path) -> None:
+    f = tmp_path / "help.md"
+    f.write_text("--help", encoding="utf-8")
+    seen = _capture(monkeypatch, stdout="")
+    out = mcp_server.comment(42, message_file=str(f))
+    assert out["ok"] is True
+    _assert_sent_on_stdin(seen[0], "--help")
+
+    seen = _capture(monkeypatch)
+    out = mcp_server.create_issue("Title", "--help", skip_duplicate_check=True)
+    assert out["ok"] is True
+    _assert_sent_on_stdin(seen[0], "--help")
+
+
+def test_unusable_paths_are_refused_not_raised(monkeypatch) -> None:
+    seen = _capture(monkeypatch, stdout="")
+    for path in ("/tmp/" + "x" * 300, "~no_such_user_zz/body.md"):
+        out = mcp_server.comment(42, message_file=path)
+        assert out["ok"] is False, path
+        assert "could not be read" in out["stderr"], (path, out["stderr"])
+    assert seen == []
+
+
+def test_nul_bytes_are_refused(monkeypatch, tmp_path) -> None:
+    f = tmp_path / "nul.md"
+    f.write_bytes(b"a\x00b")
+    seen = _capture(monkeypatch)
+    out = mcp_server.create_issue("Title", body_file=str(f),
+                                  skip_duplicate_check=True)
+    assert out["ok"] is False and "NUL byte" in out["stderr"]
+    out = mcp_server.comment(42, "a\x00b")
+    assert out["ok"] is False and "NUL byte" in out["stderr"]
+    assert seen == []
+
+
+def test_regular_file_check_is_on_the_opened_descriptor(monkeypatch, tmp_path) -> None:
+    """A path that passes a stat-by-name check and is then swapped for a FIFO
+    must still be refused without blocking: the check reads the descriptor."""
+    import os
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    seen = _capture(monkeypatch)
+    monkeypatch.setattr(mcp_server.Path, "is_file", lambda self: True)
+    out = mcp_server.create_issue("Title", body_file=str(fifo),
+                                  skip_duplicate_check=True)
+    assert out["ok"] is False
+    assert "not a regular file" in out["stderr"]
+    assert seen == []
+
+
+# ---- the real zh script: --stdin carries the body into createIssue ------------
+
+def test_zh_create_stdin_puts_the_exact_body_in_create_issue(monkeypatch, tmp_path) -> None:
+    """Run the argv create_issue builds through the real cmd_create, with the
+    text on stdin. The body that reaches the createIssue mutation must be the
+    text given (bash's $(cat) drops only trailing newlines), and a body of
+    "--help" must create an issue rather than print usage."""
+    import json
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _bash_runner import run_zh_with_stubs
+
+    vars_file = tmp_path / "vars.json"
+    stubs = r"""
+        load_config() { :; }
+        get_repo_info() { printf 'acme/widgets'; }
+        get_repo_id() { printf 'repo-gid'; }
+        get_workspace_id() { printf 'ws-gid'; }
+        zh_fetch_issue_types() { printf '[]'; }
+        zh_issue_type_id_from() { printf 'tid-task'; }
+        zh_issue_type_names_from() { printf 'Task'; }
+        zh_graphql() {
+            if [[ "$1" == *createIssue* ]]; then
+                printf '%s' "$2" > "__VARS__"
+                printf '%s' '{"data":{"createIssue":{"issue":{"id":"new-gid","number":4242,"htmlUrl":"https://example/4242","title":"T","repository":{"ownerName":"acme","name":"widgets"},"issueType":{"name":"Task"}}}}}'
+                return 0
+            fi
+            printf '%s' '{"data":{}}'
+        }
+    """.replace("__VARS__", str(vars_file))
+
+    for text in (BODY, "--help"):
+        seen = _capture(monkeypatch)
+        mcp_server.create_issue("Title", text, skip_duplicate_check=True)
+        args = seen[0][1:]  # drop the "create" subcommand; cmd_create is called directly
+        if vars_file.exists():
+            vars_file.unlink()
+        r = run_zh_with_stubs(stubs, 'cmd_create "$@"', args=args, stdin=stdins[-1])
+        assert vars_file.exists(), f"createIssue never ran for {text!r}: {r.stderr}"
+        sent = json.loads(vars_file.read_text(encoding="utf-8"))["input"]["body"]
+        assert sent == text.rstrip("\n"), (text, sent)

@@ -71,6 +71,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -2031,32 +2032,50 @@ def _inline_or_file_text(inline: str, path: str, field: str,
 
     The path must be absolute: the server's working directory is not the
     caller's, so a relative path would resolve somewhere the caller never
-    meant. Only a regular file is read: a FIFO or device would block the
-    server or stream without end. GitHub refuses an issue or comment body
-    over 65536 characters, so a larger file is refused here, before
-    anything is sent. Bytes are decoded strictly as UTF-8 so a
-    mis-encoded file is refused rather than sent with replacement
-    characters.
+    meant. Only a regular file is read, checked on the opened descriptor
+    (opened non-blocking) so a path swapped for a FIFO after the check
+    cannot block the server. GitHub refuses an issue or comment body over
+    65536 characters, so a larger file is refused here, before anything
+    is sent. Bytes are decoded strictly as UTF-8 so a mis-encoded file is
+    refused rather than sent with replacement characters. A NUL byte is
+    refused in either source: bash drops it when zh reads stdin, so the
+    text sent would differ from the text given.
     """
     if not path:
+        if "\x00" in inline:
+            return "", f"{field} contains a NUL byte"
         return inline, ""
     if inline:
         return "", f"pass {field} or {file_field}, not both"
-    p = Path(path).expanduser()
+    unreadable = f"{file_field} could not be read: {path}"
+    if not path.startswith(("/", "~")):
+        return "", f"{file_field} must be an absolute path: {path}"
+    try:
+        p = Path(path).expanduser()
+    except RuntimeError:
+        return "", f"{unreadable} (unknown home directory)"
     if not p.is_absolute():
         return "", f"{file_field} must be an absolute path: {path}"
-    if not p.is_file():
-        return "", f"{file_field} could not be read: {path} (not a regular file)"
     too_long = (f"{file_field} is over GitHub's "
                 f"{_GITHUB_BODY_MAX_CHARS}-character limit: {path}")
     # A UTF-8 character is at most 4 bytes, so a file longer than
     # 4 * limit bytes is over the limit without decoding it.
     max_bytes = _GITHUB_BODY_MAX_CHARS * 4
     try:
-        with p.open("rb") as fh:
+        fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+    except (OSError, ValueError) as e:
+        return "", f"{unreadable} ({getattr(e, 'strerror', None) or e})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "", f"{unreadable} (not a regular file)"
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
             raw = fh.read(max_bytes + 1)
     except OSError as e:
-        return "", f"{file_field} could not be read: {path} ({e.strerror or e})"
+        return "", f"{unreadable} ({e.strerror or e})"
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if len(raw) > max_bytes:
         return "", too_long
     try:
@@ -2065,6 +2084,8 @@ def _inline_or_file_text(inline: str, path: str, field: str,
         return "", f"{file_field} is not valid UTF-8: {path}"
     if len(text) > _GITHUB_BODY_MAX_CHARS:
         return "", too_long
+    if "\x00" in text:
+        return "", f"{file_field} contains a NUL byte: {path}"
     return text, ""
 
 
@@ -2279,7 +2300,10 @@ def create_issue(title: str, body: str = "", type: str = "Task",
     # v1.9.0: use --json so the new number is parsed from a clean JSON
     # object on stdout rather than scraped from a colorized success line
     # (the parse-miss that motivated G2).
-    args = ["create", title, "-t", type, "-p", pipeline, "-b", body, "--json"]
+    # The body travels on stdin, never as an argument: an argument that looks
+    # like a flag (a body of "--help") is parsed as one, and argv is visible
+    # to other local users and capped per argument on Linux.
+    args = ["create", title, "-t", type, "-p", pipeline, "--stdin", "--json"]
     if labels:
         args.extend(["-l", labels])
     if parent and parent > 0:
@@ -2288,7 +2312,7 @@ def create_issue(title: str, body: str = "", type: str = "Task",
             args.append("--allow-closed-parent")
     if priority:
         args.extend(["--priority", priority])
-    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path), stdin=body)
 
     # Round-6 finding #6: shape parity with _planning_create. The bash
     # --json emit carries priority / priority_requested / estimate;
@@ -2491,8 +2515,9 @@ def comment(number: int, message: str = "", repo_path: str = "",
         return {"ok": False, "partial_applied": False,
                 "number": number, "raw": "",
                 "stderr": "message must be non-empty"}
-    r = _run_zh(["comment", str(number), "-m", message],
-                cwd=_resolve_cwd(repo_path))
+    # On stdin for the same reasons as create_issue's body.
+    r = _run_zh(["comment", str(number), "--stdin"],
+                cwd=_resolve_cwd(repo_path), stdin=message)
     # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
     return {
         "ok": r["ok"],
