@@ -2022,15 +2022,40 @@ def zh_reindex(full: bool = False, repo_path: str = "") -> dict:
 # WRITE TOOLS — ISSUE LIFECYCLE
 # -----------------------------------------------------------------------------
 
+def _inline_or_file_text(inline: str, path: str, field: str,
+                         file_field: str) -> tuple[str, str]:
+    """(text, error) from an inline value or a file path, never both.
+
+    The path must be absolute: the server's working directory is not the
+    caller's, so a relative path would resolve somewhere the caller never
+    meant. Bytes are decoded strictly as UTF-8 so a mis-encoded file is
+    refused rather than sent with replacement characters.
+    """
+    if not path:
+        return inline, ""
+    if inline:
+        return "", f"pass {field} or {file_field}, not both"
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        return "", f"{file_field} must be an absolute path: {path}"
+    try:
+        return p.read_bytes().decode("utf-8"), ""
+    except UnicodeDecodeError:
+        return "", f"{file_field} is not valid UTF-8: {path}"
+    except OSError as e:
+        return "", f"{file_field} could not be read: {path} ({e.strerror or e})"
+
+
 @mcp.tool()
-def create_issue(title: str, body: str, type: str = "Task",
+def create_issue(title: str, body: str = "", type: str = "Task",
                  pipeline: str = "Product Backlog",
                  labels: str = "", parent: int = 0,
                  priority: str = "", repo_path: str = "",
                  confirm_create: bool = False,
                  skip_duplicate_check: bool = False,
                  related_issues: list[int] | None = None,
-                 allow_closed_parent: bool = False) -> dict:
+                 allow_closed_parent: bool = False,
+                 body_file: str = "") -> dict:
     """Create a new ZenHub issue.
 
     Runs a pre-flight similarity check against existing open issues
@@ -2049,7 +2074,14 @@ def create_issue(title: str, body: str, type: str = "Task",
 
     Args:
         title: Issue title (required, non-empty).
-        body: Issue body / description in Markdown (required, non-empty).
+        body: Issue body / description in Markdown. Required (non-empty)
+            unless `body_file` is given.
+        body_file: Absolute path of a UTF-8 file holding the body, for
+            bodies too long or backtick-heavy to pass inline. Mutually
+            exclusive with `body`; the file's text gets the same
+            non-empty check and duplicate check an inline body does. A
+            missing, unreadable or non-UTF-8 file is refused before
+            anything is sent.
         type: Issue type. Defaults to Task. Discover with list_types.
         pipeline: Target pipeline. Defaults to "Product Backlog".
         labels: Comma-separated label names (optional).
@@ -2147,6 +2179,11 @@ def create_issue(title: str, body: str, type: str = "Task",
     if not title.strip():
         return {**_empty_create_shape,
                 "stderr": "title must be non-empty",
+                "duplicate_check": _validation_dup_placeholder}
+    body, file_err = _inline_or_file_text(body, body_file, "body", "body_file")
+    if file_err:
+        return {**_empty_create_shape,
+                "stderr": file_err,
                 "duplicate_check": _validation_dup_placeholder}
     if not body.strip():
         return {**_empty_create_shape,
@@ -2396,17 +2433,28 @@ def reorder_issue(number: int, position: str, repo_path: str = "") -> dict:
 
 
 @mcp.tool()
-def comment(number: int, message: str, repo_path: str = "") -> dict:
+def comment(number: int, message: str = "", repo_path: str = "",
+            message_file: str = "") -> dict:
     """Add a comment to an issue.
 
     Args:
         number: Issue number.
-        message: Comment text (Markdown supported).
+        message: Comment text (Markdown supported). Required (non-empty)
+            unless `message_file` is given.
         repo_path: Optional absolute path of a git checkout to run zh from.
+        message_file: Absolute path of a UTF-8 file holding the comment
+            text. Mutually exclusive with `message`; a missing,
+            unreadable, non-UTF-8 or empty file is refused before
+            anything is sent.
 
     Returns:
         dict with: ok, partial_applied, number, raw, stderr.
     """
+    message, file_err = _inline_or_file_text(
+        message, message_file, "message", "message_file")
+    if file_err:
+        return {"ok": False, "partial_applied": False,
+                "number": number, "raw": "", "stderr": file_err}
     if not message.strip():
         # v1.9.2 round-3 (PR #27) finding #1: validation early-return
         # must match the success-path key set (number, raw, stderr)
