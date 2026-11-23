@@ -332,3 +332,22 @@ def test_zh_create_stdin_puts_the_exact_body_in_create_issue(monkeypatch, tmp_pa
         assert vars_file.exists(), f"createIssue never ran for {text!r}: {r.stderr}"
         sent = json.loads(vars_file.read_text(encoding="utf-8"))["input"]["body"]
         assert sent == text.rstrip("\n"), (text, sent)
+
+
+def test_inline_text_over_the_limit_is_refused(monkeypatch) -> None:
+    seen = _capture(monkeypatch)
+    big = "a" * (mcp_server._GITHUB_BODY_MAX_CHARS + 1)
+    out = mcp_server.create_issue("Title", big, skip_duplicate_check=True)
+    assert out["ok"] is False and "character limit" in out["stderr"]
+    out = mcp_server.comment(42, big)
+    assert out["ok"] is False and "character limit" in out["stderr"]
+    assert seen == []
+
+
+def test_run_zh_returns_a_failure_when_zh_cannot_start(tmp_path) -> None:
+    """An exec failure (E2BIG on Linux, a vanished cwd) is reported in the
+    standard result shape, never raised out of the tool."""
+    r = mcp_server._run_zh(["--version"], cwd=str(tmp_path / "gone"))
+    assert r["ok"] is False
+    assert r["exit_code"] == -1
+    assert r["stderr_plain"].startswith("zh could not be started:")

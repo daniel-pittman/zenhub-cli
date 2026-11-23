@@ -1090,6 +1090,19 @@ def _run_zh(args: list[str], *, cwd: str | None = None,
             "stdout_plain": _ANSI_RE.sub("", captured_stdout),
             "stderr_plain": _ANSI_RE.sub("", combined_stderr),
         }
+    except (OSError, ValueError) as e:
+        # zh never started: E2BIG from an argument over Linux's per-argument
+        # limit, a missing cwd, a NUL byte in an argument. Nothing was sent,
+        # so return the same failure shape a tool can report, not a raise.
+        msg = f"zh could not be started: {e}"
+        return {
+            "ok": False,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": msg,
+            "stdout_plain": "",
+            "stderr_plain": msg,
+        }
     return {
         "ok": result.returncode == 0,
         "exit_code": result.returncode,
@@ -2044,6 +2057,9 @@ def _inline_or_file_text(inline: str, path: str, field: str,
     if not path:
         if "\x00" in inline:
             return "", f"{field} contains a NUL byte"
+        if len(inline) > _GITHUB_BODY_MAX_CHARS:
+            return "", (f"{field} is over GitHub's "
+                        f"{_GITHUB_BODY_MAX_CHARS}-character limit")
         return inline, ""
     if inline:
         return "", f"pass {field} or {file_field}, not both"
