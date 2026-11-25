@@ -158,7 +158,7 @@ ZH_REST_TOKEN=your_rest_token_here
 | `pipeline delete "Name" [-y]` | | **DANGER, propose first:** permanently delete an empty pipeline after checking the exact issue count |
 | `pipelines [repo]` | `pipes`, `p` | List pipeline names for a workspace |
 | `move <issue> <pipeline>` | `mv`, `m` | Move an issue to a pipeline |
-| `reorder <issue> <position>` | `order`, `pos` | Reorder issue within its pipeline |
+| `reorder <issue> <position>` | `order`, `pos` | Reorder issue within its pipeline: `top`, `bottom`, an open-card position, or `before`/`after <issue>`; confirmed by reading the pipeline back |
 | `estimate <issue> <points>` | `est`, `points` | Set story point estimate |
 | `assign <issue> <user> [user...]` | | Assign one or more users to an issue |
 | `unassign <issue> <user> [user...]` | | Remove the named assignee(s) |
@@ -268,12 +268,22 @@ The MCP tools are `pipeline_create`, `pipeline_move`, `pipeline_rename`, and `pi
 zh move 42 "In Progress"
 zh move #42 done          # # prefix and case-insensitive matching
 
-# Reorder within current pipeline
-zh reorder 42 top         # Move to top
+# Reorder within current pipeline. Positions count OPEN cards only, from 0,
+# so closed issues still filed in the pipeline never push a card below the
+# visible top.
+zh reorder 42 top         # Above the first open card
 zh reorder 42 0           # Same as top
-zh reorder 42 bottom      # Move to bottom
-zh reorder 42 5           # Move to position 5
+zh reorder 42 bottom      # Below the last open card
+zh reorder 42 5           # Sixth open card from the top
+zh reorder 42 before 17   # Directly above #17 (same pipeline)
+zh reorder 42 after 17    # Directly below #17
+zh reorder 42 top --json  # {number, pipeline, requested, verified, open_position, open_count}
 ```
+
+`zh reorder` reads the pipeline back after every move and exits 1 when the
+card is not where it was asked to go, so a move ZenHub accepts but does not
+apply is never reported as a success. Exit 2 means the move was sent but the
+pipeline could not be read back in full; check it with `zh pipeline`.
 
 ### Estimates & Assignment
 
@@ -519,8 +529,8 @@ zh subissue list 42
 # Unlink sub-issues — does NOT close them, just removes the parent relationship
 zh subissue remove 42 100
 
-# Reorder a sub-issue among its siblings. Note: sibling-anchored positions,
-# NOT integer positions like 'zh reorder' uses.
+# Reorder a sub-issue among its siblings (sibling-anchored, like
+# 'zh reorder ... before|after' but within the parent's sub-issue list).
 zh subissue reorder 100 top
 zh subissue reorder 100 bottom
 zh subissue reorder 100 after 101

@@ -853,9 +853,11 @@ COMMANDS:
                            Example: zh move 42 "In Progress"
                            Example: zh move #42 done
 
-    reorder <issue> <pos>   Reorder an issue within its pipeline
+    reorder <issue> <pos>   Reorder an issue within its pipeline (top, bottom, an
+                           open-card position from 0, or before/after <issue>);
+                           confirmed by reading the pipeline back. [--json]
                            Example: zh reorder 42 top
-                           Example: zh reorder 42 bottom
+                           Example: zh reorder 42 before 17
 
     estimate <issue> <pts>  Set story point estimate
                            Example: zh estimate 42 3
@@ -1513,11 +1515,14 @@ Example: zh issue 42"
 # "showing N of M" instead of implying it rendered everything.
 #
 # filters_json is the IssueSearchFiltersInput payload ({} for all issues,
-# {assignees:{in:[user]}} for `zh mine`).
+# {assignees:{in:[user]}} for `zh mine`). extra_fields is an optional
+# GraphQL selection added to each node (`zh reorder` asks for
+# `pipelineIssue(workspaceId: $workspaceId) { id }`).
 zh_pipeline_issues_fetch_all() {
     local pipeline_id="$1"
     local workspace_id="$2"
     local filters_json="${3:-{\}}"
+    local extra_fields="${4:-}"
 
     local query='
     query($pipelineId: ID!, $workspaceId: ID!, $filters: IssueSearchFiltersInput!, $after: String) {
@@ -1549,6 +1554,7 @@ zh_pipeline_issues_fetch_all() {
                     ownerName
                     name
                 }
+                '"${extra_fields}"'
             }
         }
     }'
@@ -2568,121 +2574,265 @@ Example: zh pipeline \"In Progress\"
     echo ""
 }
 
+# Print one line per pipeline card, in board order: "<pipelineIssueId> <state> <owner/repo>#<n>".
+# Exits non-zero when the walk is incomplete, so a caller never plans a move
+# or confirms one from a partial order.
+zh_reorder_pipeline_order() {
+    local pipeline_id="$1" workspace_id="$2"
+    local page
+    page=$(zh_pipeline_issues_fetch_all "$pipeline_id" "$workspace_id" '{}' \
+        'pipelineIssue(workspaceId: $workspaceId) { id }') || return 1
+    local complete fetched total
+    complete=$(printf '%s' "$page" | jq -r '.complete')
+    fetched=$(printf '%s' "$page" | jq '.nodes | length')
+    total=$(printf '%s' "$page" | jq -r '.totalCount')
+    if [[ "$complete" != "true" ]] || [[ "$fetched" -lt "$total" ]]; then
+        return 1
+    fi
+    printf '%s' "$page" | jq -r '.nodes[]
+        | select(.pipelineIssue.id != null)
+        | "\(.pipelineIssue.id) \(.state) \(.repository.ownerName)/\(.repository.name)#\(.number)"'
+}
+
 cmd_reorder() {
-    load_config
+    local usage="Usage: zh reorder <issue_number> top|bottom|<position> [--json]
+       zh reorder <issue_number> before|after <issue_number> [--json]
 
-    local issue_num="${1:-}"
-    local position="${2:-}"
-
-    if [[ -z "$issue_num" ]] || [[ -z "$position" ]]; then
-        error "Usage: zh reorder <issue_number> <position>
-       zh reorder <issue_number> top
-       zh reorder <issue_number> bottom
+Positions count OPEN cards only, from 0. Closed issues still filed in the
+pipeline are skipped, so 'top' means above the first open card.
 
 Examples:
-  zh reorder 42 0      # Move to top of pipeline
-  zh reorder 42 top    # Move to top
-  zh reorder 42 5      # Move to position 5
-  zh reorder 42 bottom # Move to bottom"
+  zh reorder 42 top        # Above the first open card
+  zh reorder 42 bottom     # Below the last open card
+  zh reorder 42 3          # Fourth open card from the top
+  zh reorder 42 before 17  # Directly above #17
+  zh reorder 42 after 17   # Directly below #17
+
+Exit codes: 0 moved and confirmed by reading the pipeline back,
+            1 failed or the card is not where it was asked to go,
+            2 move sent but the pipeline could not be read back in full."
+    local json=false
+    local -a pos_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --) shift; pos_args+=(${@+"$@"}); break ;;
+            *) pos_args+=("$1"); shift ;;
+        esac
+    done
+
+    local issue_num="${pos_args[0]:-}"
+    local position="${pos_args[1]:-}"
+    local anchor_num="${pos_args[2]:-}"
+    if [[ -z "$issue_num" ]] || [[ -z "$position" ]] || [[ ${#pos_args[@]} -gt 3 ]]; then
+        error "$usage"
     fi
 
-    # Strip # prefix if present
     issue_num="${issue_num#\#}"
+    anchor_num="${anchor_num#\#}"
+    [[ "$issue_num" =~ ^[0-9]+$ ]] || error "Invalid issue number: ${pos_args[0]}"
 
-    local owner_repo
+    local mode index=""
+    case "$position" in
+        top|first) mode=top ;;
+        bottom|last) mode=bottom ;;
+        before|after)
+            mode="$position"
+            [[ "$anchor_num" =~ ^[0-9]+$ ]] || error "zh reorder ${issue_num} ${position} needs an issue number to place it ${position}"
+            [[ "$anchor_num" != "$issue_num" ]] || error "Cannot place #${issue_num} ${position} itself"
+            ;;
+        *)
+            if [[ "$position" =~ ^[0-9]+$ ]]; then
+                mode=index
+                index=$((10#$position))
+            else
+                error "Invalid position: $position (use top, bottom, a number, or before/after <issue>)"
+            fi
+            ;;
+    esac
+    if [[ "$mode" != before && "$mode" != after && -n "$anchor_num" ]]; then
+        error "$usage"
+    fi
+
+    load_config
+
+    local owner_repo repo_id workspace_id
     owner_repo=$(get_repo_info)
-
-    local repo_id
     repo_id=$(get_repo_id "$owner_repo")
-
-    local workspace_id
     workspace_id=$(get_workspace_id "$owner_repo")
 
-    # Get the issue's current pipeline
+    # pipelineIssue(workspaceId) is this workspace's card. pipelineIssues
+    # lists the issue's cards in every workspace, so its first node can be
+    # another workspace's pipeline.
     local issue_query='
-    query($repoId: ID!, $issueNumber: Int!) {
+    query($repoId: ID!, $issueNumber: Int!, $workspaceId: ID!) {
         issueByInfo(repositoryId: $repoId, issueNumber: $issueNumber) {
             id
             number
             title
-            pipelineIssues {
-                nodes {
-                    pipeline {
-                        id
-                        name
-                        issues {
-                            totalCount
-                        }
-                    }
-                }
+            pipelineIssue(workspaceId: $workspaceId) {
+                id
+                pipeline { id name }
             }
         }
     }'
 
-    local issue_vars
-    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson issue_num "$issue_num" \
-        '{repoId: $repo_id, issueNumber: $issue_num}')
-
-    local issue_response
+    local issue_vars issue_response
+    issue_vars=$(jq -n --arg repo_id "$repo_id" --argjson n "$issue_num" --arg ws "$workspace_id" \
+        '{repoId: $repo_id, issueNumber: $n, workspaceId: $ws}')
     issue_response=$(zh_graphql "$issue_query" "$issue_vars")
 
-    local issue_id issue_title pipeline_id pipeline_name total_count
-    issue_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.id // empty')
-    issue_title=$(echo "$issue_response" | jq -r '.data.issueByInfo.title')
-    pipeline_id=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.id // empty')
-    pipeline_name=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.name // "Unknown"')
-    total_count=$(echo "$issue_response" | jq -r '.data.issueByInfo.pipelineIssues.nodes[0].pipeline.issues.totalCount // 0')
+    local issue_id issue_title self_pi pipeline_id pipeline_name
+    issue_id=$(printf '%s' "$issue_response" | jq -r '.data.issueByInfo.id // empty')
+    issue_title=$(printf '%s' "$issue_response" | jq -r '.data.issueByInfo.title // ""')
+    self_pi=$(printf '%s' "$issue_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
+    pipeline_id=$(printf '%s' "$issue_response" | jq -r '.data.issueByInfo.pipelineIssue.pipeline.id // empty')
+    pipeline_name=$(printf '%s' "$issue_response" | jq -r '.data.issueByInfo.pipelineIssue.pipeline.name // "Unknown"')
 
-    if [[ -z "$issue_id" ]]; then
-        error "Issue #${issue_num} not found in ZenHub"
+    [[ -n "$issue_id" ]] || error "Issue #${issue_num} not found in ZenHub"
+    [[ -n "$self_pi" && -n "$pipeline_id" ]] || error "Issue #${issue_num} is not in a pipeline in this workspace"
+
+    local order
+    order=$(zh_reorder_pipeline_order "$pipeline_id" "$workspace_id") \
+        || error "Could not read every card in '${pipeline_name}', so nothing was moved (retry, or check the ZenHub connection)"
+
+    # Open cards other than the one being moved, in board order.
+    local -a others=()
+    local pi st label
+    while read -r pi st label; do
+        [[ -z "$pi" || "$pi" == "$self_pi" || "$st" == CLOSED ]] && continue
+        others+=("$pi")
+    done <<< "$order"
+
+    local anchor_pi="" anchor_label=""
+    if [[ "$mode" == before || "$mode" == after ]]; then
+        local anchor_vars anchor_response anchor_pipeline
+        anchor_vars=$(jq -n --arg repo_id "$repo_id" --argjson n "$anchor_num" --arg ws "$workspace_id" \
+            '{repoId: $repo_id, issueNumber: $n, workspaceId: $ws}')
+        anchor_response=$(zh_graphql "$issue_query" "$anchor_vars")
+        anchor_pi=$(printf '%s' "$anchor_response" | jq -r '.data.issueByInfo.pipelineIssue.id // empty')
+        anchor_pipeline=$(printf '%s' "$anchor_response" | jq -r '.data.issueByInfo.pipelineIssue.pipeline.id // empty')
+        [[ -n "$anchor_pi" ]] || error "Issue #${anchor_num} is not in a pipeline in this workspace"
+        [[ "$anchor_pipeline" == "$pipeline_id" ]] \
+            || error "#${anchor_num} is not in '${pipeline_name}'; move #${issue_num} there first with 'zh move'"
+        anchor_label="#${anchor_num}"
     fi
 
-    if [[ -z "$pipeline_id" ]]; then
-        error "Issue #${issue_num} is not in any pipeline"
-    fi
-
-    # Handle special position keywords
-    local pos_int
-    case "$position" in
-        top|first|0)
-            pos_int=0
-            ;;
-        bottom|last)
-            pos_int=$((total_count - 1))
-            ;;
-        *)
-            if [[ "$position" =~ ^[0-9]+$ ]]; then
-                pos_int=$position
+    # Resolve every request to "before card X" or "after card X". A numeric
+    # position on moveIssue, and 'top' as position 0, count closed cards the
+    # board hides, so those moves can land below the visible top.
+    local relation="" target_pi=""
+    case "$mode" in
+        top) [[ ${#others[@]} -gt 0 ]] && { relation=before; target_pi="${others[0]}"; } ;;
+        bottom) [[ ${#others[@]} -gt 0 ]] && { relation=after; target_pi="${others[${#others[@]}-1]}"; } ;;
+        index)
+            if [[ ${#others[@]} -eq 0 ]]; then
+                :
+            elif [[ "$index" -lt ${#others[@]} ]]; then
+                relation=before; target_pi="${others[$index]}"
             else
-                error "Invalid position: $position (use a number, 'top', or 'bottom')"
+                relation=after; target_pi="${others[${#others[@]}-1]}"
             fi
             ;;
+        before|after) relation="$mode"; target_pi="$anchor_pi" ;;
     esac
 
-    info "Moving issue #${issue_num} to position ${pos_int} in '${pipeline_name}'..."
-
-    # Move the issue (to same pipeline but different position)
-    local move_mutation='
-    mutation($input: MoveIssueInput!) {
-        moveIssue(input: $input) {
-            issue {
-                id
+    if [[ -n "$relation" ]]; then
+        if [[ "$json" != true ]]; then
+            case "$mode" in
+                top) info "Moving #${issue_num} to the top of '${pipeline_name}'..." ;;
+                bottom) info "Moving #${issue_num} to the bottom of '${pipeline_name}'..." ;;
+                index) info "Moving #${issue_num} to open position ${index} in '${pipeline_name}'..." ;;
+                *) info "Moving #${issue_num} ${relation} ${anchor_label} in '${pipeline_name}'..." ;;
+            esac
+        fi
+        local move_mutation='
+        mutation($input: MoveIssueRelativeToInput!) {
+            moveIssueRelativeTo(input: $input) {
+                clientMutationId
             }
-        }
-    }'
+        }'
+        local field move_vars
+        if [[ "$relation" == before ]]; then field=beforePipelineIssueId; else field=afterPipelineIssueId; fi
+        move_vars=$(jq -n --arg i "$issue_id" --arg f "$field" --arg t "$target_pi" \
+            '{input: {issueId: $i, ($f): $t}}')
+        zh_graphql "$move_mutation" "$move_vars" > /dev/null \
+            || error "ZenHub refused the move of #${issue_num}; the card was not moved"
+    fi
 
-    local move_vars
-    move_vars=$(jq -n \
-        --arg issue_id "$issue_id" \
-        --arg pipeline_id "$pipeline_id" \
-        --argjson position "$pos_int" \
-        '{input: {issueId: $issue_id, pipelineId: $pipeline_id, position: $position}}')
+    # Read the pipeline back. A move is confirmed only when the card sits
+    # directly next to its target, so a call that reports success without
+    # moving the card is caught here.
+    local after_order
+    if ! after_order=$(zh_reorder_pipeline_order "$pipeline_id" "$workspace_id"); then
+        if [[ "$json" == true ]]; then
+            jq -n --argjson n "$issue_num" --arg p "$pipeline_name" --arg req "$position" \
+                '{number: $n, pipeline: $p, requested: $req, verified: false, open_position: null, open_count: null}'
+        else
+            warn "Move of #${issue_num} was sent, but '${pipeline_name}' could not be read back in full, so it is unconfirmed. Check with: zh pipeline \"${pipeline_name}\""
+        fi
+        exit 2
+    fi
 
-    zh_graphql "$move_mutation" "$move_vars" > /dev/null
+    local -a all_pi=() open_pi=()
+    while read -r pi st label; do
+        [[ -z "$pi" ]] && continue
+        all_pi+=("$pi")
+        [[ "$st" == CLOSED ]] || open_pi+=("$pi")
+    done <<< "$after_order"
 
-    echo ""
-    success "Reordered issue #${issue_num}: ${issue_title}"
-    echo -e "  Now at position ${CYAN}${pos_int}${NC} in ${GREEN}${pipeline_name}${NC}"
+    # Index loops, not "${arr[@]}": /bin/bash 3.2 treats an empty array as
+    # unbound under set -u.
+    local self_at=-1 target_at=-1 open_at=-1 i
+    for ((i = 0; i < ${#all_pi[@]}; i++)); do
+        [[ "${all_pi[$i]}" == "$self_pi" ]] && self_at=$i
+        [[ -n "$target_pi" && "${all_pi[$i]}" == "$target_pi" ]] && target_at=$i
+    done
+    for ((i = 0; i < ${#open_pi[@]}; i++)); do
+        [[ "${open_pi[$i]}" == "$self_pi" ]] && open_at=$i
+    done
+
+    local verified=false
+    if [[ "$self_at" -ge 0 ]]; then
+        if [[ -z "$relation" ]]; then
+            verified=true
+        elif [[ "$relation" == before && "$target_at" -eq $((self_at + 1)) ]]; then
+            verified=true
+        elif [[ "$relation" == after && "$target_at" -ge 0 && "$self_at" -eq $((target_at + 1)) ]]; then
+            verified=true
+        fi
+    fi
+
+    local open_count=${#open_pi[@]}
+    if [[ "$json" == true ]]; then
+        jq -n --argjson n "$issue_num" --arg p "$pipeline_name" --arg req "$position" \
+            --argjson v "$verified" --argjson at "$open_at" --argjson c "$open_count" \
+            '{number: $n, pipeline: $p, requested: $req, verified: $v,
+              open_position: (if $at < 0 then null else $at end), open_count: $c}'
+    fi
+
+    if [[ "$verified" != true ]]; then
+        if [[ "$self_at" -lt 0 ]]; then
+            printf "${RED}Error:${NC} %s\n" "#${issue_num} is no longer in '${pipeline_name}' after the move; check it with: zh issue ${issue_num}" >&2
+        else
+            printf "${RED}Error:${NC} %s\n" "ZenHub accepted the move, but #${issue_num} is not where it was asked to go (now open card ${open_at} of ${open_count} in '${pipeline_name}'). Check with: zh pipeline \"${pipeline_name}\"" >&2
+        fi
+        exit 1
+    fi
+
+    if [[ "$json" != true ]]; then
+        echo ""
+        if [[ -z "$relation" ]]; then
+            success "#${issue_num} is the only open card in '${pipeline_name}'; nothing to move"
+        else
+            success "Reordered issue #${issue_num}: ${issue_title}"
+        fi
+        if [[ "$open_at" -ge 0 ]]; then
+            echo -e "  Now open card ${CYAN}${open_at}${NC} of ${open_count} in ${GREEN}${pipeline_name}${NC} (confirmed by reading the pipeline back)"
+        else
+            echo -e "  Placed in ${GREEN}${pipeline_name}${NC} (the issue is closed, so it has no open position)"
+        fi
+    fi
 }
 
 cmd_estimate() {
