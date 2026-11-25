@@ -2476,28 +2476,64 @@ def move_issue(number: int, pipeline: str, repo_path: str = "") -> dict:
 
 
 @mcp.tool()
-def reorder_issue(number: int, position: str, repo_path: str = "") -> dict:
+def reorder_issue(number: int, position: str, repo_path: str = "",
+                  relative_to: int = 0) -> dict:
     """Reorder an issue within its current pipeline.
+
+    Positions count open cards only, so closed issues still filed in the
+    pipeline never push a card below the visible top. After the move the
+    pipeline is read back, and `ok` is True only when the card is where it
+    was asked to go.
 
     Args:
         number: Issue number.
-        position: Either a numeric string (e.g., "5"), "top", or "bottom".
+        position: "top", "bottom", an open-card position from 0 as a
+            string (e.g. "3"), or "before" / "after" with `relative_to`.
         repo_path: Optional absolute path of a git checkout to run zh from.
+        relative_to: The issue to place this one directly before or after.
+            Required with "before" / "after"; it must be in the same
+            pipeline.
 
     Returns:
-        dict with: ok, partial_applied, number, position, raw, stderr.
+        dict with: ok, partial_applied (a move was sent but is not confirmed
+        where it was asked to go, so the card may have moved), number,
+        position, verified, unconfirmed (the move was sent but the pipeline
+        could not be read back in full; check it before retrying),
+        open_position, open_count, pipeline, raw, stderr.
     """
-    r = _run_zh(["reorder", str(number), position],
-                cwd=_resolve_cwd(repo_path))
-    # v1.9.3 pattern-sweep: uniform-key parity (see close_issue comment).
-    return {
-        "ok": r["ok"],
-        "partial_applied": False,
-        "number": number,
-        "position": position,
-        "raw": r["stdout_plain"],
-        "stderr": _stderr_plain(r),
-    }
+    def result(ok, data, r, stderr=None, *, unconfirmed=False):
+        data = data or {}
+        return {
+            "ok": ok,
+            "partial_applied": bool(data.get("sent")) and not ok,
+            "number": number,
+            "position": position,
+            "verified": bool(data.get("verified")),
+            "unconfirmed": unconfirmed,
+            "open_position": data.get("open_position"),
+            "open_count": data.get("open_count"),
+            "pipeline": data.get("pipeline"),
+            "raw": r["stdout_plain"] if r else "",
+            "stderr": _stderr_plain(r) if stderr is None else stderr,
+        }
+
+    pos = position.strip().lower()
+    relative = pos in ("before", "after")
+    if relative and not relative_to:
+        return result(False, None, None,
+                      f'position "{position}" needs relative_to (an issue number)')
+    if not relative and relative_to:
+        return result(False, None, None,
+                      'relative_to is only used with position "before" or "after"')
+    args = ["reorder", "--json", "--", str(number), pos]
+    if relative:
+        args.append(str(relative_to))
+    r = _run_zh(args, cwd=_resolve_cwd(repo_path))
+    data = _parse_json_stdout(r["stdout_plain"])
+    data = data if isinstance(data, dict) and "verified" in data else None
+    code = _safe_int(r.get("exit_code"))
+    return result(bool(r.get("ok")) and bool(data and data.get("verified")), data, r,
+                  unconfirmed=(code == 2 and bool(data and data.get("sent"))))
 
 
 @mcp.tool()

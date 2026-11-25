@@ -63,7 +63,11 @@ zh pipeline -- create          # View a pipeline literally named Create
 
 # Manage issues
 zh move <issue> "Pipeline"    # Move to pipeline
-zh reorder <issue> top        # Prioritize
+zh reorder <issue> top        # Prioritize (above the first OPEN card)
+zh reorder <issue> before <n> # Directly above #n; also after <n>, bottom, or an open-card index
+# Positions count open cards only; closed cards filed in the pipeline are skipped.
+# Every move is read back: exit 1 if the card is not where asked, 2 if unconfirmed.
+# MCP: reorder_issue(number, position, relative_to=<n> for before/after); ok only when verified.
 zh estimate <issue> <points>  # Set estimate
 zh assign <issue> <user> [user...]      # Assign one or more users
 zh unassign <issue> <user> [user...]    # Remove only the named assignee(s)
