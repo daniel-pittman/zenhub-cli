@@ -2,7 +2,9 @@
 the pipeline back.
 
 The stand-in ZenHub keeps one pipeline as an ordered list of cards, closed
-ones included, the way a real pipeline keeps closed issues filed in it. A
+ones included, the way a real pipeline keeps closed issues filed in it. Like
+the live API, `searchIssuesByPipeline` leaves the closed cards out (unless a
+test asks for them) while moves still apply to the full list. A
 `moveIssueRelativeTo` call is applied to that list unless the test asks for
 a silent no-op, which is how the real API failed for `moveIssue(position: 0)`.
 """
@@ -42,7 +44,7 @@ APPLY_MOVE = r'''
 
 
 def _stubs(cards=None, *, noop=False, other_pipeline=(), reread_partial=False,
-           mutation_fails=False):
+           mutation_fails=False, search_shows_closed=False):
     initial = shlex.quote(json.dumps(CARDS if cards is None else cards))
     apply_move = shlex.quote(APPLY_MOVE)
     elsewhere = " ".join(str(n) for n in other_pipeline)
@@ -82,7 +84,9 @@ def _stubs(cards=None, *, noop=False, other_pipeline=(), reread_partial=False,
             if [[ {str(reread_partial).lower()} == true && -f "$state.moved" ]]; then
                 printf '%s' '{{"data":{{"searchIssuesByPipeline":null}}}}'; return
             fi
-            jq '{{data: {{searchIssuesByPipeline: {{totalCount: length,
+            jq --argjson all {str(search_shows_closed).lower()} \
+               'map(select($all or .state != "CLOSED")) |
+               {{data: {{searchIssuesByPipeline: {{totalCount: length,
                 pageInfo: {{hasNextPage: false, endCursor: null}},
                 nodes: map({{number: .n, title: "t", state: .state, zenhubUrl: "u",
                     estimate: null, assignees: {{nodes: []}},
@@ -115,6 +119,16 @@ def test_top_goes_above_the_first_open_card_not_position_zero():
     assert "OLD_MOVE_ISSUE_CALLED" not in r.stderr
     out = _json(r)
     assert out["verified"] is True and out["open_position"] == 0 and out["open_count"] == 4
+
+
+def test_closed_cards_in_the_search_result_are_skipped():
+    r = _run(["4", "top", "--json"], search_shows_closed=True)
+    assert r.returncode == 0, r.stderr
+    assert _moves(r) == [{"issueId": "issue-4", "beforePipelineIssueId": "pi-1"}]
+    assert _json(r)["open_position"] == 0 and _json(r)["open_count"] == 4
+    r = _run(["1", "2", "--json"], search_shows_closed=True)
+    assert _moves(r) == [{"issueId": "issue-1", "beforePipelineIssueId": "pi-4"}]
+    assert _json(r)["open_position"] == 2
 
 
 def test_bottom_goes_below_the_last_open_card():
