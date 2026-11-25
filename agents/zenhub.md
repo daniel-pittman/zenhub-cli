@@ -66,7 +66,7 @@ This agent exists because (a) `zh` has a wide tool surface (issue ops, epic ops,
 - `zh reopen <issue#>` — reopen
 - `zh delete <issue#> [-y]`: **PERMANENTLY delete** a GitHub issue (via `gh issue delete`; also removes it from the ZenHub board, and covers sub-issues since a sub-issue is just an issue). **DANGER / propose-first ALWAYS**: irreversible, needs admin/triage on the repo. Prefer `zh close` in almost every case. Interactive terminals are prompted to retype the issue number to confirm; `-y`/`--yes` skips the prompt and is implied for non-interactive callers, so an agent invocation will not hang waiting on a prompt (your propose-first protocol is the guardrail there). Wraps GitHub deletion (not ZenHub's `deleteZenhubIssue`, which only accepts ZenHub-only cards with no GitHub issue behind them; those must be removed in the ZenHub web UI). Epics are normal issues now, so delete one the same way: `zh delete <issue#>`.
 - `zh move <issue#> "<pipeline>"` — move between pipelines
-- `zh reorder <issue#> <position|top|bottom>` — reorder within current pipeline (numeric positions supported, top = 1)
+- `zh reorder <issue#> top|bottom|<n>|before <issue#>|after <issue#>` — reorder within current pipeline. Positions count open cards only, from 0 (top = 0); closed cards still filed in the pipeline are skipped. Every move is read back: exit 1 when the card is not where asked, exit 2 when the read-back was incomplete. MCP `reorder_issue` takes `relative_to` for before/after and is `ok` only when verified.
 - `zh estimate <issue#> <points|clear>` — set/clear story-point estimate
 - `zh assign <issue#> <user> [user...]` — assign one or more users
 - `zh unassign <issue#> <user> [user...]` — remove ONLY the named assignee(s); `zh unassign <issue#> --all` to clear everyone (a bare unassign with no user errors rather than removing all, so a missing target can't silently un-assign teammates)
@@ -345,7 +345,7 @@ For routine operations:
 - **Comment**: use `zh comment -f <file>` for multi-line comments. Use `-m` only for short messages.
 - **Close**: ALWAYS include a closing comment. Cite evidence (commit SHA, file:line, audit YAML pointer). Closing without explanation is bad form.
 - **Move**: single ticket can fire directly. Bulk moves (>3) → propose-first.
-- **Reorder**: numeric positions or `top`/`bottom`. Bulk reorders apply position 1 first, then 2, etc. — each call computes from current state.
+- **Reorder**: `top`/`bottom`, an open-card position, or `before`/`after <issue#>`. For a bulk reorder, place the first card `top`, then each next card `after` the previous one: each call reads current state and confirms its own result.
 - **Assign**: free to fire directly.
 
 ### Epic management
