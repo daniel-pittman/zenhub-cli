@@ -2495,16 +2495,17 @@ def reorder_issue(number: int, position: str, repo_path: str = "",
             pipeline.
 
     Returns:
-        dict with: ok, partial_applied, number, position, verified,
-        unconfirmed (the move was sent but the pipeline could not be read
-        back in full; check it before retrying), open_position, open_count,
-        pipeline, raw, stderr.
+        dict with: ok, partial_applied (a move was sent but is not confirmed
+        where it was asked to go, so the card may have moved), number,
+        position, verified, unconfirmed (the move was sent but the pipeline
+        could not be read back in full; check it before retrying),
+        open_position, open_count, pipeline, raw, stderr.
     """
     def result(ok, data, r, stderr=None, *, unconfirmed=False):
         data = data or {}
         return {
             "ok": ok,
-            "partial_applied": unconfirmed,
+            "partial_applied": bool(data.get("sent")) and not ok,
             "number": number,
             "position": position,
             "verified": bool(data.get("verified")),
@@ -2532,7 +2533,7 @@ def reorder_issue(number: int, position: str, repo_path: str = "",
     data = data if isinstance(data, dict) and "verified" in data else None
     code = _safe_int(r.get("exit_code"))
     return result(bool(r.get("ok")) and bool(data and data.get("verified")), data, r,
-                  unconfirmed=(code == 2 and data is not None))
+                  unconfirmed=(code == 2 and bool(data and data.get("sent"))))
 
 
 @mcp.tool()

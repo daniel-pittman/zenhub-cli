@@ -2589,8 +2589,11 @@ zh_reorder_pipeline_order() {
     if [[ "$complete" != "true" ]] || [[ "$fetched" -lt "$total" ]]; then
         return 1
     fi
+    # A node without its card id can be neither planned around nor confirmed.
+    if printf '%s' "$page" | jq -e 'any(.nodes[]; .pipelineIssue.id == null)' > /dev/null; then
+        return 1
+    fi
     printf '%s' "$page" | jq -r '.nodes[]
-        | select(.pipelineIssue.id != null)
         | "\(.pipelineIssue.id) \(.state) \(.repository.ownerName)/\(.repository.name)#\(.number)"'
 }
 
@@ -2628,9 +2631,12 @@ Exit codes: 0 moved and confirmed by reading the pipeline back,
         error "$usage"
     fi
 
+    # At most 9 digits keeps bash arithmetic far from overflow; 10# keeps a
+    # leading zero from reading as octal, so "04" and "4" are the same issue.
     issue_num="${issue_num#\#}"
     anchor_num="${anchor_num#\#}"
-    [[ "$issue_num" =~ ^[0-9]+$ ]] || error "Invalid issue number: ${pos_args[0]}"
+    [[ "$issue_num" =~ ^[0-9]{1,9}$ ]] || error "Invalid issue number: ${pos_args[0]}"
+    issue_num=$((10#$issue_num))
 
     local mode index=""
     case "$position" in
@@ -2638,11 +2644,12 @@ Exit codes: 0 moved and confirmed by reading the pipeline back,
         bottom|last) mode=bottom ;;
         before|after)
             mode="$position"
-            [[ "$anchor_num" =~ ^[0-9]+$ ]] || error "zh reorder ${issue_num} ${position} needs an issue number to place it ${position}"
+            [[ "$anchor_num" =~ ^[0-9]{1,9}$ ]] || error "zh reorder ${issue_num} ${position} needs an issue number to place it ${position}"
+            anchor_num=$((10#$anchor_num))
             [[ "$anchor_num" != "$issue_num" ]] || error "Cannot place #${issue_num} ${position} itself"
             ;;
         *)
-            if [[ "$position" =~ ^[0-9]+$ ]]; then
+            if [[ "$position" =~ ^[0-9]{1,9}$ ]]; then
                 mode=index
                 index=$((10#$position))
             else
@@ -2696,15 +2703,21 @@ Exit codes: 0 moved and confirmed by reading the pipeline back,
     order=$(zh_reorder_pipeline_order "$pipeline_id" "$workspace_id") \
         || error "Could not read every card in '${pipeline_name}', so nothing was moved (retry, or check the ZenHub connection)"
 
-    # Open cards other than the one being moved, in board order.
+    # Open cards other than the one being moved, in board order. The board
+    # hides closed cards, so a closed card can neither be placed among the
+    # open ones nor serve as an anchor, and a move it took part in could
+    # never be confirmed.
     local -a others=()
-    local pi st label
+    local pi st label self_open=false
     while read -r pi st label; do
-        [[ -z "$pi" || "$pi" == "$self_pi" || "$st" == CLOSED ]] && continue
+        [[ -z "$pi" || "$st" == CLOSED ]] && continue
+        if [[ "$pi" == "$self_pi" ]]; then self_open=true; continue; fi
         others+=("$pi")
     done <<< "$order"
+    [[ "$self_open" == true ]] \
+        || error "#${issue_num} is closed, and the board hides closed cards, so it has no open position to move to (reopen it first with: zh reopen ${issue_num})"
 
-    local anchor_pi="" anchor_label=""
+    local anchor_pi="" anchor_label="" anchor_at=-1 i
     if [[ "$mode" == before || "$mode" == after ]]; then
         local anchor_vars anchor_response anchor_pipeline
         anchor_vars=$(jq -n --arg repo_id "$repo_id" --argjson n "$anchor_num" --arg ws "$workspace_id" \
@@ -2715,35 +2728,45 @@ Exit codes: 0 moved and confirmed by reading the pipeline back,
         [[ -n "$anchor_pi" ]] || error "Issue #${anchor_num} is not in a pipeline in this workspace"
         [[ "$anchor_pipeline" == "$pipeline_id" ]] \
             || error "#${anchor_num} is not in '${pipeline_name}'; move #${issue_num} there first with 'zh move'"
+        for ((i = 0; i < ${#others[@]}; i++)); do
+            [[ "${others[$i]}" == "$anchor_pi" ]] && anchor_at=$i
+        done
+        [[ "$anchor_at" -ge 0 ]] \
+            || error "#${anchor_num} is closed, and the board hides closed cards; place #${issue_num} next to an open card instead"
         anchor_label="#${anchor_num}"
     fi
 
-    # Resolve every request to "before card X" or "after card X". A numeric
-    # position on moveIssue, and 'top' as position 0, count closed cards the
-    # board hides, so those moves can land below the visible top.
-    local relation="" target_pi=""
+    # Resolve every request to "before card X" or "after card X", plus the
+    # open position the card must end at. A numeric position on moveIssue,
+    # and 'top' as position 0, count closed cards the board hides, so those
+    # moves can land below the visible top.
+    local count=${#others[@]}
+    local relation="" target_pi="" want_at=0
     case "$mode" in
-        top) [[ ${#others[@]} -gt 0 ]] && { relation=before; target_pi="${others[0]}"; } ;;
-        bottom) [[ ${#others[@]} -gt 0 ]] && { relation=after; target_pi="${others[${#others[@]}-1]}"; } ;;
-        index)
-            if [[ ${#others[@]} -eq 0 ]]; then
-                :
-            elif [[ "$index" -lt ${#others[@]} ]]; then
-                relation=before; target_pi="${others[$index]}"
-            else
-                relation=after; target_pi="${others[${#others[@]}-1]}"
-            fi
-            ;;
-        before|after) relation="$mode"; target_pi="$anchor_pi" ;;
+        top) want_at=0 ;;
+        bottom) want_at=$count ;;
+        index) want_at=$(( index < count ? index : count )) ;;
+        before) want_at=$anchor_at ;;
+        after) want_at=$((anchor_at + 1)) ;;
     esac
+    if [[ "$mode" == before || "$mode" == after ]]; then
+        relation="$mode"; target_pi="$anchor_pi"
+    elif [[ "$count" -gt 0 ]]; then
+        if [[ "$want_at" -lt "$count" ]]; then
+            relation=before; target_pi="${others[$want_at]}"
+        else
+            relation=after; target_pi="${others[$((count - 1))]}"
+        fi
+    fi
 
+    local sent=false
     if [[ -n "$relation" ]]; then
         if [[ "$json" != true ]]; then
             case "$mode" in
                 top) info "Moving #${issue_num} to the top of '${pipeline_name}'..." ;;
                 bottom) info "Moving #${issue_num} to the bottom of '${pipeline_name}'..." ;;
-                index) info "Moving #${issue_num} to open position ${index} in '${pipeline_name}'..." ;;
-                *) info "Moving #${issue_num} ${relation} ${anchor_label} in '${pipeline_name}'..." ;;
+                index) info "Moving #${issue_num} to open position ${want_at} in '${pipeline_name}'..." ;;
+                *) info "Moving #${issue_num} ${mode} ${anchor_label} in '${pipeline_name}'..." ;;
             esac
         fi
         local move_mutation='
@@ -2758,80 +2781,73 @@ Exit codes: 0 moved and confirmed by reading the pipeline back,
             '{input: {issueId: $i, ($f): $t}}')
         zh_graphql "$move_mutation" "$move_vars" > /dev/null \
             || error "ZenHub refused the move of #${issue_num}; the card was not moved"
+        sent=true
     fi
 
-    # Read the pipeline back. A move is confirmed only when the card sits
-    # directly next to its target, so a call that reports success without
-    # moving the card is caught here.
-    local after_order
-    if ! after_order=$(zh_reorder_pipeline_order "$pipeline_id" "$workspace_id"); then
-        if [[ "$json" == true ]]; then
-            jq -n --argjson n "$issue_num" --arg p "$pipeline_name" --arg req "$position" \
-                '{number: $n, pipeline: $p, requested: $req, verified: false, open_position: null, open_count: null}'
-        else
-            warn "Move of #${issue_num} was sent, but '${pipeline_name}' could not be read back in full, so it is unconfirmed. Check with: zh pipeline \"${pipeline_name}\""
+    local verified=false open_at=-1 open_count=1
+    if [[ "$sent" != true ]]; then
+        # The only open card: the order just read already confirms it.
+        verified=true; open_at=0
+    else
+        # Read the pipeline back. A move is confirmed only when the card is
+        # at the open position asked for, next to its target, so a call that
+        # reports success without moving the card is caught here.
+        local after_order
+        if ! after_order=$(zh_reorder_pipeline_order "$pipeline_id" "$workspace_id"); then
+            if [[ "$json" == true ]]; then
+                jq -n --argjson n "$issue_num" --arg p "$pipeline_name" --arg req "$position" \
+                    '{number: $n, pipeline: $p, requested: $req, sent: true, verified: false,
+                      open_position: null, open_count: null}'
+            else
+                warn "Move of #${issue_num} was sent, but '${pipeline_name}' could not be read back in full, so it is unconfirmed. Check with: zh pipeline \"${pipeline_name}\""
+            fi
+            exit 2
         fi
-        exit 2
-    fi
 
-    local -a all_pi=() open_pi=()
-    while read -r pi st label; do
-        [[ -z "$pi" ]] && continue
-        all_pi+=("$pi")
-        [[ "$st" == CLOSED ]] || open_pi+=("$pi")
-    done <<< "$after_order"
-
-    # Index loops, not "${arr[@]}": /bin/bash 3.2 treats an empty array as
-    # unbound under set -u.
-    local self_at=-1 target_at=-1 open_at=-1 i
-    for ((i = 0; i < ${#all_pi[@]}; i++)); do
-        [[ "${all_pi[$i]}" == "$self_pi" ]] && self_at=$i
-        [[ -n "$target_pi" && "${all_pi[$i]}" == "$target_pi" ]] && target_at=$i
-    done
-    for ((i = 0; i < ${#open_pi[@]}; i++)); do
-        [[ "${open_pi[$i]}" == "$self_pi" ]] && open_at=$i
-    done
-
-    local verified=false
-    if [[ "$self_at" -ge 0 ]]; then
-        if [[ -z "$relation" ]]; then
-            verified=true
-        elif [[ "$relation" == before && "$target_at" -eq $((self_at + 1)) ]]; then
-            verified=true
-        elif [[ "$relation" == after && "$target_at" -ge 0 && "$self_at" -eq $((target_at + 1)) ]]; then
-            verified=true
+        local -a open_pi=()
+        while read -r pi st label; do
+            [[ -z "$pi" || "$st" == CLOSED ]] && continue
+            open_pi+=("$pi")
+        done <<< "$after_order"
+        open_count=${#open_pi[@]}
+        # Index loops, not "${arr[@]}": /bin/bash 3.2 treats an empty array
+        # as unbound under set -u.
+        for ((i = 0; i < open_count; i++)); do
+            [[ "${open_pi[$i]}" == "$self_pi" ]] && open_at=$i
+        done
+        if [[ "$open_at" -eq "$want_at" ]]; then
+            if [[ "$relation" == before ]]; then
+                [[ $((open_at + 1)) -lt "$open_count" && "${open_pi[$((open_at + 1))]}" == "$target_pi" ]] && verified=true
+            else
+                [[ "$open_at" -ge 1 && "${open_pi[$((open_at - 1))]}" == "$target_pi" ]] && verified=true
+            fi
         fi
     fi
 
-    local open_count=${#open_pi[@]}
     if [[ "$json" == true ]]; then
         jq -n --argjson n "$issue_num" --arg p "$pipeline_name" --arg req "$position" \
-            --argjson v "$verified" --argjson at "$open_at" --argjson c "$open_count" \
-            '{number: $n, pipeline: $p, requested: $req, verified: $v,
+            --argjson s "$sent" --argjson v "$verified" --argjson at "$open_at" --argjson c "$open_count" \
+            '{number: $n, pipeline: $p, requested: $req, sent: $s, verified: $v,
               open_position: (if $at < 0 then null else $at end), open_count: $c}'
     fi
 
     if [[ "$verified" != true ]]; then
-        if [[ "$self_at" -lt 0 ]]; then
-            printf "${RED}Error:${NC} %s\n" "#${issue_num} is no longer in '${pipeline_name}' after the move; check it with: zh issue ${issue_num}" >&2
+        if [[ "$open_at" -lt 0 ]]; then
+            printf "${RED}Error:${NC} %s\n" "#${issue_num} is no longer among the open cards in '${pipeline_name}' after the move; check it with: zh issue ${issue_num}" >&2
         else
-            printf "${RED}Error:${NC} %s\n" "ZenHub accepted the move, but #${issue_num} is not where it was asked to go (now open card ${open_at} of ${open_count} in '${pipeline_name}'). Check with: zh pipeline \"${pipeline_name}\"" >&2
+            printf "${RED}Error:${NC} %s\n" "ZenHub accepted the move, but #${issue_num} is not where it was asked to go (asked for open card ${want_at}, now open card ${open_at} of ${open_count} in '${pipeline_name}'). Check with: zh pipeline \"${pipeline_name}\"" >&2
         fi
         exit 1
     fi
 
     if [[ "$json" != true ]]; then
         echo ""
-        if [[ -z "$relation" ]]; then
+        if [[ "$sent" != true ]]; then
             success "#${issue_num} is the only open card in '${pipeline_name}'; nothing to move"
         else
             success "Reordered issue #${issue_num}: ${issue_title}"
         fi
-        if [[ "$open_at" -ge 0 ]]; then
-            echo -e "  Now open card ${CYAN}${open_at}${NC} of ${open_count} in ${GREEN}${pipeline_name}${NC} (confirmed by reading the pipeline back)"
-        else
-            echo -e "  Placed in ${GREEN}${pipeline_name}${NC} (the issue is closed, so it has no open position)"
-        fi
+        echo -e "  Now open card ${CYAN}${open_at}${NC} of ${open_count} in ${GREEN}${pipeline_name}${NC} (confirmed by reading the pipeline back)"
     fi
 }
 

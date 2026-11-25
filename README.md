@@ -277,13 +277,15 @@ zh reorder 42 bottom      # Below the last open card
 zh reorder 42 5           # Sixth open card from the top
 zh reorder 42 before 17   # Directly above #17 (same pipeline)
 zh reorder 42 after 17    # Directly below #17
-zh reorder 42 top --json  # {number, pipeline, requested, verified, open_position, open_count}
+zh reorder 42 top --json  # {number, pipeline, requested, sent, verified, open_position, open_count}
 ```
 
 `zh reorder` reads the pipeline back after every move and exits 1 when the
 card is not where it was asked to go, so a move ZenHub accepts but does not
 apply is never reported as a success. Exit 2 means the move was sent but the
 pipeline could not be read back in full; check it with `zh pipeline`.
+A closed card can't be moved or used as the `before`/`after` card: the
+board hides closed cards, so the command refuses before sending anything.
 
 ### Estimates & Assignment
 
