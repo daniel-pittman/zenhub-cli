@@ -203,7 +203,7 @@ jobs:
       # reports, and the review would post its checklist with no findings.
       - name: Run Claude Code
         if: steps.guard.outputs.skip == 'false' && steps.trusted.outputs.run == 'true'
-        uses: anthropics/claude-code-action@469588f42e6b1e94cd14ad09dccfeaec772ce0fd # v1.0.280
+        uses: anthropics/claude-code-action@e5812cd75691ca7bbfc57c0ecf4441db3a1ab7dd # v1.0.281
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"

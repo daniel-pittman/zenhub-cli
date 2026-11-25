@@ -460,7 +460,7 @@ jobs:
       # reports, and the review would post its checklist with no findings.
       - name: Run Claude code review
         id: claude-review
-        uses: anthropics/claude-code-action@469588f42e6b1e94cd14ad09dccfeaec772ce0fd # v1.0.280
+        uses: anthropics/claude-code-action@e5812cd75691ca7bbfc57c0ecf4441db3a1ab7dd # v1.0.281
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
           CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: "1"
@@ -687,7 +687,7 @@ jobs:
       # mode, where a safety review can approve a tool no allow rule covers.
       - name: Extract the merge verdict
         id: extract
-        uses: anthropics/claude-code-action@469588f42e6b1e94cd14ad09dccfeaec772ce0fd # v1.0.280
+        uses: anthropics/claude-code-action@e5812cd75691ca7bbfc57c0ecf4441db3a1ab7dd # v1.0.281
         env:
           # Strips Anthropic, cloud and Actions credentials (the OAuth token,
           # the OIDC request token) from the environment of the processes the
